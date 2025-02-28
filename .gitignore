@@ -7,3 +7,9 @@ build/
 *.log
 dist/
 doc/_build
+*.ipynb_checkpoints
+*.venv
+*sbi-logs
+*xrism
+*old
+*article
