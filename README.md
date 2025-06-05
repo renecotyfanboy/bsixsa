@@ -1,0 +1,1 @@
+This repository contains the code used in Dupourqué & Barret (2025) to perform simulation-based inference for high-resolution X-ray spectra using the X-IFU. There is no plan to maintain this codebase. 
