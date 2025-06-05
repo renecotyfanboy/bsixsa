@@ -17,3 +17,5 @@ run_*.py
 *.sh
 *hpc
 *didier
+*data
+*true_data
