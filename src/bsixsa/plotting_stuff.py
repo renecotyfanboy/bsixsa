@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import bsixsa
 import numpy as np
 import catppuccin
 from catppuccin.extras.matplotlib import load_color
@@ -54,7 +53,7 @@ def error_bars_for_observed_data(observed_counts, sigma=1):
 
     return y_observed, y_observed_low, y_observed_high
 
-def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 6), plot_background=False):
+def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 6), plot_background=False, legend=True):
 
     if component_names is None:
         raise ValueError("component_names must be specified")
@@ -208,7 +207,9 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
     axs[1].set_xlabel("Energy [keV]")
     axs[0].set_ylabel("Observed Spectrum \n" + r"[$\frac{\text{Counts}}{\text{cm}^2  \text{keV} \text{s}}$]")
     axs[1].set_yticks([-3, 0, 3])
-    axs[0].legend(legend_list, legend_names, loc="upper right")
+
+    if legend:
+        axs[0].legend(legend_list, legend_names, loc="upper right")
     axs[0].loglog()
     fig.align_ylabels()
 

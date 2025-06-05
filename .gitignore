@@ -13,3 +13,7 @@ doc/_build
 *xrism
 *old
 *article
+run_*.py
+*.sh
+*hpc
+*didier
