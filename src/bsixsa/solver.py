@@ -55,6 +55,20 @@ def create_prior_function(transformations):
 
 	return prior
 
+def create_reverse_function(transformations):
+	"""
+	Create a single prior transformation function from a list of
+	transformations for each parameter. This assumes the priors factorize.
+	"""
+
+	def reverse(cube):
+		params = cube.copy()
+		for i, t in enumerate(transformations):
+			transform = t['aftertransform']
+			params[i] = transform(cube[i])
+		return params
+
+	return reverse
 
 def store_chain(chainfilename, transformations, posterior, fit_statistic):
 	"""Writes a MCMC chain file in the same format as the Xspec chain command."""
@@ -100,6 +114,7 @@ def set_parameters(transformations, values):
 class SIXSASolver(object):
 
 	allowed_stats = ['cstat', 'pstat']
+	inference : NPE
 
 	def __init__(
 			self, transformations, prior_function=None, outputfiles_basename='chains/', use_background=False
@@ -174,6 +189,8 @@ class SIXSASolver(object):
 			npe_kwargs=None,
 			training_kwargs=None,
 			prune_summaries=False,
+			clear_simulations=False,
+			plot_embedding_coverage=True,
 			device="cpu"
 	):
 
@@ -204,20 +221,6 @@ class SIXSASolver(object):
 				return x, None
 			embedding_list = [embedding]*num_rounds
 
-		elif embedding == 'bd2025_summary_statistics':
-
-			self.embedding = "callable"
-			embedding_list = [lambda x: summary_statistics_func(
-				x,
-				energy_low_observation=energy_low_observation,
-				energy_high_observation=energy_high_observation
-			)]*num_rounds
-
-		elif embedding == "bd2025_wst":
-
-			self.embedding = "callable"
-			embedding_list = [compress_with_wst]*num_rounds
-
 		elif isinstance(embedding, list):
 			self.embedding = "callable"
 			embedding_list = embedding
@@ -237,14 +240,13 @@ class SIXSASolver(object):
 		proposal = prior
 
 		self.density_estimator_build_fun = posterior_nn(
-			model="maf",
+			model="zuko_maf",
 			hidden_features=100,
 			num_transforms=10,
-			embedding_net=self.embedding_net #if self.embedding_net is not None else None
+			embedding_net=self.embedding_net,
 		)
 
 		inference = NPE(prior=prior, density_estimator=self.density_estimator_build_fun, device=device, **npe_kwargs)
-
 		cc = ChainConsumer()
 		colors = self.round_colors(num_rounds)
 
@@ -261,16 +263,19 @@ class SIXSASolver(object):
 				is_last_round=rounds == num_rounds - 1,
 				training_kwargs=training_kwargs[rounds],
 				device=device,
-				prune_summaries=prune_summaries
+				prune_summaries=prune_summaries,
+				plot_embedding_coverage=plot_embedding_coverage
 			)
 
 			round_samples = self.unit_cube_to_xspec(posterior.sample((10000,)).numpy().T)
 
 			chain = self.chain_from_sample(round_samples, name=f"Round {rounds + 1}", color=colors[rounds])
 			cc.add_chain(chain)
-
-
 			posteriors.append(posterior)
+
+		if clear_simulations:
+			inference._x_roundwise = []
+			inference._theta_roundwise = []
 
 		self.fitted_posteriors = posteriors
 
@@ -287,10 +292,6 @@ class SIXSASolver(object):
 		store_chain(chainfilename, self.transformations, self.posterior, posterior_stat)
 		xspec.AllChains.clear()
 		xspec.AllChains += chainfilename
-		# set current parameters to best fit
-		self.set_best_fit()
-
-		# plot stuff
 
 		cc.plotter.plot(filename=f"{self.outputfiles_basename}posterior_per_round.pdf")
 		plt.close('all')
@@ -517,17 +518,82 @@ class SIXSASolver(object):
 		component_names = list(np.asarray(component_names)[parameter_index])
 		return rename_parameters(parameter_names_vanilla, component_names)
 
+	def posterior_dataframe(self, num_samples=10_000):
+		"""
+		Build a posterior dataframe from the lastest fitted neural network
+
+		Parameters:
+			num_samples (int): number of samples to draw
+		"""
+
+		indexes = np.sort([t['index'] for t in self.transformations])
+		parameter_names = np.asarray(self.parameter_names_uniques)[indexes - 1]
+
+		samples = self.fitted_posteriors[-1].sample((num_samples,))
+		warped_samples = self.unit_cube_to_xspec(samples.numpy().T)
+
+		dict_of_params = {}
+
+		for i in indexes:
+			name = self.parameter_names_uniques[i - 1]
+			dict_of_params[name] = np.asarray([warped_samples[j][i] for j in range(len(warped_samples))])
+
+		return pd.DataFrame.from_dict(dict_of_params)
+
+
+	def predictive_coverage(self, nsamples=100, figsize=(4.5, 4.5)):
+		"""
+		Plot the predicting coverage using the prior distribution set by the user
+
+		Parameters:
+			nsamples (int): number of samples to plot the predictive bands
+			figsize (tuple): size of the figure
+		"""
+
+		Plot.device = "/null"
+		Plot.xAxis = "keV"
+		model_list = []
+
+		if len(getattr(self, "fitted_posteriors", [])) >0:
+			sampler = self.fitted_posteriors[-1]
+		else:
+			num_parameters = len(self.transformations)
+			sampler = BoxUniform(
+				low=torch.zeros(num_parameters),
+				high=torch.ones(num_parameters),
+			)
+
+		params = sampler.sample((nsamples,)).numpy().T
+
+		with XSilence():
+
+			for i in range(nsamples):
+				set_parameters(transformations=self.transformations, values=self.prior_function(params[:, i]))
+				Plot("data")
+				model = Plot.model()
+				model_list.append(model)
+
+			energies = Plot.x()
+			edeltas = Plot.xErr()
+			rates = Plot.y()
+			errors = Plot.yErr()
+
+		fig=plt.figure(figsize=figsize)
+		plt.errorbar(energies, rates, xerr=edeltas, yerr=errors, fmt='.', alpha=0.8)
+		plt.fill_between(energies, *np.percentile(model_list, [16, 84], axis=0), alpha=0.2)
+		plt.loglog()
+
+		return fig
+
 	def simulate(self, parameters_xspec, **kwargs):
+		"""
+		Fast simulation using parallelized XSPEC calls
+		"""
 
 		if (not self.background_to_compute) or (kwargs.get("return_stat", False)):
 			return parallel_folding(parameters_xspec, **kwargs)
 
 		if self.background_to_compute:
-
-			#background = np.random.negative_binomial(
-			#		np.repeat(self._background[None, :], len(parameters_xspec), axis=0) + 1,
-			#	1 / 2
-			#) * self._backratio
 
 			background = np.random.poisson(
 				np.repeat(self._background[None, :], len(parameters_xspec), axis=0)
@@ -536,6 +602,9 @@ class SIXSASolver(object):
 			spectra = parallel_folding(parameters_xspec, **kwargs)
 
 			return spectra + background
+
+		else:
+			raise NotImplementedError
 
 	def perform_inference_round(
 			self,
@@ -549,6 +618,7 @@ class SIXSASolver(object):
 			is_last_round=False,
 			training_kwargs=None,
 			prune_summaries=False,
+			plot_embedding_coverage=False,
 			device="cpu"
 	):
 
@@ -584,7 +654,7 @@ class SIXSASolver(object):
 		).train(**training_kwargs)
 
 		posterior = inference.build_posterior(
-			density_estimator,
+			density_estimator
 		)
 
 		if x_o is not None:
@@ -623,7 +693,7 @@ class SIXSASolver(object):
 		self.validation_loss.extend(inference.summary["validation_loss"][-num_epochs:])
 
 		# Plot summary stat stuff
-		if self.embedding == "callable":
+		if self.embedding == "callable" and plot_embedding_coverage:
 			cols = int(np.ceil(np.sqrt(len(feature_names))))
 			rows = int(np.ceil(len(feature_names) / cols))
 
@@ -696,7 +766,7 @@ class SIXSASolver(object):
 
 	def plot_training_summary(self, figsize=(10, 7), filename=None):
 
-		plt.figure(figsize=figsize)
+		figure = plt.figure(figsize=figsize)
 
 		prev_num = 0
 		colors = self.round_colors(len(self.epoch_trained))
@@ -727,6 +797,9 @@ class SIXSASolver(object):
 		]
 
 		plt.legend(custom_lines, ['Training loss', 'Validation loss'])
-		plt.savefig(filename)
-		plt.close()
 
+		if filename is not None:
+			plt.savefig(filename)
+			plt.close()
+
+		return figure

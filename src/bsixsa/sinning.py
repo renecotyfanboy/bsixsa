@@ -8,7 +8,7 @@ Binning routines for plotting
 from __future__ import print_function
 import numpy
 import scipy.special, scipy.stats
-from src.bsixsa import gof
+from . import gof
 import tqdm
 
 
