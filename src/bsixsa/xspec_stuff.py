@@ -4,6 +4,78 @@ import numpy as np
 import uuid
 import pathos.multiprocessing as multiprocessing #pathos
 from tqdm.auto import tqdm
+from contextlib import contextmanager
+
+
+def transform_parameters_for_xspec(transformations, theta) -> dict[int, float]:
+    """Transform the current parameters using BXA transformation for XSPEC (i.e. real space) and return a dictionary"""
+    return {int(t['index']) : float(t['aftertransform'](theta[i])) for i, t in enumerate(transformations)}
+
+
+
+def get_model_block(lines):
+    """
+    Find the lines related to the model parameters in an .xcm file
+    """
+
+    in_model_block = False
+    out_lines = []
+    out_lines_indexes = []
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        tokens = stripped.split()
+        head = tokens[0]
+
+        if head == "model":
+            in_model_block = True
+            continue
+
+        if head == "bayes":
+            in_model_block = False
+            continue
+
+        if in_model_block:
+            out_lines.append(line)
+            out_lines_indexes.append(i)
+            continue
+
+    parameter_index = np.argsort(out_lines_indexes) + 1
+
+    return {
+        int(par_index) : (out_line, line_number) for par_index, out_line, line_number in zip(parameter_index, out_lines, out_lines_indexes)
+    }
+
+
+@contextmanager
+def local_xcm_path(params, base_xcm_path):
+    """
+    Build a local .xcm file path containing the values specified in params, using a base xcm path.
+    """
+
+    local_xcm_path = f"local_values_{uuid.uuid4()}.xcm"
+
+    with open(base_xcm_path, "r") as f:
+        lines = f.readlines()
+        mapping = get_model_block(lines)
+
+    for par_index, value in params.items():
+        line, line_index = mapping[par_index]
+        line = f"{value:.8g}".rjust(15) + line[15:]
+        lines[line_index] = line
+
+    with open(local_xcm_path, "w") as f:
+        f.writelines(lines)
+
+    try:
+        yield local_xcm_path
+
+    finally:
+        os.remove(local_xcm_path)
 
 
 def parallel_folding(params, n_jobs=None, return_stat=False, desc=""):
@@ -40,35 +112,28 @@ def parallel_folding(params, n_jobs=None, return_stat=False, desc=""):
     return result_to_return
 
 
-def transform_parameters_for_xspec(transformations, theta) -> dict[int, float]:
-    """Transform the current parameters using BXA transformation for XSPEC (i.e. real space) and return a dictionary"""
-    return {int(t['index']) : float(t['aftertransform'](theta[i])) for i, t in enumerate(transformations)}
-
-
 def folded_model_from_parameters(params, model_file):
     from bsixsa import XSilence
 
     with XSilence():
+        with local_xcm_path(params, model_file) as local_xcm:
 
-        xspec.Xset.restore(model_file)
-        xspec.Fit.statMethod = "cstat"
-        xspec.Fit.bayes = "on"
-        model = xspec.AllModels(1)
-        model.setPars(params)
-        count_list = []
-        stat_list = []
+            xspec.Xset.restore(local_xcm)
+            xspec.Fit.statMethod = "cstat"
+            xspec.Fit.bayes = "on"
+            model = xspec.AllModels(1)
+            #model.setPars(params)
+            count_list = []
+            stat_list = []
 
-        #print(xspec.Xset.modelStrings)
+            for n in range(1, xspec.AllData.nSpectra + 1):
 
-        for n in range(1, xspec.AllData.nSpectra + 1):
+                expected_rate = np.multiply(model.folded(n), xspec.AllData(n).exposure)
+                count_list.append(expected_rate)
 
-            expected_rate = np.multiply(model.folded(n), xspec.AllData(n).exposure)
-            count_list.append(expected_rate)
+            poisson_realisation = np.random.poisson(np.hstack(count_list))
+            stat_list.append(float(xspec.Fit.statistic))
 
-        poisson_realisation = np.random.poisson(np.hstack(count_list))
-        stat_list.append(float(xspec.Fit.statistic))
-
-        #xspec.AllData.clear()
-        xspec.AllModels.clear()
+            xspec.AllModels.clear() # VERY IMPORTANT : speedup of ~4 for unkown reasons
 
     return poisson_realisation, np.asarray(stat_list).ravel()
