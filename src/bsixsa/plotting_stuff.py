@@ -58,8 +58,10 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
     if component_names is None:
         raise ValueError("component_names must be specified")
 
-    data = solver.posterior_predictions_convolved(component_names=component_names, nsamples=100,
-                                                  plottype="counts")
+    data = solver.posterior_predictions_convolved(
+        component_names=component_names, nsamples=100, plottype="counts"
+    )
+
     plt.close("all")
 
     if data.get("background") is not None:

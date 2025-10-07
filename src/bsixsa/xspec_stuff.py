@@ -4,7 +4,7 @@ import numpy as np
 import uuid
 import pathos.multiprocessing as multiprocessing #pathos
 from tqdm.auto import tqdm
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 def transform_parameters_for_xspec(transformations, theta) -> dict[int, float]:
@@ -78,7 +78,7 @@ def local_xcm_path(params, base_xcm_path):
         os.remove(local_xcm_path)
 
 
-def parallel_folding(params, n_jobs=None, return_stat=False, desc=""):
+def parallel_folding(params, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True):
     """Perform simulation in parallel with XSPEC"""
     # Set up the number of workers
     if n_jobs is None:
@@ -91,49 +91,64 @@ def parallel_folding(params, n_jobs=None, return_stat=False, desc=""):
 
     xspec.Xset.save(model_file, info="m")
 
-    # Create a progress bar
-    with tqdm(total=len(params), desc=desc + "Folding model") as pbar:
+    try:
 
-        def update_progress(_):
-            pbar.update()
+        # Create a progress bar
+        with tqdm(total=len(params), desc=desc + "Folding model") if progress_bar else nullcontext() as pbar:
 
-        with multiprocessing.Pool(processes=n_jobs) as pool:
+            def update_progress(_):
+                if pbar is not None:
+                    pbar.update()
 
-            results = [pool.apply_async(folded_model_from_parameters, (param, model_file), callback=update_progress) for param in params]
+            with multiprocessing.Pool(processes=n_jobs) as pool:
 
-            if return_stat:
-                result_to_return =  np.vstack([result.get()[1] for result in results])
+                results = [pool.apply_async(folded_model_from_parameters, (param, model_file, apply_stat), callback=update_progress) for param in params]
 
-            else:
-                result_to_return = np.vstack([result.get()[0] for result in results])
+                if return_stat:
+                    result_to_return =  np.vstack([result.get()[1] for result in results])
 
-    os.remove(model_file)
+                else:
+                    result_to_return = np.vstack([result.get()[0] for result in results])
+
+    except Exception as e:
+        print(f'Simulations interrupted by {e}')
+
+    finally:
+        files = os.listdir("./")
+
+        for file in files:
+            if file.startswith("parallel_folding_") or file.startswith("local_values_"):
+                os.remove(file)
 
     return result_to_return
 
 
-def folded_model_from_parameters(params, model_file):
+def folded_model_from_parameters(params, model_file, apply_stat):
     from bsixsa import XSilence
 
     with XSilence():
         with local_xcm_path(params, model_file) as local_xcm:
-
             xspec.Xset.restore(local_xcm)
-            xspec.Fit.statMethod = "cstat"
-            xspec.Fit.bayes = "on"
-            model = xspec.AllModels(1)
-            #model.setPars(params)
-            count_list = []
-            stat_list = []
 
-            for n in range(1, xspec.AllData.nSpectra + 1):
+        xspec.Fit.statMethod = "cstat"
+        xspec.Fit.bayes = "on"
+        model = xspec.AllModels(1)
+        #model.setPars(params)
+        count_list = []
+        stat_list = []
 
-                expected_rate = np.multiply(model.folded(n), xspec.AllData(n).exposure)
-                count_list.append(expected_rate)
+        for n in range(1, xspec.AllData.nSpectra + 1):
 
-            poisson_realisation = np.random.poisson(np.hstack(count_list))
-            stat_list.append(float(xspec.Fit.statistic))
+            expected_rate = np.multiply(model.folded(n), xspec.AllData(n).exposure)
+            count_list.append(expected_rate)
 
-            xspec.AllModels.clear() # VERY IMPORTANT : speedup of ~4 for unkown reasons
+        if apply_stat:
+            spectra = np.random.poisson(np.hstack(count_list))
+        else:
+            spectra = np.hstack(count_list)
 
-    return poisson_realisation, np.asarray(stat_list).ravel()
+        stat_list.append(float(xspec.Fit.statistic))
+
+        xspec.AllModels.clear() # VERY IMPORTANT : speedup of ~4 for unknown reasons
+
+    return spectra, np.asarray(stat_list).ravel()

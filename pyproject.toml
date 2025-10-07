@@ -18,6 +18,7 @@ dependencies = [
     "pathos>=0.3.3",
     "pytorch-minimize>=0.0.2",
     "sbi>0.23",
+    "scipy>1.15",
     "tqdm>=4.67.1",
     "ultranest>=4.4.0",
 ]

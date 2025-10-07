@@ -10,12 +10,10 @@ doc/_build
 *.ipynb_checkpoints
 *.venv
 *sbi-logs
-*xrism
+*old_code
 *old
-*article
 run_*.py
 *.sh
-*hpc
-*didier
 *data
-*true_data
+*dev
+.env
