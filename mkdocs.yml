@@ -3,6 +3,7 @@ site_name: bsixsa
 nav:
   - Home:
     - Welcome : index.md
+    - API Reference : api.md
 
 theme:
   name: material
@@ -13,14 +14,16 @@ theme:
 #    - content.code.select
 #    - navigation.instant
     - navigation.tabs
+    - navigation.sections
 #    - navigation.indexes
     - navigation.instant
     - navigation.instant.prefetch
     - navigation.instant.progress
     - navigation.top
-    - toc.integrate
+#    - toc.integrate
     - header.autohide
     - navigation.expand
+
 
   favicon: logo/logo_small.svg
   logo: logo/logo_small.svg
@@ -50,14 +53,24 @@ theme:
 
 plugins:
   - search
-#      enabled: !ENV INSIDERS
-#      plugins:
-#        - optimize
-#        - privacy
-#        - projects
-#        - social
-#        - typeset
-
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          import:
+            - https://docs.python.org/3/objects.inv
+            - https://docs.astropy.org/en/latest/objects.inv
+            - https://samreay.github.io/ChainConsumer/objects.inv
+            - https://python.arviz.org/en/latest/objects.inv
+            - https://sbi.readthedocs.io/en/latest/objects.inv
+          options:
+            members_order: alphabetical
+            docstring_section_style: table
+            docstring_style: google
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            modernize_annotations: true
 
 markdown_extensions:
 
@@ -81,6 +94,8 @@ markdown_extensions:
   - pymdownx.emoji:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.arithmatex:
+      generic: true
   - pymdownx.highlight
   - pymdownx.inlinehilite
   - pymdownx.keys
@@ -103,8 +118,6 @@ repo_name: bsixsa
 extra_css:
   - css/material.css
   - css/mkdocstrings.css
-  - css/xarray.css
-  - css/extra.css
 
 extra_javascript:
   - javascripts/mathjax.js

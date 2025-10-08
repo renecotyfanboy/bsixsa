@@ -171,19 +171,15 @@ class SIXSASolver(object):
     def num_parameters(self):
         return len(self.transformations)
 
-    def sample_parameters(self, n_samples, kind=Literal["to_unit_cube", "to_bxa", "to_xspec"], sampler=None):
-        """
-        Sample parameters in a given space.
+    def sample_parameters(self, n_samples:int, *, kind:Literal["to_unit_cube", "to_bxa", "to_xspec"]="to_xspec", sampler=None):
+        r"""
+        Sample parameters $\theta$ in a given space.
 
         Parameters:
-            n_samples (int): number of parameters to sample
-            kind : Parameter space to sample over
-                - `to_unit_cube`: Sample $\theta$ in the unit cube
-                - `to_bxa`: Sample $\theta$ in the `BXA` space (log-distributed values are in log-space, other in real-space) CF unit_cube_to_bxa
-                - `to_xspec`: Sample $\theta$ in the `xspec` space (everything is in real-space and formatted as `setPars` friendly dictionaries) CF unit_cube_to_xspec
+            n_samples : number of parameters to sample
+            kind : Parameter space to sample over. `to_unit_cube` will sample $\theta$ in the unit cube. `to_bxa` will sample $\theta$ in the `BXA` space (log-distributed values are in log-space, other in real-space) CF unit_cube_to_bxa. `to_xspec` will sample $\theta$ in the `xspec` space (everything is in real-space and formatted as `setPars` friendly dictionaries) CF unit_cube_to_xspec
 
         """
-
 
         device = "cpu"
 
@@ -245,8 +241,7 @@ class SIXSASolver(object):
 
     def run(
             self,
-            num_rounds=5,
-            num_simulations=5_000,
+            num_simulations_per_round:list[int],
             *,
             embedding: Optional[Embedding | list[Embedding]]=None,
             npe_kwargs=None,
@@ -255,6 +250,12 @@ class SIXSASolver(object):
             plot_embedding_coverage=True,
             device="cpu"
     ):
+        """
+        Run the solver
+
+        Parameters:
+            num_simulations_per_round (list[int]): number of simulations to perform per inference round
+        """
 
         if Fit.statMethod.lower() not in SIXSASolver.allowed_stats:
             raise RuntimeError(
