@@ -139,7 +139,7 @@ def folded_model_from_parameters(params, model_file, apply_stat):
 
         for n in range(1, xspec.AllData.nSpectra + 1):
 
-            expected_rate = np.multiply(model.folded(n), xspec.AllData(n).exposure)
+            expected_rate = np.asarray(model.folded(n), dtype=np.float32) * xspec.AllData(n).exposure
             count_list.append(expected_rate)
 
         if apply_stat:
@@ -151,4 +151,4 @@ def folded_model_from_parameters(params, model_file, apply_stat):
 
         xspec.AllModels.clear() # VERY IMPORTANT : speedup of ~4 for unknown reasons
 
-    return spectra, np.asarray(stat_list).ravel()
+    return spectra, np.asarray(stat_list, dtype=np.float32).ravel()

@@ -4,71 +4,72 @@ import torch
 from torch import nn
 
 
-class Scaler(nn.Module):
+class LogStandardScaler(nn.Module):
 
-    def __init__(self, data):
-        super(Scaler, self).__init__()
+    def __init__(self):
+
+        super(LogStandardScaler, self).__init__()
+        self.softplus = nn.Softplus(beta=10.)
+
+    def fit(self, X: torch.Tensor):
+        X = torch.log1p(X)
+        self.register_buffer("mean_", torch.mean(X, dim=0), persistent=True)
+        self.register_buffer("scale_", torch.std(X, dim=0), persistent=True)
+
+    def transform(self, X: torch.Tensor):
+
+        X = torch.log1p(X)
+        X = (X - self.mean_) / (self.scale_ + 1e-6)
+        return X
+
+    def inverse_transform(self, X: torch.Tensor):
+
+        X = (X * self.scale_) + self.mean_
+        X = self.softplus(X)
+        X = torch.expm1(X)
+        return X
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, n_bins, latent_dim=32):
+    def __init__(self, n_bins, latent_dim=32, hidden_dims: list[int] | None = None):
         super(Autoencoder, self).__init__()
 
-        # Encoder
-        """
-        self.encoder_module = nn.Sequential(
-            nn.Linear(n_bins, n_bins//2),
-            nn.LayerNorm(n_bins//2),
-            nn.GELU(),
-            nn.Linear(n_bins//2, n_bins // 4),
-            nn.LayerNorm(n_bins // 4),
-            nn.GELU(),
-            nn.Linear(n_bins//4, latent_dim)
-        )
+        self.scaler = LogStandardScaler()
+        default_hidden_dims = [max(1, n_bins // 2), max(1, n_bins // 4), max(1, n_bins // 8)]
+        self.hidden_dims = list(hidden_dims) if hidden_dims is not None else default_hidden_dims
 
-        # Decoder
-        self.decoder_module = nn.Sequential(
-            nn.Linear(latent_dim, n_bins//4),
-            nn.LayerNorm(n_bins//4),
-            nn.GELU(),
-            nn.Linear(n_bins//4, n_bins//2),
-            nn.LayerNorm(n_bins // 2),
-            nn.GELU(),
-            nn.Linear(n_bins // 2, n_bins),
-        )
-        """
+        encoder_layers: list[nn.Module] = []
+        prev_dim = n_bins
+        for hidden_dim in self.hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.01),
+            ])
+            prev_dim = hidden_dim
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.encoder_module = nn.Sequential(*encoder_layers)
 
-        self.encoder_module = nn.Sequential(
-            nn.Linear(n_bins, n_bins//2),
-            nn.BatchNorm1d(n_bins//2),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(n_bins //2, latent_dim),
-        )
-
-        # Decoder
-        self.decoder_module = nn.Sequential(
-            nn.Linear(latent_dim, n_bins//2),
-            nn.BatchNorm1d(n_bins//2),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(n_bins // 2, n_bins),
-        )
+        decoder_layers: list[nn.Module] = []
+        prev_dim = latent_dim
+        for hidden_dim in reversed(self.hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.01),
+            ])
+            prev_dim = hidden_dim
+        decoder_layers.append(nn.Linear(prev_dim, n_bins))
+        self.decoder_module = nn.Sequential(*decoder_layers)
 
         self.latent_dim = latent_dim
         self.input_dim = n_bins
-        self.is_scaled = False
-
-    def set_scaler(self, mean, std) -> None:
-
-        self.register_buffer("mean", mean, persistent=True)
-        self.register_buffer("std", std, persistent=True)
-        self.is_scaled = True
 
     def encoder(self, x):
 
-        x = torch.log1p(x)
-        x = (x - self.mean) / self.std
+        x = self.scaler.transform(x)
         x = self.encoder_module(x)
 
         return x
@@ -76,8 +77,7 @@ class Autoencoder(nn.Module):
     def decoder(self, x):
 
         x = self.decoder_module(x)
-        x = x * self.std + self.mean
-        x = torch.exp(x)
+        x = self.scaler.inverse_transform(x)
 
         return x
 
@@ -86,50 +86,41 @@ class Autoencoder(nn.Module):
         return self.decoder(self.encoder(x))
 
 
-class VariationaAutoencoder(nn.Module):
-    def __init__(self, n_bins, latent_dim=32):
-        super(VariationaAutoencoder, self).__init__()
+class VariationalAutoencoder(nn.Module):
+    def __init__(self, n_bins, latent_dim=32, hidden_dims: list[int] | None = None):
+        super(VariationalAutoencoder, self).__init__()
 
-        # Encoder
-        """
-        self.encoder_module = nn.Sequential(
-            nn.Linear(n_bins, n_bins//2),
-            nn.LayerNorm(n_bins//2),
-            nn.GELU(),
-            nn.Linear(n_bins//2, n_bins // 4),
-            nn.LayerNorm(n_bins // 4),
-            nn.GELU(),
-            nn.Linear(n_bins//4, latent_dim)
-        )
+        default_hidden_dims = [max(1, n_bins // 2), max(1, n_bins // 4), max(1, n_bins // 8)]
+        self.hidden_dims = list(hidden_dims) if hidden_dims is not None else default_hidden_dims
 
-        # Decoder
-        self.decoder_module = nn.Sequential(
-            nn.Linear(latent_dim, n_bins//4),
-            nn.LayerNorm(n_bins//4),
-            nn.GELU(),
-            nn.Linear(n_bins//4, n_bins//2),
-            nn.LayerNorm(n_bins // 2),
-            nn.GELU(),
-            nn.Linear(n_bins // 2, n_bins),
-        )
-        """
-
-        self.encoder_module = nn.Sequential(
-            nn.Linear(n_bins, n_bins // 2),
-            nn.BatchNorm1d(n_bins // 2),
-            nn.GELU(),
-        )
+        encoder_layers: list[nn.Module] = []
+        prev_dim = n_bins
+        for hidden_dim in self.hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.01),
+            ])
+            prev_dim = hidden_dim
+        self.encoder_module = nn.Sequential(*encoder_layers)
 
         # Decoder
-        self.decoder_module = nn.Sequential(
-            nn.Linear(latent_dim, n_bins // 2),
-            nn.BatchNorm1d(n_bins // 2),
-            nn.GELU(),
-            nn.Linear(n_bins // 2, n_bins),
-        )
+        decoder_layers: list[nn.Module] = []
+        prev_decoder_dim = latent_dim
+        for hidden_dim in reversed(self.hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(prev_decoder_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.01),
+            ])
+            prev_decoder_dim = hidden_dim
+        decoder_layers.append(nn.Linear(prev_decoder_dim, n_bins))
+        self.decoder_module = nn.Sequential(*decoder_layers)
 
-        self.mu_layer = nn.Linear(n_bins // 2, latent_dim)
-        self.logvar_layer = nn.Linear(n_bins // 2, latent_dim)
+        self.mu_layer = nn.Linear(prev_dim, latent_dim)
+        self.logvar_layer = nn.Linear(prev_dim, latent_dim)
 
         self.latent_dim = latent_dim
         self.input_dim = n_bins
@@ -158,7 +149,7 @@ class VariationaAutoencoder(nn.Module):
 
         x = self.decoder_module(x)
         x = x * self.std + self.mean
-        x = torch.exp(x)
+        x = torch.expm1(x)
         return x
 
     def forward(self, x):

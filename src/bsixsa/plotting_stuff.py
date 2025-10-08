@@ -53,13 +53,13 @@ def error_bars_for_observed_data(observed_counts, sigma=1):
 
     return y_observed, y_observed_low, y_observed_high
 
-def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 6), plot_background=False, legend=True):
+def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 6), plot_background=False, legend=True, n_samples=100):
 
     if component_names is None:
         raise ValueError("component_names must be specified")
 
     data = solver.posterior_predictions_convolved(
-        component_names=component_names, nsamples=100, plottype="counts"
+        component_names=component_names, nsamples=n_samples, plottype="counts"
     )
 
     plt.close("all")
@@ -184,7 +184,8 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
 
     total = total/denominator
 
-    residuals = (total-y_observed)/(np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0))
+    divider = (np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0))
+    residuals = (total-y_observed) / np.where(divider>0, divider, 1.)
 
     axs[1].stairs(np.median(residuals, axis=0), edges=bin_edges, color=SPECTRUM_COLOR, label="Total", alpha=alpha_median, zorder=100)
     axs[1].stairs(np.percentile(residuals, 84, axis=0), edges=bin_edges, baseline=np.percentile(residuals, 16, axis=0), fill=True, alpha=alpha_envelope[1], color=SPECTRUM_COLOR, zorder=80)

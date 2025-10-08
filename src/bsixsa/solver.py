@@ -1,6 +1,6 @@
 from __future__ import print_function
 
-from typing import Any
+from typing import Any, Optional, Literal
 
 import numpy as np
 from ultranest.plot import PredictionBand
@@ -24,8 +24,9 @@ from sbi.utils import BoxUniform
 from sbi.utils import RestrictedPrior, get_density_thresholder
 import matplotlib.pyplot as plt
 
-from .embedding.trainable import TrainableEmbedding, TorchEmbedding
+from .embedding.trainable import TrainableEmbedding, TorchModuleEmbedding
 from .xspec_stuff import parallel_folding, transform_parameters_for_xspec
+from .plotting_stuff import plot_ppc
 from tqdm.auto import tqdm
 from matplotlib.lines import Line2D
 from .embedding.abc import Embedding
@@ -135,8 +136,8 @@ class SIXSASolver(object):
         self.embedding = None
         self.embedding_net = nn.Identity()
 
-        x_o = np.asarray(xspec.AllData(1).values) * xspec.AllData(1).exposure
-        self.c_stat_conversion_factor = 0. #np.sum(sp.special.gammaln(x_o + 1))
+        # x_o = np.asarray(xspec.AllData(1).values) * xspec.AllData(1).exposure
+        # self.c_stat_conversion_factor = 0. #np.sum(sp.special.gammaln(x_o + 1))
 
         # for convenience. Has to be a directory anyway for ultranest
         if not outputfiles_basename.endswith('/'):
@@ -148,6 +149,7 @@ class SIXSASolver(object):
         if self.background_to_compute:
             self._background = (np.asarray(xspec.AllData(1).background.values) * xspec.AllData(1).background.exposure).astype(int)
             self._backratio = np.asarray(xspec.AllData(1).exposure / xspec.AllData(1).background.exposure)
+
         self.outputfiles_basename = outputfiles_basename
 
     def set_paramnames(self, paramnames=None):
@@ -158,7 +160,7 @@ class SIXSASolver(object):
 
     def set_best_fit(self):
         """Sets model to the best fit values."""
-
+        #TODO : Update this function
         x0 = self.posterior_unit_cube[:, self.posterior_sampler.log_prob(self.posterior_unit_cube.T).argmax()]
         result = minimize(lambda p: -self.posterior_sampler.log_prob(p, track_gradients=True), x0, method='newton-exact')
         best_fit = result.x
@@ -169,7 +171,19 @@ class SIXSASolver(object):
     def num_parameters(self):
         return len(self.transformations)
 
-    def sample_parameters(self, n_spectra, kind="to_xspec", sampler=None):
+    def sample_parameters(self, n_samples, kind=Literal["to_unit_cube", "to_bxa", "to_xspec"], sampler=None):
+        """
+        Sample parameters in a given space.
+
+        Parameters:
+            n_samples (int): number of parameters to sample
+            kind : Parameter space to sample over
+                - `to_unit_cube`: Sample $\theta$ in the unit cube
+                - `to_bxa`: Sample $\theta$ in the `BXA` space (log-distributed values are in log-space, other in real-space) CF unit_cube_to_bxa
+                - `to_xspec`: Sample $\theta$ in the `xspec` space (everything is in real-space and formatted as `setPars` friendly dictionaries) CF unit_cube_to_xspec
+
+        """
+
 
         device = "cpu"
 
@@ -181,7 +195,7 @@ class SIXSASolver(object):
         else:
             raise NotImplementedError
 
-        theta = sampler.sample((n_spectra,)) # In the unit cube space
+        theta = sampler.sample((n_samples,)) # In the unit cube space
 
         if kind == "to_unit_cube":
             return theta
@@ -224,7 +238,7 @@ class SIXSASolver(object):
         theta = theta.numpy().T
         parameters_xspec = self.unit_cube_to_xspec(theta)
         cstat = parallel_folding(parameters_xspec, return_stat=True).squeeze()
-        ll = -0.5 * cstat - self.c_stat_conversion_factor
+        ll = -0.5 * cstat # - self.c_stat_conversion_factor
         result = torch.from_numpy(ll)
 
         return result
@@ -233,7 +247,8 @@ class SIXSASolver(object):
             self,
             num_rounds=5,
             num_simulations=5_000,
-            embedding: Embedding=None,
+            *,
+            embedding: Optional[Embedding | list[Embedding]]=None,
             npe_kwargs=None,
             training_kwargs=None,
             clear_simulations=False,
@@ -303,7 +318,7 @@ class SIXSASolver(object):
                 is_last_round=rounds == num_rounds - 1,
                 training_kwargs=training_kwargs[rounds],
                 device=device,
-                pl ot_embedding_coverage=plot_embedding_coverage
+                plot_embedding_coverage=plot_embedding_coverage
             )
 
             round_samples = self.unit_cube_to_xspec(posterior.sample((10000,)).numpy().T)
@@ -321,7 +336,7 @@ class SIXSASolver(object):
 
         embedding = embedding_list[-1]
 
-        if isinstance(embedding, TorchEmbedding):
+        if isinstance(embedding, TorchModuleEmbedding):
             x_o = embedding(torch.from_numpy(observed_spectrum.astype(np.float32)[None, :]).to(embedding.device)).to(device).squeeze()
 
         else:
@@ -592,11 +607,20 @@ class SIXSASolver(object):
         finite_weight = torch.isfinite(log_weight)
         samples = samples[finite_weight]
         log_weight = log_weight[finite_weight]
-        weight = torch.exp(log_weight)# - log_weight.max())
+
+        # Stabilize weights by subtracting the maximum log weight before exponentiation,
+        # matching the SIR post-processing used in SIXSA_CODES.
+        max_log_weight = torch.max(log_weight)
+        stable_log_weight = log_weight - max_log_weight
+        raw_weight = torch.exp(stable_log_weight)
+        weight = raw_weight / raw_weight.sum().clamp_min(torch.finfo(raw_weight.dtype).eps)
 
         warped_samples = self.unit_cube_to_xspec(samples.numpy().T)
 
-        dict_of_params = {"weight":weight.numpy().astype(np.float64)}
+        dict_of_params = {
+            "weight": raw_weight.numpy().astype(np.float64),
+            #"weight_norm": weight.numpy().astype(np.float64),
+        }
 
         for i in indexes:
             name = self.parameter_names_uniques[i - 1]
@@ -702,12 +726,12 @@ class SIXSASolver(object):
         all_simulations = self.simulate(parameters_xspec, desc=f"Round {round_number} - " if round_number is not None else "")
 
         if isinstance(embedding, TrainableEmbedding):
-            embedding.train(all_simulations)
+            embedding.train(all_simulations, metrics_path=os.path.join(self.outputfiles_basename, f"embedding_training_round_{round_number}.pdf"))
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            if isinstance(embedding, TorchEmbedding):
+            if isinstance(embedding, TorchModuleEmbedding):
                 all_simulations = torch.from_numpy(all_simulations.astype(np.float32)).to(embedding.device)
 
             features = embedding(all_simulations)
@@ -725,7 +749,7 @@ class SIXSASolver(object):
         else:
             x_train = features
 
-        if isinstance(embedding, TorchEmbedding):
+        if isinstance(embedding, TorchModuleEmbedding):
             x_o = embedding(observation[None, :]).to(device).squeeze()
         else:
             x_o = torch.from_numpy(np.squeeze(embedding(observation))).to(device)
@@ -759,7 +783,7 @@ class SIXSASolver(object):
             accept_reject_fn = get_density_thresholder(
                 posterior,
                 num_samples_to_estimate_support=100_000,
-                quantile=1e-4
+                quantile=1e-3
             )
 
             proposal = RestrictedPrior(
@@ -892,3 +916,6 @@ class SIXSASolver(object):
             plt.close()
 
         return figure
+
+    def plot_ppc(self, **kwargs):
+        return plot_ppc(self, **kwargs)
