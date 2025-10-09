@@ -9,7 +9,18 @@ PALETTE = catppuccin.PALETTE.latte
 
 COLOR_CYCLE = [
     load_color(PALETTE.identifier, color)
-    for color in ["sky", "teal", "green", "yellow", "peach", "maroon", "red", "pink", "mauve", "blue"][::-1]
+    for color in [
+        "sky",
+        "teal",
+        "green",
+        "yellow",
+        "peach",
+        "maroon",
+        "red",
+        "pink",
+        "mauve",
+        "blue",
+    ][::-1]
 ]
 
 
@@ -17,7 +28,7 @@ SPECTRUM_COLOR = load_color(PALETTE.identifier, "blue")
 SPECTRUM_DATA_COLOR = load_color(PALETTE.identifier, "overlay2")
 BACKGROUND_DATA_COLOR = load_color(PALETTE.identifier, "text")
 
-Plot.xAxis = 'keV'
+Plot.xAxis = "keV"
 
 
 def sigma_to_percentile_intervals(sigmas):
@@ -30,19 +41,17 @@ def sigma_to_percentile_intervals(sigmas):
 
 
 def error_bars_for_observed_data(observed_counts, sigma=1):
-    r"""
-    Compute the error bars for the observed data assuming a prior Gamma distribution
+    r"""Calculate Gamma-prior credible intervals for observed counts.
 
     Parameters:
-        observed_counts: array of integer counts
-        denominator: normalization factor (e.g. effective area)
-        units: unit to convert to
-        sigma: dispersion to use for quantiles computation
+        observed_counts (numpy.ndarray): Observed counts per bin.
+        sigma (float, optional): Desired dispersion expressed in Gaussian
+            sigmas for the resulting quantile interval. Defaults to 1.
 
     Returns:
-        y_observed: observed counts in the desired units
-        y_observed_low: lower bound of the error bars
-        y_observed_high: upper bound of the error bars
+        tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: Observed counts,
+            lower bound, and upper bound corresponding to the requested
+            credible interval.
     """
 
     percentile = sigma_to_percentile_intervals([sigma])[0]
@@ -53,8 +62,17 @@ def error_bars_for_observed_data(observed_counts, sigma=1):
 
     return y_observed, y_observed_low, y_observed_high
 
-def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 6), plot_background=False, legend=True, n_samples=100):
 
+def plot_ppc(
+    solver,
+    component_names=None,
+    x_lim=None,
+    y_lim=None,
+    figsize=(12, 6),
+    plot_background=False,
+    legend=True,
+    n_samples=100,
+):
     if component_names is None:
         raise ValueError("component_names must be specified")
 
@@ -72,74 +90,124 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
     alpha_median = 0.7
     alpha_envelope = (0.15, 0.25)
 
-    models = data['models']
+    models = data["models"]
     n_components = models.shape[1]
 
-    low_energy, high_energy = data['bins'] - data['width'], data['bins'] + data['width']
+    low_energy, high_energy = data["bins"] - data["width"], data["bins"] + data["width"]
     bin_edges = np.append(low_energy, high_energy[-1])
 
     area = get_effective_area()
-    denominator = area * data['width'] * 2 * AllData(1).exposure
+    denominator = area * data["width"] * 2 * AllData(1).exposure
 
-    fig, axs = plt.subplots(nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1])
+    fig, axs = plt.subplots(
+        nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
+    )
 
-    y_observed, y_observed_low, y_observed_high = error_bars_for_observed_data(count_data, sigma=1)
-    y_observed, y_observed_low, y_observed_high = y_observed/denominator, y_observed_low/denominator, y_observed_high/denominator
+    y_observed, y_observed_low, y_observed_high = error_bars_for_observed_data(
+        count_data, sigma=1
+    )
+    y_observed, y_observed_low, y_observed_high = (
+        y_observed / denominator,
+        y_observed_low / denominator,
+        y_observed_high / denominator,
+    )
 
     error_bar = axs[0].errorbar(
-            np.sqrt(bin_edges[:-1] * bin_edges[1:]),
-            y_observed,
-            xerr=np.abs(np.stack([bin_edges[:-1], bin_edges[1:]]) - np.sqrt(bin_edges[:-1] * bin_edges[1:])),
-            yerr=[
-                np.maximum(y_observed - y_observed_low, 0),
-                np.maximum(y_observed_high - y_observed, 0),
-            ],
+        np.sqrt(bin_edges[:-1] * bin_edges[1:]),
+        y_observed,
+        xerr=np.abs(
+            np.stack([bin_edges[:-1], bin_edges[1:]])
+            - np.sqrt(bin_edges[:-1] * bin_edges[1:])
+        ),
+        yerr=[
+            np.maximum(y_observed - y_observed_low, 0),
+            np.maximum(y_observed_high - y_observed, 0),
+        ],
         linestyle="none",
         color=SPECTRUM_DATA_COLOR,
         alpha=0.8,
         capsize=2,
-        zorder=10
+        zorder=10,
     )
 
     legend_list = [error_bar]
 
     linestyles = ["solid"] + ["dashdot"] * (n_components - 1)
 
-    for i, (color, component_name, linestyle) in enumerate(zip(COLOR_CYCLE, component_names, linestyles)):
-
-        local_component = np.random.poisson(models[:,i]*data['width']*2).astype(float)
+    for i, (color, component_name, linestyle) in enumerate(
+        zip(COLOR_CYCLE, component_names, linestyles)
+    ):
+        local_component = np.random.poisson(models[:, i] * data["width"] * 2).astype(
+            float
+        )
 
         if plot_background and data.get("background") is not None and (i == 0):
-
-            background = np.random.negative_binomial(
-                np.repeat(solver._background[None, :], len(models), axis=0) + 1, 1 / 2
-            ) * solver._backratio
+            background = (
+                np.random.negative_binomial(
+                    np.repeat(solver._background[None, :], len(models), axis=0) + 1,
+                    1 / 2,
+                )
+                * solver._backratio
+            )
 
             local_component += background
 
-        local_component = local_component/denominator
+        local_component = local_component / denominator
 
-        median = axs[0].stairs(np.median(local_component, axis=0), edges=bin_edges, color=color, alpha=alpha_median,zorder=100, linestyle=linestyle)
+        median = axs[0].stairs(
+            np.median(local_component, axis=0),
+            edges=bin_edges,
+            color=color,
+            alpha=alpha_median,
+            zorder=100,
+            linestyle=linestyle,
+        )
 
         low_band, high_band = np.percentile(local_component, [16, 84], axis=0)
-        axs[0].stairs(high_band, edges=bin_edges, baseline=low_band, fill=True, alpha=alpha_envelope[1], color=color, zorder=80)
+        axs[0].stairs(
+            high_band,
+            edges=bin_edges,
+            baseline=low_band,
+            fill=True,
+            alpha=alpha_envelope[1],
+            color=color,
+            zorder=80,
+        )
 
         low_band, high_band = np.percentile(local_component, [2.5, 97.5], axis=0)
-        axs[0].stairs(high_band, edges=bin_edges, baseline=low_band, fill=True, alpha=alpha_envelope[0], color=color, zorder=60)
+        axs[0].stairs(
+            high_band,
+            edges=bin_edges,
+            baseline=low_band,
+            fill=True,
+            alpha=alpha_envelope[0],
+            color=color,
+            zorder=60,
+        )
 
         # The legend cannot handle fill_between, so we pass a fill to get a fancy icon
-        (envelope,) = axs[0].fill(np.nan, np.nan, alpha=alpha_envelope[-1], facecolor=color)
+        (envelope,) = axs[0].fill(
+            np.nan, np.nan, alpha=alpha_envelope[-1], facecolor=color
+        )
 
         legend_list.append((median, envelope))
 
     if plot_background and data.get("background") is not None:
-
         background = data["background"] * data["width"] * 2 / solver._backratio
 
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = error_bars_for_observed_data(background, sigma=1)
         y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
-            y_observed_bkg*solver._backratio, y_observed_low_bkg*solver._backratio, y_observed_high_bkg*solver._backratio)
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = y_observed_bkg/denominator, y_observed_low_bkg/denominator, y_observed_high_bkg/denominator
+            error_bars_for_observed_data(background, sigma=1)
+        )
+        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
+            y_observed_bkg * solver._backratio,
+            y_observed_low_bkg * solver._backratio,
+            y_observed_high_bkg * solver._backratio,
+        )
+        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
+            y_observed_bkg / denominator,
+            y_observed_low_bkg / denominator,
+            y_observed_high_bkg / denominator,
+        )
 
         """
         error_bar_bkg = axs[0].errorbar(
@@ -159,38 +227,78 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
         )
         """
 
-        #legend_list.append(error_bar_bkg)
+        # legend_list.append(error_bar_bkg)
 
-        background_envelope = np.random.poisson(
-				np.repeat(solver._background[None, :], 1000, axis=0)
-			) * solver._backratio
+        background_envelope = (
+            np.random.poisson(np.repeat(solver._background[None, :], 1000, axis=0))
+            * solver._backratio
+        )
 
+        background_envelope = background_envelope / denominator
 
-        background_envelope = background_envelope/denominator
-
-        median = axs[0].stairs(np.median(background_envelope, axis=0), edges=bin_edges, color=BACKGROUND_DATA_COLOR, alpha=alpha_median, zorder=100, linestyle="dotted")
+        median = axs[0].stairs(
+            np.median(background_envelope, axis=0),
+            edges=bin_edges,
+            color=BACKGROUND_DATA_COLOR,
+            alpha=alpha_median,
+            zorder=100,
+            linestyle="dotted",
+        )
         low_band, high_band = np.percentile(background_envelope, [16, 84], axis=0)
-        envelope = axs[0].stairs(high_band, edges=bin_edges, baseline=low_band, fill=True, alpha=alpha_envelope[1], color=BACKGROUND_DATA_COLOR, zorder=80)
+        envelope = axs[0].stairs(
+            high_band,
+            edges=bin_edges,
+            baseline=low_band,
+            fill=True,
+            alpha=alpha_envelope[1],
+            color=BACKGROUND_DATA_COLOR,
+            zorder=80,
+        )
         legend_list.append((median, envelope))
 
-    total = np.random.poisson(models[:, 0]*data['width']*2).astype(float)
+    total = np.random.poisson(models[:, 0] * data["width"] * 2).astype(float)
 
     if plot_background and data.get("background") is not None:
-        background = np.random.negative_binomial(
-            np.repeat(solver._background[None, :], len(models), axis=0) + 1, 1 / 2
-        ) * solver._backratio
+        background = (
+            np.random.negative_binomial(
+                np.repeat(solver._background[None, :], len(models), axis=0) + 1, 1 / 2
+            )
+            * solver._backratio
+        )
 
         total += background
 
-    total = total/denominator
+    total = total / denominator
 
-    divider = (np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0))
-    residuals = (total-y_observed) / np.where(divider>0, divider, 1.)
+    divider = np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0)
+    residuals = (total - y_observed) / np.where(divider > 0, divider, 1.0)
 
-    axs[1].stairs(np.median(residuals, axis=0), edges=bin_edges, color=SPECTRUM_COLOR, label="Total", alpha=alpha_median, zorder=100)
-    axs[1].stairs(np.percentile(residuals, 84, axis=0), edges=bin_edges, baseline=np.percentile(residuals, 16, axis=0), fill=True, alpha=alpha_envelope[1], color=SPECTRUM_COLOR, zorder=80)
-    axs[1].stairs(np.percentile(residuals, 97.5, axis=0), edges=bin_edges, baseline=np.percentile(residuals, 2.5, axis=0), fill=True, alpha=alpha_envelope[0], color=SPECTRUM_COLOR, zorder=60)
-
+    axs[1].stairs(
+        np.median(residuals, axis=0),
+        edges=bin_edges,
+        color=SPECTRUM_COLOR,
+        label="Total",
+        alpha=alpha_median,
+        zorder=100,
+    )
+    axs[1].stairs(
+        np.percentile(residuals, 84, axis=0),
+        edges=bin_edges,
+        baseline=np.percentile(residuals, 16, axis=0),
+        fill=True,
+        alpha=alpha_envelope[1],
+        color=SPECTRUM_COLOR,
+        zorder=80,
+    )
+    axs[1].stairs(
+        np.percentile(residuals, 97.5, axis=0),
+        edges=bin_edges,
+        baseline=np.percentile(residuals, 2.5, axis=0),
+        fill=True,
+        alpha=alpha_envelope[0],
+        color=SPECTRUM_COLOR,
+        zorder=60,
+    )
 
     if x_lim is not None:
         axs[0].set_xlim(*x_lim)
@@ -198,17 +306,24 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
     if y_lim is not None:
         axs[0].set_ylim(*y_lim)
 
-    residual_lim = 3.2#max(np.max(np.abs(residuals))*1.05, 3.2)
+    residual_lim = 3.2  # max(np.max(np.abs(residuals))*1.05, 3.2)
 
-    legend_names = ["Data"] + component_names + (["Background"] if data.get('background') is not None else [])
+    legend_names = (
+        ["Data"]
+        + component_names
+        + (["Background"] if data.get("background") is not None else [])
+    )
 
     axs[1].set_ylim(-residual_lim, residual_lim)
     axs[1].axhline(0, color="black", linestyle="--", alpha=0.5)
     axs[1].axhline(-3, color="black", linestyle="--", alpha=0.5)
     axs[1].axhline(3, color="black", linestyle="--", alpha=0.5)
-    axs[1].set_ylabel("Residuals \n"+r"$\left[ \sigma \right]$")
+    axs[1].set_ylabel("Residuals \n" + r"$\left[ \sigma \right]$")
     axs[1].set_xlabel("Energy [keV]")
-    axs[0].set_ylabel("Observed Spectrum \n" + r"[$\frac{\text{Counts}}{\text{cm}^2  \text{keV} \text{s}}$]")
+    axs[0].set_ylabel(
+        "Observed Spectrum \n"
+        + r"[$\frac{\text{Counts}}{\text{cm}^2  \text{keV} \text{s}}$]"
+    )
     axs[1].set_yticks([-3, 0, 3])
 
     if legend:
@@ -217,10 +332,10 @@ def plot_ppc(solver, component_names=None, x_lim=None, y_lim=None, figsize=(12, 
     fig.align_ylabels()
 
     return fig
-    #plt.savefig(outputfiles_basename + 'convolved_posterior.pdf', bbox_inches='tight')
+    # plt.savefig(outputfiles_basename + 'convolved_posterior.pdf', bbox_inches='tight')
+
 
 def get_effective_area():
-
     Plot.area = True
     Plot("ldata")
     res_divided_by_area = Plot.model()
@@ -229,4 +344,4 @@ def get_effective_area():
     Plot("ldata")
     res_not_divided_by_area = Plot.model()
 
-    return np.asarray(res_not_divided_by_area)/np.asarray(res_divided_by_area)
+    return np.asarray(res_not_divided_by_area) / np.asarray(res_divided_by_area)

@@ -3,29 +3,33 @@ from abc import ABC, abstractmethod
 
 
 class Embedding(ABC):
-
     trainable: bool = False
 
     @abstractmethod
-
-    @abstractmethod
     def __call__(self, spectra):
-        """
-        Implements the compression scheme related to the embedding
+        """Compress spectra into the embedding space.
+
+        Parameters:
+            spectra (numpy.ndarray): Input spectra to transform. The array can
+                be 1D (single spectrum) or 2D (batch of spectra).
+
+        Returns:
+            (numpy.ndarray): Embedded representation for each spectrum.
         """
         pass
 
     @property
     @abstractmethod
     def names(self) -> list[str]:
-        """
-        Returns the names of the embedding dimensions
+        """Return human-readable labels for each embedding dimension.
+
+        Returns:
+            (list[str]): Names aligned with the embedding output order.
         """
         return []
 
 
 class MultipleEmbedding(Embedding):
-
     def __init__(self, embeddings: list[Embedding]):
         self.embeddings = embeddings
 
@@ -34,7 +38,6 @@ class MultipleEmbedding(Embedding):
         return [name for embedding in self.embeddings for name in embedding.names]
 
     def __call__(self, spectra):
-
         reduced_spectra_list = []
 
         if spectra.ndim == 1:

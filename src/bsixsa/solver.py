@@ -19,7 +19,7 @@ import torch.nn as nn
 import cmasher as cmr
 import scipy as sp
 from sbi.inference import ImportanceSamplingPosterior
-from sbi.inference import NPE#import FMPE as NPE
+from sbi.inference import NPE  # import FMPE as NPE
 from sbi.utils import BoxUniform
 from sbi.utils import RestrictedPrior, get_density_thresholder
 import matplotlib.pyplot as plt
@@ -44,85 +44,127 @@ class XSilence(object):
 
 
 def create_prior_function(transformations):
-    """
-    Create a single prior transformation function from a list of
-    transformations for each parameter. This assumes the priors factorize.
+    """Compose independent parameter transforms into a single prior map.
+
+    Parameters:
+        transformations (Sequence[dict]): Metadata describing the forward
+            transform for each parameter. Each dict must provide a
+            ``"transform"`` callable.
+
+    Returns:
+        Callable[[numpy.ndarray], numpy.ndarray]: Function that maps unit-cube
+            samples into the parameter space while respecting individual
+            priors.
     """
 
     def prior(cube):
         params = cube.copy()
         for i, t in enumerate(transformations):
-            transform = t['transform']
+            transform = t["transform"]
             params[i] = transform(cube[i])
         return params
 
     return prior
 
+
 def create_reverse_function(transformations):
-    """
-    Create a single prior transformation function from a list of
-    transformations for each parameter. This assumes the priors factorize.
+    """Compose inverse prior transforms into a single callable.
+
+    Parameters:
+        transformations (Sequence[dict]): Metadata describing the reverse
+            transform for each parameter. Each dict must provide an
+            ``"aftertransform"`` callable.
+
+    Returns:
+        Callable[[numpy.ndarray], numpy.ndarray]: Function that maps parameter
+            values back onto the unit cube.
     """
 
     def reverse(cube):
         params = cube.copy()
         for i, t in enumerate(transformations):
-            transform = t['aftertransform']
+            transform = t["aftertransform"]
             params[i] = transform(cube[i])
         return params
 
     return reverse
 
+
 def store_chain(chainfilename, transformations, posterior, fit_statistic):
-    """Writes a MCMC chain file in the same format as the Xspec chain command."""
+    """Write samples to an XSPEC-compatible chain FITS file.
+
+    Parameters:
+        chainfilename (str): Destination path for the FITS chain file.
+        transformations (Sequence[dict]): Parameter metadata describing how to
+            undo prior transforms.
+        posterior (numpy.ndarray): Posterior samples with shape
+            ``(n_samples, n_parameters)`` in unit-cube space.
+        fit_statistic (numpy.ndarray): Fit statistic associated with each
+            sample.
+    """
     import astropy.io.fits as pyfits
 
     group_index = 1
-    old_model = transformations[0]['model']
+    old_model = transformations[0]["model"]
     names = []
     for t in transformations:
-        if t['model'] != old_model:
+        if t["model"] != old_model:
             group_index += 1
-        old_model = t['model']
-        names.append('%s__%d' % (t['name'], t['index'] + (group_index - 1) * old_model.nParameters))
+        old_model = t["model"]
+        names.append(
+            "%s__%d"
+            % (t["name"], t["index"] + (group_index - 1) * old_model.nParameters)
+        )
 
-    columns = [pyfits.Column(
-        name=name, format='D', array=t['aftertransform'](posterior[:, i]))
-        for i, name in enumerate(names)]
-    columns.append(pyfits.Column(name='FIT_STATISTIC', format='D', array=fit_statistic))
+    columns = [
+        pyfits.Column(name=name, format="D", array=t["aftertransform"](posterior[:, i]))
+        for i, name in enumerate(names)
+    ]
+    columns.append(pyfits.Column(name="FIT_STATISTIC", format="D", array=fit_statistic))
     table = pyfits.ColDefs(columns)
     header = pyfits.Header()
     header.add_comment("""Created with B-SISXA""")
     header.add_comment("""Based on BXA (Bayesian X-ray spectal Analysis) for Xspec""")
     header.add_comment("""refer to https://github.com/JohannesBuchner/""")
-    header['TEMPR001'] = 1.
-    header['STROW001'] = 1
-    header['EXTNAME'] = 'CHAIN'
+    header["TEMPR001"] = 1.0
+    header["STROW001"] = 1
+    header["EXTNAME"] = "CHAIN"
     tbhdu = pyfits.BinTableHDU.from_columns(table, header=header)
     tbhdu.writeto(chainfilename, overwrite=True)
 
 
 def set_parameters(transformations, values):
-    """Set current parameters."""
+    """Update the active XSPEC parameters using transformed values.
+
+    Parameters:
+        transformations (Sequence[dict]): Metadata describing each parameter,
+            including the ``"aftertransform"`` callable.
+        values (Sequence[float]): Parameter values in the transformed space
+            (typically unit-cube samples).
+    """
     assert len(values) == len(transformations)
     pars = []
     for i, t in enumerate(transformations):
-        v = float(t['aftertransform'](values[i]))
-        assert not isnan(v) and not isinf(v), 'ERROR: parameter %d (index %d, %s) to be set to %f' % (
-            i, t['index'], t['name'], v)
-        pars += [t['model'], {t['index']:v}]
+        v = float(t["aftertransform"](values[i]))
+        assert not isnan(v) and not isinf(v), (
+            "ERROR: parameter %d (index %d, %s) to be set to %f"
+            % (i, t["index"], t["name"], v)
+        )
+        pars += [t["model"], {t["index"]: v}]
     AllModels.setPars(*pars)
 
 
 class SIXSASolver(object):
-
-    allowed_stats = ['cstat', 'pstat']
-    inference : NPE
+    allowed_stats = ["cstat", "pstat"]
+    inference: NPE
 
     def __init__(
-            self, transformations, prior_function=None, outputfiles_basename='chains/', use_background=False
+        self,
+        transformations,
+        prior_function=None,
+        outputfiles_basename="chains/",
+        use_background=False,
     ):
-
         if prior_function is None:
             prior_function = create_prior_function(transformations)
 
@@ -140,29 +182,40 @@ class SIXSASolver(object):
         # self.c_stat_conversion_factor = 0. #np.sum(sp.special.gammaln(x_o + 1))
 
         # for convenience. Has to be a directory anyway for ultranest
-        if not outputfiles_basename.endswith('/'):
-            outputfiles_basename = outputfiles_basename + '/'
+        if not outputfiles_basename.endswith("/"):
+            outputfiles_basename = outputfiles_basename + "/"
 
         if not os.path.exists(outputfiles_basename):
             os.mkdir(outputfiles_basename)
 
         if self.background_to_compute:
-            self._background = (np.asarray(xspec.AllData(1).background.values) * xspec.AllData(1).background.exposure).astype(int)
-            self._backratio = np.asarray(xspec.AllData(1).exposure / xspec.AllData(1).background.exposure)
+            self._background = (
+                np.asarray(xspec.AllData(1).background.values)
+                * xspec.AllData(1).background.exposure
+            ).astype(int)
+            self._backratio = np.asarray(
+                xspec.AllData(1).exposure / xspec.AllData(1).background.exposure
+            )
 
         self.outputfiles_basename = outputfiles_basename
 
     def set_paramnames(self, paramnames=None):
         if paramnames is None:
-            self.paramnames = [str(t['name']) for t in self.transformations]
+            self.paramnames = [str(t["name"]) for t in self.transformations]
         else:
             self.paramnames = paramnames
 
     def set_best_fit(self):
-        """Sets model to the best fit values."""
-        #TODO : Update this function
-        x0 = self.posterior_unit_cube[:, self.posterior_sampler.log_prob(self.posterior_unit_cube.T).argmax()]
-        result = minimize(lambda p: -self.posterior_sampler.log_prob(p, track_gradients=True), x0, method='newton-exact')
+        """Set current XSPEC parameters to the maximum a posteriori sample."""
+        # TODO : Update this function
+        x0 = self.posterior_unit_cube[
+            :, self.posterior_sampler.log_prob(self.posterior_unit_cube.T).argmax()
+        ]
+        result = minimize(
+            lambda p: -self.posterior_sampler.log_prob(p, track_gradients=True),
+            x0,
+            method="newton-exact",
+        )
         best_fit = result.x
         params = self.prior_function(best_fit.numpy())
         set_parameters(transformations=self.transformations, values=params)
@@ -171,14 +224,26 @@ class SIXSASolver(object):
     def num_parameters(self):
         return len(self.transformations)
 
-    def sample_parameters(self, n_samples:int, *, kind:Literal["to_unit_cube", "to_bxa", "to_xspec"]="to_xspec", sampler=None):
-        r"""
-        Sample parameters $\theta$ in a given space.
+    def sample_parameters(
+        self,
+        n_samples: int,
+        *,
+        kind: Literal["to_unit_cube", "to_bxa", "to_xspec"] = "to_xspec",
+        sampler=None,
+    ):
+        r"""Sample parameters :math:`\theta` in the requested coordinate system.
 
         Parameters:
-            n_samples : number of parameters to sample
-            kind : Parameter space to sample over. `to_unit_cube` will sample $\theta$ in the unit cube. `to_bxa` will sample $\theta$ in the `BXA` space (log-distributed values are in log-space, other in real-space) CF unit_cube_to_bxa. `to_xspec` will sample $\theta$ in the `xspec` space (everything is in real-space and formatted as `setPars` friendly dictionaries) CF unit_cube_to_xspec
+            n_samples (int): Number of draws to generate.
+            kind (Literal["to_unit_cube", "to_bxa", "to_xspec"], optional):
+                Target space for the returned samples. Defaults to
+                ``"to_xspec"``.
+            sampler (Callable | None): Optional custom sampler that returns
+                unit-cube samples. If ``None``, a ``BoxUniform`` prior is used.
 
+        Returns:
+            torch.Tensor | numpy.ndarray | list[dict]: Samples expressed in the
+                requested space.
         """
 
         device = "cpu"
@@ -191,7 +256,7 @@ class SIXSASolver(object):
         else:
             raise NotImplementedError
 
-        theta = sampler.sample((n_samples,)) # In the unit cube space
+        theta = sampler.sample((n_samples,))  # In the unit cube space
 
         if kind == "to_unit_cube":
             return theta
@@ -205,19 +270,29 @@ class SIXSASolver(object):
         else:
             raise NotImplementedError
 
-
     def unit_cube_to_bxa(self, theta):
-        """
-        Convert parameters drawn on the unit cube to BXA format. The output is an array of format (N_parameters x N_draws)
-        where the parameter values can be in log-space if the prior is "log".
+        """Convert unit-cube samples to the mixed BXA parameter space.
+
+        Parameters:
+            theta (numpy.ndarray): Array of samples drawn on ``[0, 1]`` with
+                shape ``(n_parameters, n_draws)``.
+
+        Returns:
+            numpy.ndarray: Samples mapped into the BXA space, where log-uniform
+                priors remain in log space.
         """
 
         return self.prior_function(theta)
 
     def unit_cube_to_xspec(self, theta):
-        """
-        Convert parameters drawn on the unit cube to XSPEC format. The output is an array of dictionaries containing
-        the parameter index and values in real space.
+        """Convert unit-cube samples to XSPEC ``setPars`` dictionaries.
+
+        Parameters:
+            theta (numpy.ndarray): Array of samples on the unit cube with shape
+                ``(n_parameters, n_draws)``.
+
+        Returns:
+            list[dict]: Parameter dictionaries ready to be consumed by XSPEC.
         """
 
         parameters_bxa = self.unit_cube_to_bxa(theta)
@@ -225,7 +300,7 @@ class SIXSASolver(object):
         parameters_xspec = np.apply_along_axis(
             lambda p: transform_parameters_for_xspec(self.transformations, p),
             0,
-            parameters_bxa
+            parameters_bxa,
         )
 
         return parameters_xspec
@@ -234,32 +309,54 @@ class SIXSASolver(object):
         theta = theta.numpy().T
         parameters_xspec = self.unit_cube_to_xspec(theta)
         cstat = parallel_folding(parameters_xspec, return_stat=True).squeeze()
-        ll = -0.5 * cstat # - self.c_stat_conversion_factor
+        ll = -0.5 * cstat  # - self.c_stat_conversion_factor
         result = torch.from_numpy(ll)
 
         return result
 
+    @property
+    def observed_spectrum(self):
+        return np.asarray(xspec.AllData(1).values, dtype=np.float32) * xspec.AllData(1).exposure
+
     def run(
-            self,
-            num_simulations_per_round:list[int],
-            *,
-            embedding: Optional[Embedding | list[Embedding]]=None,
-            npe_kwargs=None,
-            training_kwargs=None,
-            clear_simulations=False,
-            plot_embedding_coverage=True,
-            device="cpu"
+        self,
+        num_simulations_per_round: list[int],
+        *,
+        embedding: Optional[Embedding | list[Embedding]] = None,
+        npe_kwargs=None,
+        training_kwargs=None,
+        clear_simulations=False,
+        plot_embedding_coverage=True,
+        device="cpu",
     ):
-        """
-        Run the solver
+        """Run sequential simulation-based inference for the configured model.
 
         Parameters:
-            num_simulations_per_round (list[int]): number of simulations to perform per inference round
+            num_simulations_per_round (list[int]): Number of simulations per
+                inference round.
+            embedding (Embedding | list[Embedding] | None): Embedding module or
+                per-round list of embeddings applied to simulated spectra.
+            npe_kwargs (dict | None): Keyword arguments forwarded to the NPE
+                constructor.
+            training_kwargs (dict | list[dict] | None): Per-round training
+                arguments for the density estimator.
+            clear_simulations (bool, optional): Whether to drop stored
+                simulations after training. Defaults to ``False``.
+            plot_embedding_coverage (bool, optional): Enable diagnostic plots of
+                embedding coverage. Defaults to ``True``.
+            device (str, optional): Torch device identifier. Defaults to
+                ``"cpu"``.
+
+        Returns:
+            ImportanceSamplingPosterior: Final importance-sampling posterior
+                enriched with SIR corrections.
         """
 
         if Fit.statMethod.lower() not in SIXSASolver.allowed_stats:
             raise RuntimeError(
-                'ERROR: not using cstat or pstat! set Fit.statMethod to cash before analysing (currently: %s)!' % Fit.statMethod)
+                "ERROR: not using cstat or pstat! set Fit.statMethod to cash before analysing (currently: %s)!"
+                % Fit.statMethod
+            )
 
         if training_kwargs is None:
             training_kwargs = {}
@@ -267,19 +364,16 @@ class SIXSASolver(object):
             npe_kwargs = {}
 
         num_parameters = len(self.transformations)
+        num_rounds = len(num_simulations_per_round)
+
         posteriors = []
 
-        # Gather spectrum insights
-        observed_spectrum = np.asarray(xspec.AllData(1).values) * xspec.AllData(1).exposure
 
         if not isinstance(training_kwargs, list):
-            training_kwargs = [training_kwargs]*num_rounds
-
-        if not isinstance(num_simulations, list):
-            num_simulations = [num_simulations]*num_rounds
+            training_kwargs = [training_kwargs] * num_rounds
 
         if isinstance(embedding, Embedding):
-            embedding_list = [embedding]*num_rounds
+            embedding_list = [embedding] * num_rounds
 
         elif isinstance(embedding, list):
             embedding_list = embedding
@@ -301,30 +395,37 @@ class SIXSASolver(object):
             embedding_net=self.embedding_net,
         )
 
-        inference = NPE(prior=prior, density_estimator=self.density_estimator_build_fun, device=device, **npe_kwargs)
+        inference = NPE(
+            prior=prior,
+            density_estimator=self.density_estimator_build_fun,
+            device=device,
+            **npe_kwargs,
+        )
 
         cc = ChainConsumer()
         colors = self.round_colors(num_rounds)
 
         for rounds in range(num_rounds):
-
             posterior, proposal, inference = self.perform_inference_round(
                 prior,
                 proposal,
                 inference,
-                num_simulations[rounds],
+                num_simulations_per_round[rounds],
                 embedding=embedding_list[rounds],
-                observation=observed_spectrum,
                 round_number=rounds + 1,
                 is_last_round=rounds == num_rounds - 1,
                 training_kwargs=training_kwargs[rounds],
                 device=device,
-                plot_embedding_coverage=plot_embedding_coverage
+                plot_embedding_coverage=plot_embedding_coverage,
             )
 
-            round_samples = self.unit_cube_to_xspec(posterior.sample((10000,)).numpy().T)
+            round_samples = self.unit_cube_to_xspec(
+                posterior.sample((10000,)).numpy().T
+            )
 
-            chain = self.chain_from_sample(round_samples, name=f"Round {rounds + 1}", color=colors[rounds])
+            chain = self.chain_from_sample(
+                round_samples, name=f"Round {rounds + 1}", color=colors[rounds]
+            )
             cc.add_chain(chain)
             posteriors.append(posterior)
 
@@ -333,12 +434,20 @@ class SIXSASolver(object):
             inference._theta_roundwise = []
 
         self.fitted_posteriors = posteriors
-        #self.posterior_sampler = posteriors[-1]
+        # self.posterior_sampler = posteriors[-1]
 
         embedding = embedding_list[-1]
 
         if isinstance(embedding, TorchModuleEmbedding):
-            x_o = embedding(torch.from_numpy(observed_spectrum.astype(np.float32)[None, :]).to(embedding.device)).to(device).squeeze()
+            x_o = (
+                embedding(
+                    torch.from_numpy(observed_spectrum.astype(np.float32)[None, :]).to(
+                        embedding.device
+                    )
+                )
+                .to(device)
+                .squeeze()
+            )
 
         else:
             x_o = torch.from_numpy(np.squeeze(embedding(observed_spectrum))).to(device)
@@ -347,48 +456,49 @@ class SIXSASolver(object):
             potential_fn=self.log_prob_fn,
             proposal=posteriors[-1],
             method="sir",
-            oversampling_factor=128
-        ).set_default_x(
-            x_o
-        )
+            oversampling_factor=128,
+        ).set_default_x(x_o)
 
         self.posterior_sampler = posterior_sir
 
         posterior_unit_cube = self.posterior_sampler.sample((1000,)).numpy().T
         posterior_bxa = self.prior_function(posterior_unit_cube)
         posterior_xspec = self.unit_cube_to_xspec(posterior_unit_cube)
-        posterior_stat = self.simulate(posterior_xspec, return_stat=True, desc="Computing posterior statistic - ")
+        posterior_stat = self.simulate(
+            posterior_xspec, return_stat=True, desc="Computing posterior statistic - "
+        )
 
-        self.posterior_unit_cube =posterior_unit_cube
+        self.posterior_unit_cube = posterior_unit_cube
         self.inference = inference
         self.posterior = posterior_bxa.T
 
-        chainfilename = '%schain.fits' % self.outputfiles_basename
+        chainfilename = "%schain.fits" % self.outputfiles_basename
         store_chain(chainfilename, self.transformations, self.posterior, posterior_stat)
         xspec.AllChains.clear()
         xspec.AllChains += chainfilename
 
         cc.plotter.plot(filename=f"{self.outputfiles_basename}posterior_per_round.pdf")
-        plt.close('all')
+        plt.close("all")
 
-        self.plot_training_summary(filename=f"{self.outputfiles_basename}training_summary.pdf")
+        self.plot_training_summary(
+            filename=f"{self.outputfiles_basename}training_summary.pdf"
+        )
 
-        return self.posterior_sampler #posteriors[-1] #self.results posterior_sir #
+        return self.posterior_sampler  # posteriors[-1] #self.results posterior_sir #
 
     def create_flux_chain(self, spectrum, erange="2.0 10.0", nsamples=None):
-        """
-        For each posterior sample, computes the flux in the given energy range.
+        """Evaluate fluxes for posterior samples within a given energy band.
 
-        The so-created chain can be combined with redshift information to propagate
-        the uncertainty. This is especially important if redshift is a variable
-        parameter in the fit (with some prior).
+        Parameters:
+            spectrum: XSPEC spectrum object providing the ``flux`` attribute.
+            erange (str, optional): Energy band passed to
+                ``AllModels.calcFlux``. Defaults to ``"2.0 10.0"``.
+            nsamples (int | None): Number of posterior samples to consider.
+                Defaults to all available samples.
 
-        Returns erg/cm^2 energy flux (first column) and photon flux (second column)
-        for each posterior sample.
-
-        :param spectrum: spectrum to use for spectrum.flux
-        :param erange: argument to AllModels.calcFlux, energy range
-        :param nsamples: number of samples to consider (the default, None, means all)
+        Returns:
+            (numpy.ndarray): Two-column array containing energy flux and photon
+                flux for each posterior sample.
         """
         # prefix = analyzer.outputfiles_basename
         # modelnames = set([t['model'].name for t in transformations])
@@ -406,15 +516,24 @@ class SIXSASolver(object):
             return numpy.array(flux)
 
     def posterior_predictions_convolved(
-            self, component_names=None, plot_args=None, nsamples=400, plottype='counts'
+        self, component_names=None, plot_args=None, nsamples=400, plottype="counts"
     ):
-        """Plot convolved model posterior predictions.
+        """Generate convolved posterior predictive bands for plotting.
 
-        Also returns data points for plotting.
+        Parameters:
+            component_names (list[str] | None): Labels associated with each
+                additive model component. Use ``"ignore"`` to skip a component
+                in the plot.
+            plot_args (list[dict] | None): Matplotlib keyword arguments per
+                component.
+            nsamples (int, optional): Number of posterior samples to draw.
+                Defaults to 400.
+            plottype (str, optional): XSPEC plot type passed to ``Plot``.
+                Defaults to ``"counts"``.
 
-        :param component_names: labels to use. Set to 'ignore' to skip plotting a component
-        :param plot_args: matplotlib.pyplot.plot arguments for each component
-        :param nsamples: number of posterior samples to use (lower is faster)
+        Returns:
+            dict: Observational data, model bands, and metadata needed for
+                plotting posterior predictive checks.
         """
         # get data, binned to 10 counts
         # overplot models
@@ -422,17 +541,21 @@ class SIXSASolver(object):
         data = [None]  # bin, bin width, data and data error
         models = []  #
         if component_names is None:
-            component_names = ['convolved model'] + ['component%d' for i in range(100 - 1)]
+            component_names = ["convolved model"] + [
+                "component%d" for i in range(100 - 1)
+            ]
         if plot_args is None:
             plot_args = [{}] * 100
-            for i, c in enumerate(plt.rcParams['axes.prop_cycle'].by_key()['color']):
+            for i, c in enumerate(plt.rcParams["axes.prop_cycle"].by_key()["color"]):
                 plot_args[i] = dict(color=c)
                 del i, c
         bands = []
         Plot.background = True
         Plot.add = True
 
-        for content in self.posterior_predictions_plot(plottype=plottype, nsamples=nsamples):
+        for content in self.posterior_predictions_plot(
+            plottype=plottype, nsamples=nsamples
+        ):
             xmid = content[:, 0]
             ndata_columns = 6 if Plot.background else 4
             ncomponents = content.shape[1] - ndata_columns
@@ -449,44 +572,63 @@ class SIXSASolver(object):
             models.append(model_contributions)
 
         for band, label, component_plot_args in zip(bands, component_names, plot_args):
-            if label == 'ignore': continue
-            lineargs = dict(drawstyle='steps', color='k')
+            if label == "ignore":
+                continue
+            lineargs = dict(drawstyle="steps", color="k")
             lineargs.update(component_plot_args)
-            shadeargs = dict(color=lineargs['color'])
+            shadeargs = dict(color=lineargs["color"])
             band.shade(alpha=0.5, **shadeargs)
             band.shade(q=0.495, alpha=0.1, **shadeargs)
             band.line(label=label, **lineargs)
 
         if Plot.background:
-            results = dict(list(zip('bins,width,data,error,background,backgrounderr'.split(','), data[0].transpose())))
+            results = dict(
+                list(
+                    zip(
+                        "bins,width,data,error,background,backgrounderr".split(","),
+                        data[0].transpose(),
+                    )
+                )
+            )
         else:
-            results = dict(list(zip('bins,width,data,error'.split(','), data[0].transpose())))
-        results['models'] = numpy.array(models)
+            results = dict(
+                list(zip("bins,width,data,error".split(","), data[0].transpose()))
+            )
+        results["models"] = numpy.array(models)
         return results
 
     def posterior_predictions_unconvolved(
-            self, component_names=None, plot_args=None, nsamples=400,
-            plottype='model',
+        self,
+        component_names=None,
+        plot_args=None,
+        nsamples=400,
+        plottype="model",
     ):
-        """
-        Plot unconvolved model posterior predictions.
+        """Generate unconvolved posterior predictive bands for each component.
 
-        :param component_names: labels to use. Set to 'ignore' to skip plotting a component
-        :param plot_args: list of matplotlib.pyplot.plot arguments for each component, e.g. [dict(color='r'), dict(color='g'), dict(color='b')]
-        :param nsamples: number of posterior samples to use (lower is faster)
-        :param plottype: type of plot string, passed to `xspec.Plot()`
+        Parameters:
+            component_names (list[str] | None): Labels for model components;
+                use ``"ignore"`` to skip drawing a component.
+            plot_args (list[dict] | None): Matplotlib keyword arguments per
+                component.
+            nsamples (int, optional): Number of posterior samples to draw.
+                Defaults to 400.
+            plottype (str, optional): Argument passed to ``xspec.Plot``.
+                Defaults to ``"model"``.
         """
         if component_names is None:
-            component_names = ['model'] + ['component%d' for i in range(100 - 1)]
+            component_names = ["model"] + ["component%d" for i in range(100 - 1)]
         if plot_args is None:
             plot_args = [{}] * 100
-            for i, c in enumerate(plt.rcParams['axes.prop_cycle'].by_key()['color']):
+            for i, c in enumerate(plt.rcParams["axes.prop_cycle"].by_key()["color"]):
                 plot_args[i] = dict(color=c)
                 del i, c
         Plot.add = True
         bands = []
 
-        for content in self.posterior_predictions_plot(plottype=plottype, nsamples=nsamples):
+        for content in self.posterior_predictions_plot(
+            plottype=plottype, nsamples=nsamples
+        ):
             xmid = content[:, 0]
             ncomponents = content.shape[1] - 2
             for component in range(ncomponents):
@@ -497,17 +639,25 @@ class SIXSASolver(object):
                 bands[component].add(y)
 
         for band, label, component_plot_args in zip(bands, component_names, plot_args):
-            if label == 'ignore': continue
-            lineargs = dict(drawstyle='steps', color='k')
+            if label == "ignore":
+                continue
+            lineargs = dict(drawstyle="steps", color="k")
             lineargs.update(component_plot_args)
-            shadeargs = dict(color=lineargs['color'])
+            shadeargs = dict(color=lineargs["color"])
             band.shade(alpha=0.5, **shadeargs)
             band.shade(q=0.495, alpha=0.1, **shadeargs)
             band.line(label=label, **lineargs)
 
     def posterior_predictions_plot(self, plottype, nsamples=None):
-        """
-        Internal Routine used by posterior_predictions_unconvolved, posterior_predictions_convolved
+        """Yield XSPEC plot arrays for posterior predictive visualisations.
+
+        Parameters:
+            plottype (str): Plot type forwarded to ``xspec.Plot``.
+            nsamples (int | None): Number of posterior samples to evaluate.
+
+        Returns:
+            (numpy.ndarray): Arrays containing plot-ready data for each sampled
+                posterior draw.
         """
         # for plotting, we don't need so many points, and especially the
         # points that barely made it into the analysis are not that interesting.
@@ -516,7 +666,7 @@ class SIXSASolver(object):
 
         with XSilence():
             olddevice = Plot.device
-            Plot.device = '/null'
+            Plot.device = "/null"
 
             # plot models
             maxncomp = 100 if Plot.add else 0
@@ -524,18 +674,26 @@ class SIXSASolver(object):
                 set_parameters(values=row, transformations=self.transformations)
                 Plot(plottype)
                 # get plot data
-                if plottype == 'model':
-                    base_content = numpy.transpose([
-                        Plot.x(), Plot.xErr(), Plot.model()])
+                if plottype == "model":
+                    base_content = numpy.transpose(
+                        [Plot.x(), Plot.xErr(), Plot.model()]
+                    )
                 elif Plot.background:
-                    base_content = numpy.transpose([
-                        Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(),
-                        Plot.backgroundVals(), numpy.zeros_like(Plot.backgroundVals()),
-                        Plot.model()])
+                    base_content = numpy.transpose(
+                        [
+                            Plot.x(),
+                            Plot.xErr(),
+                            Plot.y(),
+                            Plot.yErr(),
+                            Plot.backgroundVals(),
+                            numpy.zeros_like(Plot.backgroundVals()),
+                            Plot.model(),
+                        ]
+                    )
                 else:
-                    base_content = numpy.transpose([
-                        Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(),
-                        Plot.model()])
+                    base_content = numpy.transpose(
+                        [Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(), Plot.model()]
+                    )
                 # get additive components, if there are any
                 comp = []
                 for i in range(1, maxncomp):
@@ -543,19 +701,26 @@ class SIXSASolver(object):
                         comp.append(Plot.addComp(i))
                     except Exception:
                         print(
-                            'The error "***XSPEC Error: Requested array does not exist for this plot." can be ignored.')
+                            'The error "***XSPEC Error: Requested array does not exist for this plot." can be ignored.'
+                        )
                         maxncomp = i
                         break
-                content = numpy.hstack((base_content, numpy.transpose(comp).reshape((len(base_content), -1))))
+                content = numpy.hstack(
+                    (
+                        base_content,
+                        numpy.transpose(comp).reshape((len(base_content), -1)),
+                    )
+                )
                 yield content
             Plot.device = olddevice
 
-
     @property
     def parameter_names_uniques(self):
-        """
-        Return a list of unique parameter names, with component names appended if necessary.
-        The list is ordered as the parameters appear in the XSPEC model.
+        """Return unique parameter names aligned with XSPEC ordering.
+
+        Returns:
+            (list[str]): Parameter names augmented with component identifiers to
+                avoid duplicates.
         """
 
         xspec_model = xspec.AllModels(1)
@@ -587,57 +752,65 @@ class SIXSASolver(object):
             for parameter in getattr(xspec_model, component).parameterNames:
                 parameter_names.append(parameter)
                 component_names.append(component)
-                parameter_index.append(getattr(getattr(xspec_model, component), parameter).index - 1)
+                parameter_index.append(
+                    getattr(getattr(xspec_model, component), parameter).index - 1
+                )
 
         parameter_names_vanilla = list(np.asarray(parameter_names)[parameter_index])
         component_names = list(np.asarray(component_names)[parameter_index])
         return rename_parameters(parameter_names_vanilla, component_names)
 
     def posterior_dataframe(self, num_samples=10_000):
-        """
-        Build a posterior dataframe from the lastest fitted neural network
+        """Build a posterior sample table from the fitted neural network.
 
         Parameters:
-            num_samples (int): number of samples to draw
+            num_samples (int, optional): Number of samples to draw from the
+                posterior sampler. Defaults to 10_000.
+
+        Returns:
+            pandas.DataFrame: Table with parameter samples and corresponding
+                importance weights.
         """
-        from scipy.special import softmax
 
-        indexes = np.sort([t['index'] for t in self.transformations])
+        indexes = np.sort([t["index"] for t in self.transformations])
 
-        samples, log_weight = self.posterior_sampler.sample((num_samples,), method="importance")
+        samples, log_weight = self.posterior_sampler.sample(
+            (num_samples,), method="importance"
+        )
         finite_weight = torch.isfinite(log_weight)
         samples = samples[finite_weight]
         log_weight = log_weight[finite_weight]
 
-        # Stabilize weights by subtracting the maximum log weight before exponentiation,
-        # matching the SIR post-processing used in SIXSA_CODES.
         max_log_weight = torch.max(log_weight)
         stable_log_weight = log_weight - max_log_weight
         raw_weight = torch.exp(stable_log_weight)
-        weight = raw_weight / raw_weight.sum().clamp_min(torch.finfo(raw_weight.dtype).eps)
 
         warped_samples = self.unit_cube_to_xspec(samples.numpy().T)
 
         dict_of_params = {
-            "weight": raw_weight.numpy().astype(np.float64),
-            #"weight_norm": weight.numpy().astype(np.float64),
+            "weight": raw_weight.numpy().astype(np.float32),
         }
 
         for i in indexes:
             name = self.parameter_names_uniques[i - 1]
-            dict_of_params[name] = np.asarray([warped_samples[j][i] for j in range(len(warped_samples))])
+            dict_of_params[name] = np.asarray(
+                [warped_samples[j][i] for j in range(len(warped_samples))]
+            )
 
         return pd.DataFrame.from_dict(dict_of_params)
 
-
     def predictive_coverage(self, nsamples=100, figsize=(4.5, 4.5)):
-        """
-        Plot the prior predictive coverage ensuring unit consistency: spectra are in counts and
-        the displayed data are converted to counts as well.
+        """Plot prior predictive coverage in count space.
 
         Parameters:
-            nsamples (int): number of samples to plot the predictive bands
-            figsize (tuple): size of the figure
+            nsamples (int, optional): Number of prior samples used to construct
+                the predictive bands. Defaults to 100.
+            figsize (tuple[float, float], optional): Matplotlib figure size.
+                Defaults to ``(4.5, 4.5)``.
+
+        Returns:
+            (matplotlib.figure.Figure): Figure containing the predictive bands
+                and observed spectrum.
         """
 
         Plot.device = "/null"
@@ -647,57 +820,85 @@ class SIXSASolver(object):
         parameters_xspec = self.sample_parameters(nsamples, kind="to_xspec")
 
         # 2) Simulate spectra (counts per bin). With apply_stat=True we include Poisson sampling.
-        spectrum_array = self.simulate(parameters_xspec, apply_stat=True, desc="Predictive coverage - ")
-
+        spectrum_array = self.simulate(
+            parameters_xspec, apply_stat=True, desc="Predictive coverage - "
+        )
 
         # Convert observed rates to counts using exposure time
         exposure = xspec.AllData(1).exposure
         rates = xspec.AllData(1).values
         counts = np.asarray(rates) * exposure
-        energies =  np.asarray(xspec.AllData(1).energies)
+        energies = np.asarray(xspec.AllData(1).energies)
         energies = list(energies[:, 0]) + [energies[-1, 1]]
 
         fig, ax = plt.subplots(figsize=figsize)
         # Observed data with error bars (in counts)
-        ax.stairs(counts, edges=energies, label='Observed', color="red", zorder=0)
+        ax.stairs(counts, edges=energies, label="Observed", color="red", zorder=0)
 
         # Compute predictive percentile bands (using prior predictive samples)
         # Bands correspond to 1σ, 2σ, 3σ credible regions
         bands = [
-            (0.135, 99.865, '3σ (99.73%)', 0.10),
-            (2.275, 97.725, '2σ (95.45%)', 0.15),
-            (15.865, 84.135, '1σ (68.27%)', 0.25),
+            (0.135, 99.865, "3σ (99.73%)", 0.10),
+            (2.275, 97.725, "2σ (95.45%)", 0.15),
+            (15.865, 84.135, "1σ (68.27%)", 0.25),
         ]
-        color = 'C0'
+
+        color = "C0"
         for lo_p, hi_p, label, alpha in bands:
             lo, hi = np.percentile(spectrum_array, [lo_p, hi_p], axis=0)
-            ax.stairs(hi, baseline=lo, edges=energies, color=color, alpha=alpha, label=f'Prior predictive {label}', fill=True)
+            ax.stairs(
+                hi,
+                baseline=lo,
+                edges=energies,
+                color=color,
+                alpha=alpha,
+                label=f"Prior predictive {label}",
+                fill=True,
+            )
 
         # Median prior predictive curve
         median = np.percentile(spectrum_array, 50, axis=0)
-        ax.stairs(median, edges=energies, color=color, lw=1.5, ls='--', label='Prior predictive median')
+        ax.stairs(
+            median,
+            edges=energies,
+            color=color,
+            lw=1.5,
+            ls="--",
+            label="Prior predictive median",
+        )
 
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_xlabel('Energy (keV)')
-        ax.set_ylabel('Counts')
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Energy (keV)")
+        ax.set_ylabel("Counts")
         ax.legend(frameon=False)
 
         return fig
 
     def simulate(self, parameters_xspec, **kwargs):
-        """
-        Fast simulation using parallelized XSPEC calls
+        """Simulate spectra using XSPEC, optionally adding background counts.
+
+        Parameters:
+            parameters_xspec (list[dict]): Parameter dictionaries suitable for
+                ``AllModels.setPars``.
+            **kwargs: Additional keyword arguments forwarded to
+                ``parallel_folding``.
+
+        Returns:
+            (numpy.ndarray): Simulated spectra (and optionally background) in
+                counts per bin.
         """
 
         if (not self.background_to_compute) or (kwargs.get("return_stat", False)):
             return parallel_folding(parameters_xspec, **kwargs)
 
         if self.background_to_compute:
-
-            background = np.random.poisson(
-                np.repeat(self._background[None, :], len(parameters_xspec), axis=0)
-            ) * self._backratio
+            background = (
+                np.random.poisson(
+                    np.repeat(self._background[None, :], len(parameters_xspec), axis=0)
+                )
+                * self._backratio
+            )
 
             spectra = parallel_folding(parameters_xspec, **kwargs)
 
@@ -707,33 +908,43 @@ class SIXSASolver(object):
             raise NotImplementedError
 
     def perform_inference_round(
-            self,
-            prior,
-            proposal: RestrictedPrior|Any,
-            inference,
-            num_simulations,
-            round_number=None,
-            embedding: Embedding=None,
-            observation=None,
-            is_last_round=False,
-            training_kwargs=None,
-            plot_embedding_coverage=False,
-            device="cpu"
+        self,
+        prior,
+        proposal: RestrictedPrior | Any,
+        inference,
+        num_simulations,
+        round_number=None,
+        embedding: Embedding = None,
+        is_last_round=False,
+        training_kwargs=None,
+        plot_embedding_coverage=False,
+        device="cpu",
     ):
 
         theta = proposal.sample((num_simulations,)).cpu().numpy().T
-
+        observation = self.observed_spectrum
         parameters_xspec = self.unit_cube_to_xspec(theta)
-        all_simulations = self.simulate(parameters_xspec, desc=f"Round {round_number} - " if round_number is not None else "")
+        all_simulations = self.simulate(
+            parameters_xspec,
+            desc=f"Round {round_number} - " if round_number is not None else "",
+        )
 
         if isinstance(embedding, TrainableEmbedding):
-            embedding.train(all_simulations, metrics_path=os.path.join(self.outputfiles_basename, f"embedding_training_round_{round_number}.pdf"))
+            embedding.train(
+                all_simulations,
+                metrics_path=os.path.join(
+                    self.outputfiles_basename,
+                    f"embedding_training_round_{round_number}.pdf",
+                ),
+            )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
             if isinstance(embedding, TorchModuleEmbedding):
-                all_simulations = torch.from_numpy(all_simulations.astype(np.float32)).to(embedding.device)
+                all_simulations = torch.from_numpy(
+                    all_simulations.astype(np.float32)
+                ).to(embedding.device)
 
             features = embedding(all_simulations)
             feature_names = embedding.names
@@ -759,15 +970,17 @@ class SIXSASolver(object):
         x_train = x_train.to(device).detach()
 
         if training_kwargs.get("retrain_from_scratch", True):
-            inference = NPE(prior=prior, density_estimator=self.density_estimator_build_fun, device=device)
+            inference = NPE(
+                prior=prior,
+                density_estimator=self.density_estimator_build_fun,
+                device=device,
+            )
 
         density_estimator = inference.append_simulations(
             theta_train, x_train, proposal=proposal
         ).train(**training_kwargs)
 
-        posterior = inference.build_posterior(
-            density_estimator
-        )
+        posterior = inference.build_posterior(density_estimator)
 
         if x_o is not None:
             posterior = posterior.set_default_x(x_o)
@@ -778,13 +991,12 @@ class SIXSASolver(object):
         def sample(*args, **kwargs):
             kwargs["show_progress_bars"] = kwargs.get("show_progress_bars", False)
             return original_sample(*args, **kwargs)
+
         posterior.sample = sample
 
         if not is_last_round:
             accept_reject_fn = get_density_thresholder(
-                posterior,
-                num_samples_to_estimate_support=100_000,
-                quantile=1e-3
+                posterior, num_samples_to_estimate_support=100_000, quantile=1e-3
             )
 
             proposal = RestrictedPrior(
@@ -792,13 +1004,13 @@ class SIXSASolver(object):
                 accept_reject_fn,
                 posterior=posterior,
                 sample_with="sir",
-                device=device
+                device=device,
             )
 
         else:
             proposal = posterior
 
-        #print(inference.summary)
+        # print(inference.summary)
         num_epochs = inference.summary["epochs_trained"][-1]
 
         self.epoch_trained.append(num_epochs)
@@ -810,33 +1022,35 @@ class SIXSASolver(object):
             cols = int(np.ceil(np.sqrt(len(feature_names))))
             rows = int(np.ceil(len(feature_names) / cols))
 
-            fig, axes = plt.subplots(
-                rows,
-                cols,
-                figsize=(cols * 4, rows * 4)
-            )
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
 
             axes = axes.flatten()
 
             for i, feature_name in enumerate(feature_names):
-                axes[i].hist(x_train[:, i], bins=30, color='skyblue', edgecolor='black', log=True)
-                axes[i].axvline(x_o[i].numpy(), color='red', linestyle='dashed', linewidth=2)
+                axes[i].hist(
+                    x_train[:, i], bins=30, color="skyblue", edgecolor="black", log=True
+                )
+                axes[i].axvline(
+                    x_o[i].numpy(), color="red", linestyle="dashed", linewidth=2
+                )
                 axes[i].set_title(feature_name)
 
             plt.suptitle(f"Summary stats - Round {round_number}")
             plt.tight_layout()
             plt.savefig(
                 f"{self.outputfiles_basename}features_round_{round_number}.pdf",
-                    bbox_inches="tight"
+                bbox_inches="tight",
             )
             plt.close()
 
         return posterior, proposal, inference
 
-
     def get_xspec_best_fit(self):
-        """
-        Perform a fit with Xspec and yield best fit value and covariance matrix.
+        """Run an XSPEC fit and return best-fit parameters with covariance.
+
+        Returns:
+            (tuple[numpy.ndarray, numpy.ndarray]): Flattened parameter vector and
+                covariance matrix estimated by XSPEC.
         """
 
         with XSilence():
@@ -856,30 +1070,28 @@ class SIXSASolver(object):
             return cov_matrix
 
         xspec_model = xspec.AllModels(1)
-        best_fit_parameters = np.asarray([xspec_model(i + 1).values[0] for i in range(xspec_model.nParameters)])
+        best_fit_parameters = np.asarray(
+            [xspec_model(i + 1).values[0] for i in range(xspec_model.nParameters)]
+        )
         covariance = build_covariance_matrix_np(xspec.Fit.covariance)
 
         return best_fit_parameters.ravel(), covariance
 
     def chain_from_sample(self, samples, **kwargs):
-
         parameter_names = self.parameter_names_uniques
         param_dict = {}
 
         for i, t in enumerate(self.transformations):
-
             j = t["index"]
-            name = parameter_names[j-1]
-            param_dict[name] = [sample[j] for sample in samples] # maybe change to i
+            name = parameter_names[j - 1]
+            param_dict[name] = [sample[j] for sample in samples]  # maybe change to i
 
         return Chain(samples=pd.DataFrame.from_dict(param_dict), **kwargs)
 
     def round_colors(self, num_rounds):
-
         return cmr.take_cmap_colors(cmr.cosmic_r, num_rounds, cmap_range=(0.1, 0.8))
 
     def plot_training_summary(self, figsize=(10, 7), filename=None):
-
         figure = plt.figure(figsize=figsize)
 
         prev_num = 0
@@ -888,18 +1100,22 @@ class SIXSASolver(object):
         for round, num_epoch in enumerate(self.epoch_trained):
             steps = np.arange(prev_num + 1, prev_num + 1 + num_epoch)
 
-            plt.plot(steps,
-                     self.training_loss[steps.min() - 1:steps.max()],
-                     color=colors[round],
-                     linestyle='dotted'
-                     )
+            plt.plot(
+                steps,
+                self.training_loss[steps.min() - 1 : steps.max()],
+                color=colors[round],
+                linestyle="dotted",
+            )
 
-            plt.plot(steps,
-                     self.validation_loss[steps.min() - 1:steps.max()],
-                     color=colors[round]
-                     )
+            plt.plot(
+                steps,
+                self.validation_loss[steps.min() - 1 : steps.max()],
+                color=colors[round],
+            )
 
-            plt.axvline(prev_num + num_epoch, color="black", linestyle="dotted", alpha=0.3)
+            plt.axvline(
+                prev_num + num_epoch, color="black", linestyle="dotted", alpha=0.3
+            )
             prev_num += num_epoch
 
         plt.xlabel("Epoch")
@@ -907,10 +1123,10 @@ class SIXSASolver(object):
 
         custom_lines = [
             Line2D([0], [0], color="black", linestyle="dotted"),
-            Line2D([0], [0], color="black")
+            Line2D([0], [0], color="black"),
         ]
 
-        plt.legend(custom_lines, ['Training loss', 'Validation loss'])
+        plt.legend(custom_lines, ["Training loss", "Validation loss"])
 
         if filename is not None:
             plt.savefig(filename)

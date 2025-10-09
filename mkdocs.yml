@@ -1,9 +1,11 @@
-site_name: bsixsa
+site_name: B-SIXSA
 
 nav:
   - Home:
-    - Welcome : index.md
-    - API Reference : api.md
+    - Welcome: index.md
+    - API Reference:
+      - Embedding: api/embedding.md
+      - Solver: api/solver.md
 
 theme:
   name: material
@@ -64,6 +66,7 @@ plugins:
             - https://samreay.github.io/ChainConsumer/objects.inv
             - https://python.arviz.org/en/latest/objects.inv
             - https://sbi.readthedocs.io/en/latest/objects.inv
+            - https://matplotlib.org/objects.inv
           options:
             members_order: alphabetical
             docstring_section_style: table

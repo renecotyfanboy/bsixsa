@@ -6,7 +6,6 @@ from pytest import fixture
 
 @fixture
 def xspec_config():
-
     xspec.AllData.clear()
     xspec.AllModels.clear()
     xspec.Xset.chatter = 0
@@ -21,7 +20,6 @@ def xspec_config():
 
 @fixture
 def data(xspec_config, request, monkeypatch):
-
     # Set paths and move to data directory
     file_pha = "tests/mock_data/spectrum_opt.pha"
     dir_path = os.path.dirname(file_pha)
@@ -30,7 +28,7 @@ def data(xspec_config, request, monkeypatch):
     # Load XSPEC obs and set energy band
     xspec_observation = xspec.Spectrum("spectrum_opt.pha")
     xspec_observation.background = None
-    low_energy, high_energy = 0.3, 12.
+    low_energy, high_energy = 0.3, 12.0
     xspec_observation.ignore(f"0.0-{low_energy:.1f} {high_energy:.1f}-**")
 
     # Load XSPEC model
@@ -38,6 +36,7 @@ def data(xspec_config, request, monkeypatch):
     xspec_model = xspec.AllModels(1)
 
     return xspec_model, xspec_observation
+
 
 @fixture
 def mock_data(data):
