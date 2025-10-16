@@ -1,4 +1,4 @@
-::: bsixsa.embedding.Embedding
+::: bsixsa.embedding.abc.Embedding
     options:
       show_root_heading: true
       show_root_toc_entry: true

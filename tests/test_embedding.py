@@ -1,7 +1,6 @@
 import pytest
 import scipy as sp
 import numpy as np
-from pytest import fixture
 from bsixsa.embedding import MultipleEmbedding
 from bsixsa.embedding.summary import (
     GlobalSummaryEmbedding,
@@ -10,7 +9,6 @@ from bsixsa.embedding.summary import (
     LocalSumAndRatioEmbedding,
     basic_global_stats,
 )
-from tests.conftest import mock_data
 
 custom_global_stats = {
     "kurtosis": lambda x: sp.stats.kurtosis(x, axis=1),

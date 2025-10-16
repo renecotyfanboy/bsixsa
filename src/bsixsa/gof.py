@@ -3,9 +3,11 @@ Compute poisson-based GOF
 """
 
 from __future__ import print_function
-import sys, os
+import sys
+import os
 import numpy
-import scipy.stats, scipy.special
+import scipy.stats
+import scipy.special
 import matplotlib.pyplot as plt
 
 
@@ -67,7 +69,6 @@ def gen_choices(cpart, k):
 
 
 def calc_models_range(data):
-    stats = []
     lowmodel = numpy.zeros_like(data) * 1e-10
     highmodel = numpy.ones_like(data) * 1e10
     for i in range(20):

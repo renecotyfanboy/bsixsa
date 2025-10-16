@@ -273,12 +273,14 @@ class TrainableEmbedding(Embedding, ABC):
     trainable = True
 
     @abstractmethod
-    def train(self, data, *, loss_fn: Callable, metrics_path, **kwargs):
+    def train(self, *args, **kwargs):
         pass
 
 
 class TorchModuleEmbedding(TrainableEmbedding, ABC):
-    def __init__(self, model, **kwargs):
+    def __init__(self, retrain_from_scratch: bool = True, **model_kwargs):
+        self.retrain_from_scratch = retrain_from_scratch
+
         self.device = torch.device(
             "mps"
             if torch.backends.mps.is_available()
@@ -287,7 +289,8 @@ class TorchModuleEmbedding(TrainableEmbedding, ABC):
             else "cpu"
         )
 
-        self.model = model.to(self.device)
+        self.model_kwargs = model_kwargs
+        self.model = self.build_model(**self.model_kwargs).to(self.device)
 
     @property
     def input_dim(self):
@@ -303,29 +306,59 @@ class TorchModuleEmbedding(TrainableEmbedding, ABC):
             ).shape[1]
         )
 
+    @abstractmethod
+    def build_model(self, **kwargs):
+        pass
+
     def names(self) -> list[str]:
         return [f"latent {i}" for i in range(1, self.embedding_dim + 1)]
 
-    def train(self, data, *, loss_fn: LossFn, metrics_path, **kwargs):
+    def train(
+        self,
+        data,
+        *,
+        loss_fn: LossFn,
+        metrics_path,
+        max_epochs: int = 1_000,
+        prefix="Training | ",
+        **kwargs,
+    ):
+        # Reset the weights
+        if self.retrain_from_scratch:
+            self.model = self.build_model().to(self.device)
+
+        # Fit the scaler if it exists
+        scaled_data = self.model.transform.forward(
+            torch.from_numpy(data.astype(np.float32)).to(self.device)
+        )
+        self.model.scaler.fit(scaled_data)
+
+        # Train the model
         self.model = training_loop(
             self.model,
             data,
             loss_fn=loss_fn,
             device=self.device,
             metrics_path=metrics_path,
+            max_epochs=max_epochs,
+            prefix=prefix,
             **kwargs,
         )
 
 
 class AutoencoderEmbedding(TorchModuleEmbedding):
-    def __init__(self, latent_dim=32, retrain_from_scratch: bool = False, **kwargs):
+    def __init__(self, latent_dim=32, hidden=(2, 4), **kwargs):
         self.latent_dim = latent_dim
-        self.retrain_from_scratch = retrain_from_scratch
-        model = self.build_model()
-        super().__init__(model, **kwargs)
+        model_kwargs = dict(hidden_dims=[self.input_dim // h for h in hidden])
 
-    def build_model(self):
-        return Autoencoder(self.input_dim, self.latent_dim, [self.input_dim // 2])
+        super().__init__(**(model_kwargs | kwargs))
+
+    @property
+    def embedding_dim(self):
+        return self.latent_dim
+
+    def build_model(self, **kwargs):
+        return Autoencoder(self.input_dim, self.latent_dim, **kwargs)
 
     def __call__(self, spectra):
         if not isinstance(spectra, torch.Tensor):
@@ -334,10 +367,6 @@ class AutoencoderEmbedding(TorchModuleEmbedding):
         return self.model.encoder(spectra)
 
     def train(self, data, **kwargs):
-        if self.retrain_from_scratch:
-            self.model = self.build_model().to(self.device)
-
-        self.model.scaler.fit(torch.from_numpy(data.astype(np.float32)).to(self.device))
         metrics_path = kwargs.pop("metrics_path", None)
 
         super().train(
@@ -371,6 +400,7 @@ class VAEEmbedding(TorchModuleEmbedding):
 
     def train(self, data, **kwargs):
         log_data = np.log1p(data)
+
         mean = torch.from_numpy(np.mean(log_data.astype(np.float32), axis=0)).to(
             self.device
         )

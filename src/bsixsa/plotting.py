@@ -40,7 +40,7 @@ def sigma_to_percentile_intervals(sigmas):
     return intervals
 
 
-def error_bars_for_observed_data(observed_counts, sigma=1):
+def poisson_error_bars(observed_counts, sigma=1):
     r"""Calculate Gamma-prior credible intervals for observed counts.
 
     Parameters:
@@ -49,7 +49,7 @@ def error_bars_for_observed_data(observed_counts, sigma=1):
             sigmas for the resulting quantile interval. Defaults to 1.
 
     Returns:
-        tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: Observed counts,
+        (tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]): Observed counts,
             lower bound, and upper bound corresponding to the requested
             credible interval.
     """
@@ -65,6 +65,7 @@ def error_bars_for_observed_data(observed_counts, sigma=1):
 
 def plot_ppc(
     solver,
+    sampler,
     component_names=None,
     x_lim=None,
     y_lim=None,
@@ -73,11 +74,42 @@ def plot_ppc(
     legend=True,
     n_samples=100,
 ):
+    r"""Plot posterior predictive spectra with residuals.
+
+    Parameters:
+        solver: Fitted solver instance exposing
+            ``posterior_predictions_convolved`` and background attributes.
+        sampler: Sampler used to draw posterior samples. Currently unused but
+            retained for interface parity with notebook code.
+        component_names (list[str]): Ordered component identifiers to plot. The
+            first entry is interpreted as the total spectrum contribution.
+        x_lim (tuple[float, float], optional): Energy bounds in keV for the
+            upper panel x-axis.
+        y_lim (tuple[float, float], optional): Flux limits for the upper panel
+            y-axis.
+        figsize (tuple[float, float], optional): Matplotlib figure size in
+            inches. Defaults to ``(12, 6)``.
+        plot_background (bool, optional): If ``True`` and the solver provides a
+            background component, draw its predictive envelope. Defaults to
+            ``False``.
+        legend (bool, optional): Whether to display the component legend on the
+            spectrum panel. Defaults to ``True``.
+        n_samples (int, optional): Number of posterior predictive samples to
+            request from ``solver.posterior_predictions_convolved``. Defaults to
+            ``100``.
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the predictive spectrum and
+        residual panels.
+    """
     if component_names is None:
         raise ValueError("component_names must be specified")
 
     data = solver.posterior_predictions_convolved(
-        component_names=component_names, nsamples=n_samples, plottype="counts"
+        component_names=component_names,
+        n_samples=n_samples,
+        plottype="counts",
+        sampler=sampler,
     )
 
     plt.close("all")
@@ -103,7 +135,7 @@ def plot_ppc(
         nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
     )
 
-    y_observed, y_observed_low, y_observed_high = error_bars_for_observed_data(
+    y_observed, y_observed_low, y_observed_high = poisson_error_bars(
         count_data, sigma=1
     )
     y_observed, y_observed_low, y_observed_high = (
@@ -195,8 +227,8 @@ def plot_ppc(
     if plot_background and data.get("background") is not None:
         background = data["background"] * data["width"] * 2 / solver._backratio
 
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
-            error_bars_for_observed_data(background, sigma=1)
+        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = poisson_error_bars(
+            background, sigma=1
         )
         y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
             y_observed_bkg * solver._backratio,
@@ -300,8 +332,11 @@ def plot_ppc(
         zorder=60,
     )
 
-    if x_lim is not None:
-        axs[0].set_xlim(*x_lim)
+    if x_lim is None:
+        energies = AllData(1).energies
+        x_lim = (np.min(energies), np.max(energies))
+
+    axs[0].set_xlim(*x_lim)
 
     if y_lim is not None:
         axs[0].set_ylim(*y_lim)
@@ -332,7 +367,6 @@ def plot_ppc(
     fig.align_ylabels()
 
     return fig
-    # plt.savefig(outputfiles_basename + 'convolved_posterior.pdf', bbox_inches='tight')
 
 
 def get_effective_area():

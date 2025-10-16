@@ -1,1 +1,1 @@
-from .abc import Embedding, MultipleEmbedding
+from .abc import MultipleEmbedding

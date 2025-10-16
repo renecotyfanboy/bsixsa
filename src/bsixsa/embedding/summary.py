@@ -38,7 +38,6 @@ class GlobalSummaryEmbedding(Embedding):
         return list(self.stats.keys())
 
     def __call__(self, data):
-
         data_transformed_list = []
 
         if data.ndim == 1:
@@ -103,6 +102,7 @@ class LocalSumWithExtra(LocalSummaryEmbedding):
 
     where $i$ are the indexes of the instrumental bins, and $\epsilon = 1$.
     """
+
     def __init__(self, *args, with_ratio=False, with_diff=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.with_ratio = with_ratio
@@ -174,6 +174,7 @@ class WeightedEnergyEmbedding(LocalSummaryEmbedding):
 
     where $i$ is the index of the coarser bins and $j$ are the indexes of the instrumental bins.
     """
+
     @property
     def names(self) -> list[str]:
         names = []

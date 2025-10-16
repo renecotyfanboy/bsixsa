@@ -80,7 +80,6 @@ def load_solver_from_pickle(transformations, path_pickle) -> SIXSASolver:
 
 def build_dataframe_from_solver(path, solver, n_points=10000) -> pd.DataFrame:
     indexes = np.sort([t["index"] for t in solver.transformations])
-    parameter_names = np.asarray(solver.parameter_names_uniques)[indexes - 1]
 
     posterior = solver.fitted_posteriors[-1]
     samples = posterior.sample((n_points,))
@@ -89,7 +88,7 @@ def build_dataframe_from_solver(path, solver, n_points=10000) -> pd.DataFrame:
     dict_of_params = {}
 
     for i in indexes:
-        name = solver.parameter_names_uniques[i - 1]
+        name = solver.parameter_names[i - 1]
         dict_of_params[name] = np.asarray(
             [warped_samples[j][i] for j in range(len(warped_samples))]
         )

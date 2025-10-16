@@ -1,11 +1,14 @@
-site_name: B-SIXSA
+site_name: SIXSA
 
 nav:
   - Home:
     - Welcome: index.md
+    - Examples:
+        - examples/basic_fit.ipynb
     - API Reference:
-      - Embedding: api/embedding.md
       - Solver: api/solver.md
+      - Embedding: api/embedding.md
+      - Plotting: api/plotting.md
 
 theme:
   name: material
@@ -55,6 +58,11 @@ theme:
 
 plugins:
   - search
+  - mkdocs-jupyter:
+      include_source: true
+      ignore_h1_titles: true
+      execute: false
+      include_requirejs: true
   - mkdocstrings:
       default_handler: python
       handlers:
