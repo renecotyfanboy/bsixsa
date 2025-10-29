@@ -1,7 +1,7 @@
 import os
+import tempfile
 import xspec
 import numpy as np
-import uuid
 import pathos.multiprocessing as multiprocessing  # pathos
 from tqdm.auto import tqdm
 from contextlib import contextmanager, nullcontext
@@ -57,12 +57,10 @@ def get_model_block(lines):
 
 
 @contextmanager
-def local_xcm_path(params, base_xcm_path):
+def local_xcm_path(params, base_xcm_path, *, tmp_dir=None):
     """
     Build a local .xcm file path containing the values specified in params, using a base xcm path.
     """
-
-    local_xcm_path = f"local_values_{uuid.uuid4()}.xcm"
 
     with open(base_xcm_path, "r") as f:
         lines = f.readlines()
@@ -73,14 +71,23 @@ def local_xcm_path(params, base_xcm_path):
         line = f"{value:.8g}".rjust(15) + line[15:]
         lines[line_index] = line
 
-    with open(local_xcm_path, "w") as f:
-        f.writelines(lines)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".xcm",
+        dir=tmp_dir,
+        delete=False,
+    ) as tmp_file:
+        tmp_file.writelines(lines)
+        local_xcm_path = tmp_file.name
 
     try:
         yield local_xcm_path
 
     finally:
-        os.remove(local_xcm_path)
+        try:
+            os.remove(local_xcm_path)
+        except FileNotFoundError:
+            pass
 
 
 def parallel_folding(
@@ -91,20 +98,17 @@ def parallel_folding(
     if n_jobs is None:
         n_jobs = os.cpu_count()  # Use all available CPUs if n_jobs is not set
 
-    model_file = f"parallel_folding_{uuid.uuid4()}.xcm"
+    with tempfile.TemporaryDirectory(prefix="parallel_folding_") as tmp_dir:
+        model_file = os.path.join(tmp_dir, "model_template.xcm")
+        xspec.Xset.save(model_file, info="m")
 
-    if os.path.exists(model_file):
-        os.remove(model_file)
-
-    xspec.Xset.save(model_file, info="m")
-
-    try:
-        # Create a progress bar
-        with (
+        progress_cm = (
             tqdm(total=len(params), desc=desc + "Folding model")
             if progress_bar
-            else nullcontext() as pbar
-        ):
+            else nullcontext()
+        )
+
+        with progress_cm as pbar:
 
             def update_progress(_):
                 if pbar is not None:
@@ -114,40 +118,25 @@ def parallel_folding(
                 results = [
                     pool.apply_async(
                         folded_model_from_parameters,
-                        (param, model_file, apply_stat),
+                        (param, model_file, apply_stat, tmp_dir),
                         callback=update_progress,
                     )
                     for param in params
                 ]
 
-                if return_stat:
-                    result_to_return = np.vstack(
-                        [result.get()[1] for result in results]
-                    )
+                outputs = [result.get() for result in results]
 
-                else:
-                    result_to_return = np.vstack(
-                        [result.get()[0] for result in results]
-                    )
+        if return_stat:
+            return np.vstack([stat for _, stat in outputs])
 
-    except Exception as e:
-        print(f"Simulations interrupted by {e}")
-
-    finally:
-        files = os.listdir("./")
-
-        for file in files:
-            if file.startswith("parallel_folding_") or file.startswith("local_values_"):
-                os.remove(file)
-
-    return result_to_return
+        return np.vstack([spectra for spectra, _ in outputs])
 
 
-def folded_model_from_parameters(params, model_file, apply_stat):
+def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):
     from bsixsa import XSilence
 
     with XSilence():
-        with local_xcm_path(params, model_file) as local_xcm:
+        with local_xcm_path(params, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
         xspec.Fit.statMethod = "cstat"
