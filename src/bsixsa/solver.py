@@ -6,6 +6,7 @@ import numpy as np
 from sbi.sbi_types import Shape
 from ultranest.plot import PredictionBand
 import os
+import shutil
 from math import isnan, isinf
 import numpy
 import warnings
@@ -205,7 +206,9 @@ class SIXSASolver(object):
         outputfiles_basename="chains/",
         use_background=False,
         device="cpu",
+        overwrite=False,
     ):
+
         if prior_function is None:
             prior_function = create_prior_function(transformations)
 
@@ -220,12 +223,37 @@ class SIXSASolver(object):
         self.embedding_net = nn.Identity()
         self.device = device
         self.samplers = {}
+        self.current_round = 0
 
-        if not outputfiles_basename.endswith("/"):
-            outputfiles_basename = outputfiles_basename + "/"
+        normalized_output_dir = os.path.normpath(outputfiles_basename)
 
-        if not os.path.exists(outputfiles_basename):
-            os.mkdir(outputfiles_basename)
+        if not os.path.exists(normalized_output_dir):
+            os.makedirs(normalized_output_dir)
+        else:
+            if not os.path.isdir(normalized_output_dir):
+                raise ValueError(
+                    f"Output path '{outputfiles_basename}' exists and is not a directory."
+                )
+
+            existing_entries = os.listdir(normalized_output_dir)
+            if existing_entries:
+                if not overwrite:
+                    raise FileExistsError(
+                        f"Output directory '{normalized_output_dir}' is not empty. "
+                        "Pass overwrite=True to clear it."
+                    )
+
+                for entry in existing_entries:
+                    entry_path = os.path.join(normalized_output_dir, entry)
+                    if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+                        shutil.rmtree(entry_path)
+                    else:
+                        os.remove(entry_path)
+
+        if not normalized_output_dir.endswith(os.sep):
+            normalized_output_dir = normalized_output_dir + os.sep
+
+        outputfiles_basename = normalized_output_dir
 
         if self.background_to_compute:
             self._background = (
@@ -476,7 +504,6 @@ class SIXSASolver(object):
                 inference,
                 num_simulations_per_round[rounds],
                 embedding=embedding_list[rounds],
-                round_number=rounds + 1,
                 is_last_round=rounds == num_rounds - 1,
                 training_kwargs=training_kwargs[rounds],
                 device=device,
@@ -980,29 +1007,30 @@ class SIXSASolver(object):
         inference,
         num_simulations,
         *,
-        round_number,
         embedding: Embedding,
         is_last_round,
         training_kwargs=None,
         plot_embedding_coverage=False,
         device="cpu",
     ):
+        self.current_round += 1
+        round_path = os.path.join(self.outputfiles_basename, f"round_{self.current_round}")
+        os.mkdir(round_path)
+
         theta = proposal.sample((num_simulations,)).cpu().numpy().T
         observation = self.observed_spectrum
         parameters_xspec = self.unit_cube_to_xspec(theta)
         all_simulations = self.simulate(
             parameters_xspec,
-            desc=f"Round {round_number} - " if round_number is not None else "",
+            desc=f"Round {self.current_round} - " if self.current_round is not None else "",
         )
 
         if isinstance(embedding, TrainableEmbedding):
             embedding.train(
                 all_simulations,
-                metrics_path=os.path.join(
-                    self.outputfiles_basename,
-                    f"embedding_training_round_{round_number}.pdf",
-                ),
-            )
+                metrics_path=f"{round_path}/embedding_training.pdf"
+            ),
+
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1100,10 +1128,10 @@ class SIXSASolver(object):
                 )
                 axes[i].set_title(feature_name)
 
-            plt.suptitle(f"Summary stats - Round {round_number}")
+            plt.suptitle(f"Summary stats - Round {self.current_round}")
             plt.tight_layout()
             plt.savefig(
-                f"{self.outputfiles_basename}features_round_{round_number}.pdf",
+                f"{round_path}/features_round_{self.current_round}.pdf",
                 bbox_inches="tight",
             )
             plt.close()

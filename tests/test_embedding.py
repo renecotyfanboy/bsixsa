@@ -6,7 +6,7 @@ from bsixsa.embedding.summary import (
     GlobalSummaryEmbedding,
     GlobalSummaryConfig,
     LocalSumEmbedding,
-    LocalSumAndRatioEmbedding,
+    LocalSumWithExtra,
     basic_global_stats,
 )
 
@@ -79,7 +79,7 @@ def test_local_sum_embedding(mock_data, energy_grid):
     ids=["Small linear", "Large log"],
 )
 def test_local_sum_and_ratio_embedding(mock_data, energy_grid):
-    embedding = LocalSumAndRatioEmbedding(energy_grid)
+    embedding = LocalSumWithExtra(energy_grid)
     embedded = embedding(mock_data)
 
     assert embedded.shape == (len(mock_data), 2 * len(energy_grid) - 3), (
