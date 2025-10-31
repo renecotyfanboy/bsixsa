@@ -27,10 +27,10 @@ class StandardScaler(nn.Module):
         self.register_buffer("scale_", torch.std(x, dim=0), persistent=True)
 
     def forward(self, x: torch.Tensor):
-        return (x - self.mean_) / (self.scale_ + 1e-6)
+        return (x - self.mean_) / (self.scale_ + 1e-3)
 
     def inverse(self, x: torch.Tensor):
-        return (x * self.scale_) + self.mean_
+        return (x * (self.scale_ + 1e-3)) + self.mean_
 
 
 class Autoencoder(nn.Module):
@@ -153,7 +153,15 @@ class VariationalAutoencoder(nn.Module):
 
     def encoder(self, x):
         x = torch.log1p(x)
+
+        if torch.isnan(x).any():
+            raise ValueError("NaN in encoder")
+
         x = (x - self.mean) / self.std
+
+        if torch.isnan(x).any():
+            raise ValueError("NaN in encoder")
+
         x = self.encoder_module(x)
         mu, logvar = self.mu_layer(x), self.logvar_layer(x)
         return mu, logvar

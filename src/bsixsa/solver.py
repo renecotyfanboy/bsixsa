@@ -24,7 +24,6 @@ from sbi.inference import NPE  # import FMPE as NPE
 from sbi.utils import BoxUniform
 from sbi.utils import RestrictedPrior, get_density_thresholder
 import matplotlib.pyplot as plt
-
 from .embedding.trainable import TrainableEmbedding, TorchModuleEmbedding
 from .xspec_stuff import parallel_folding, transform_parameters_for_xspec
 from .plotting import plot_ppc
@@ -208,7 +207,6 @@ class SIXSASolver(object):
         device="cpu",
         overwrite=False,
     ):
-
         if prior_function is None:
             prior_function = create_prior_function(transformations)
 
@@ -222,7 +220,9 @@ class SIXSASolver(object):
         self.embedding = None
         self.embedding_net = nn.Identity()
         self.device = device
-        self.samplers = {}
+        self.samplers = dict()
+        self.inference = None
+        self.embedding_list = []
         self.current_round = 0
 
         normalized_output_dir = os.path.normpath(outputfiles_basename)
@@ -254,6 +254,12 @@ class SIXSASolver(object):
             normalized_output_dir = normalized_output_dir + os.sep
 
         outputfiles_basename = normalized_output_dir
+
+        self.density_estimator_build_fun = posterior_nn(
+            model="maf",
+            hidden_features=100,
+            num_transforms=10,
+        )
 
         if self.background_to_compute:
             self._background = (
@@ -301,7 +307,7 @@ class SIXSASolver(object):
         n_samples: int,
         *,
         kind: Literal["to_unit_cube", "to_bxa", "to_xspec"] = "to_xspec",
-        sampler: str = "prior",
+        sampler_name: str = "prior",
     ):
         r"""Sample parameters $\theta$ in the requested space.
 
@@ -318,7 +324,7 @@ class SIXSASolver(object):
                 requested space.
         """
 
-        sampler = self.samplers[sampler]
+        sampler = self.samplers[sampler_name]
         theta = sampler.sample((n_samples,))  # In the unit cube space
 
         if kind == "to_unit_cube":
@@ -393,6 +399,10 @@ class SIXSASolver(object):
         return result
 
     @property
+    def available_samplers(self) -> list[str]:
+        return list(self.samplers.keys())
+
+    @property
     def observed_spectrum(self):
         """
         Return the observed spectrum read from `xspec`
@@ -411,120 +421,8 @@ class SIXSASolver(object):
             potential_fn=self.log_prob_fn, proposal=sampler, method="sir"
         ).set_default_x(x_o)
 
-    def run(
-        self,
-        num_simulations_per_round: list[int],
-        *,
-        embedding: Optional[Embedding | list[Embedding]] = None,
-        npe_kwargs=None,
-        training_kwargs=None,
-        clear_simulations=False,
-        plot_embedding_coverage=True,
-        device="cpu",
-    ):
-        """Run sequential simulation-based inference for the configured model.
-
-        Parameters:
-            num_simulations_per_round (list[int]): Number of simulations per
-                inference round.
-            embedding (Embedding | list[Embedding] | None): Embedding module or
-                per-round list of embeddings applied to simulated spectra.
-            npe_kwargs (dict | None): Keyword arguments forwarded to the NPE
-                constructor.
-            training_kwargs (dict | list[dict] | None): Per-round training
-                arguments for the density estimator.
-            clear_simulations (bool, optional): Whether to drop stored
-                simulations after training. Defaults to ``False``.
-            plot_embedding_coverage (bool, optional): Enable diagnostic plots of
-                embedding coverage. Defaults to ``True``.
-            device (str, optional): Torch device identifier. Defaults to
-                ``"cpu"``.
-
-        Returns:
-            ImportanceSamplingPosterior: Final importance-sampling posterior
-                enriched with SIR corrections.
-        """
-
-        if Fit.statMethod.lower() not in SIXSASolver.allowed_stats:
-            raise RuntimeError(
-                "ERROR: not using cstat or pstat! set Fit.statMethod to cash before analysing (currently: %s)!"
-                % Fit.statMethod
-            )
-
-        if training_kwargs is None:
-            #TODO: Better handling for the default training parameters. The user should be able to provide a subset
-            training_kwargs = dict(
-                force_first_round_loss=True,
-                retrain_from_scratch=True,
-                discard_prior_samples=True,
-                use_combined_loss=True,
-                training_batch_size=256,
-                validation_fraction=0.2,
-                learning_rate=5e-4,
-            )
-        if npe_kwargs is None:
-            npe_kwargs = {}
-
-        num_rounds = len(num_simulations_per_round)
-
-        if not isinstance(training_kwargs, list):
-            training_kwargs = [training_kwargs] * num_rounds
-
-        if isinstance(embedding, Embedding):
-            embedding_list = [embedding] * num_rounds
-
-        elif isinstance(embedding, list):
-            embedding_list = embedding
-
-        else:
-            raise NotImplementedError("Not implemented yet")
-
-        self.density_estimator_build_fun = posterior_nn(
-            model="maf",
-            hidden_features=100,
-            num_transforms=10,
-            embedding_net=self.embedding_net,
-        )
-
-        inference = NPE(
-            prior=self.samplers["prior"],
-            density_estimator=self.density_estimator_build_fun,
-            device=device,
-            **npe_kwargs,
-        )
-
-        cc = ChainConsumer()
-        colors = self.round_colors(num_rounds)
-
-        proposal = self.samplers["prior"]
-
-        for rounds in range(num_rounds):
-            posterior, proposal, inference = self.perform_inference_round(
-                proposal,
-                inference,
-                num_simulations_per_round[rounds],
-                embedding=embedding_list[rounds],
-                is_last_round=rounds == num_rounds - 1,
-                training_kwargs=training_kwargs[rounds],
-                device=device,
-                plot_embedding_coverage=plot_embedding_coverage,
-            )
-
-            self.samplers[f"round_{rounds + 1}"] = posterior
-
-            round_samples = self.sample_parameters(
-                10_000, sampler=f"round_{rounds + 1}", kind="to_xspec"
-            )
-            chain = self.chain_from_sample(
-                round_samples, name=f"Round {rounds + 1}", color=colors[rounds]
-            )
-            cc.add_chain(chain)
-
-        if clear_simulations:
-            inference._x_roundwise = []
-            inference._theta_roundwise = []
-
-        embedding = embedding_list[-1]
+    def post_process(self, device="cpu"):
+        embedding = self.embedding_list[-1]
 
         if isinstance(embedding, TorchModuleEmbedding):
             x_o = (
@@ -542,36 +440,124 @@ class SIXSASolver(object):
                 device
             )
 
-        self.samplers["exact_sampler"] = self.build_exact_sampler(
-            self.samplers[f"round_{num_rounds}"], x_o
+        sampler = self.build_exact_sampler(list(self.samplers.values())[-1], x_o)
+
+        self.samplers["exact_sampler"] = sampler
+
+        return sampler
+
+    def load_chain_in_xspec(self, n_samples, sampler_name: str = "exact_sampler"):
+        posterior_unit_cube = (
+            self.sample_parameters(
+                n_samples, kind="to_unit_cube", sampler_name=sampler_name
+            )
+            .numpy()
+            .T
         )
-
-        self.posterior_sampler = self.samplers["exact_sampler"]
-
-        posterior_unit_cube = self.posterior_sampler.sample((1000,)).numpy().T
-        posterior_bxa = self.prior_function(posterior_unit_cube)
+        posterior_bxa = self.unit_cube_to_bxa(posterior_unit_cube)
         posterior_xspec = self.unit_cube_to_xspec(posterior_unit_cube)
+
         posterior_stat = self.simulate(
             posterior_xspec, return_stat=True, desc="Computing posterior statistic - "
         )
 
-        self.posterior_unit_cube = posterior_unit_cube
-        self.inference = inference
-        self.posterior = posterior_bxa.T
-
         chainfilename = "%schain.fits" % self.outputfiles_basename
-        store_chain(chainfilename, self.transformations, self.posterior, posterior_stat)
+        store_chain(
+            chainfilename, self.transformations, posterior_bxa.T, posterior_stat
+        )
         xspec.AllChains.clear()
         xspec.AllChains += chainfilename
 
-        cc.plotter.plot(filename=f"{self.outputfiles_basename}posterior_per_round.pdf")
-        plt.close("all")
+    def run(
+        self,
+        num_simulations_per_round: list[int],
+        *,
+        embedding: Optional[Embedding | list[Embedding]] = None,
+        training_kwargs=None,
+        plot_embedding_coverage=True,
+        n_samples_xspec: int = 1000,
+        device="cpu",
+    ):
+        """Run sequential simulation-based inference for the configured model.
+
+        Parameters:
+            num_simulations_per_round (list[int]): Number of simulations per
+                inference round.
+            embedding (Embedding | list[Embedding] | None): Embedding module or
+                per-round list of embeddings applied to simulated spectra.
+            npe_kwargs (dict | None): Keyword arguments forwarded to the NPE
+                constructor.
+            training_kwargs (dict | list[dict] | None): Per-round training
+                arguments for the density estimator.
+            plot_embedding_coverage (bool, optional): Enable diagnostic plots of
+                embedding coverage. Defaults to ``True``.
+            device (str, optional): Torch device identifier. Defaults to
+                ``"cpu"``.
+
+        Returns:
+            ImportanceSamplingPosterior: Final importance-sampling posterior
+                enriched with SIR corrections.
+        """
+
+        if Fit.statMethod.lower() not in SIXSASolver.allowed_stats:
+            raise RuntimeError(
+                "ERROR: not using cstat or pstat! set Fit.statMethod to cash before analysing (currently: %s)!"
+                % Fit.statMethod
+            )
+
+        if training_kwargs is None:
+            # TODO: Better handling for the default training parameters. The user should be able to provide a subset
+            training_kwargs = dict(
+                force_first_round_loss=True,
+                retrain_from_scratch=True,
+                discard_prior_samples=True,
+                use_combined_loss=True,
+                training_batch_size=256,
+                validation_fraction=0.2,
+                learning_rate=5e-4,
+            )
+
+        num_rounds = len(num_simulations_per_round)
+
+        if not isinstance(training_kwargs, list):
+            training_kwargs = [training_kwargs] * num_rounds
+
+        if isinstance(embedding, Embedding):
+            embedding_list = [embedding] * num_rounds
+
+        elif isinstance(embedding, list):
+            embedding_list = embedding
+
+        else:
+            raise NotImplementedError("Not implemented yet")
+
+        for rounds in range(num_rounds):
+            self.perform_inference_round(
+                num_simulations_per_round[rounds],
+                embedding=embedding_list[rounds],
+                training_kwargs=training_kwargs[rounds],
+                device=device,
+                plot_embedding_coverage=plot_embedding_coverage,
+            )
+
+            """
+            round_samples = self.sample_parameters(
+                10_000, sampler=f"round_{rounds + 1}", kind="to_xspec"
+            )
+
+            chain = self.chain_from_sample(
+                round_samples, name=f"Round {rounds + 1}", color=colors[rounds]
+            )
+
+            cc.add_chain(chain)
+            """
+
+        posterior_sampler = self.post_process(device=device)
+        self.load_chain_in_xspec(n_samples_xspec)
 
         self.plot_training_summary(
             filename=f"{self.outputfiles_basename}training_summary.pdf"
         )
-
-        return self.posterior_sampler  # posteriors[-1] #self.results posterior_sir #
 
     def create_flux_chain(self, spectrum, erange="2.0 10.0", nsamples=None):
         """Evaluate fluxes for posterior samples within a given energy band.
@@ -755,7 +741,7 @@ class SIXSASolver(object):
         # points that barely made it into the analysis are not that interesting.
         # so pick a random subset of at least nsamples points
         parameters = self.sample_parameters(
-            sampler=sampler, n_samples=n_samples, kind="to_bxa"
+            sampler_name=sampler, n_samples=n_samples, kind="to_bxa"
         )
 
         with XSilence():
@@ -854,8 +840,13 @@ class SIXSASolver(object):
         component_names = list(np.asarray(component_names)[parameter_index])
         return rename_parameters(parameter_names_vanilla, component_names)
 
-    def posterior_dataframe(
-        self, num_samples=10_000, oversampling_factor=10, weighted=True
+    def build_dataframe(
+        self,
+        sampler: str = "exact_sampler",
+        num_samples=10_000,
+        oversampling_factor=10,
+        weighted=True,
+        likelihood=True,
     ):
         """Build a posterior sample table from the fitted neural network.
 
@@ -871,7 +862,7 @@ class SIXSASolver(object):
         dict_of_params = {}
 
         if weighted:
-            samples, weights = self.posterior_sampler.sample(
+            samples, weights = self.samplers[sampler].sample(
                 (num_samples,), weighted=True
             )
             dict_of_params = {
@@ -879,7 +870,7 @@ class SIXSASolver(object):
             }
 
         else:
-            samples = self.posterior_sampler.sample(
+            samples = self.samplers[sampler].sample(
                 (num_samples,), oversampling_factor=oversampling_factor, weighted=False
             )
 
@@ -892,82 +883,6 @@ class SIXSASolver(object):
             )
 
         return pd.DataFrame.from_dict(dict_of_params)
-
-    def plot_predictive_coverage(self, nsamples=100, figsize=(4.5, 4.5)):
-        """Plot prior predictive coverage in count space.
-
-        Parameters:
-            nsamples (int, optional): Number of prior samples used to construct
-                the predictive bands. Defaults to 100.
-            figsize (tuple[float, float], optional): Matplotlib figure size.
-                Defaults to ``(4.5, 4.5)``.
-
-        Returns:
-            (matplotlib.figure.Figure): Figure containing the predictive bands
-                and observed spectrum.
-        """
-
-        Plot.device = "/null"
-        Plot.xAxis = "keV"
-
-        # 1) Sample parameters from the prior using the solver's helper
-        parameters_xspec = self.sample_parameters(nsamples, kind="to_xspec")
-
-        # 2) Simulate spectra (counts per bin). With apply_stat=True we include Poisson sampling.
-        spectrum_array = self.simulate(
-            parameters_xspec, apply_stat=True, desc="Predictive coverage - "
-        )
-
-        # Convert observed rates to counts using exposure time
-        exposure = xspec.AllData(1).exposure
-        rates = xspec.AllData(1).values
-        counts = np.asarray(rates) * exposure
-        energies = np.asarray(xspec.AllData(1).energies)
-        energies = list(energies[:, 0]) + [energies[-1, 1]]
-
-        fig, ax = plt.subplots(figsize=figsize)
-        # Observed data with error bars (in counts)
-        ax.stairs(counts, edges=energies, label="Observed", color="red", zorder=0)
-
-        # Compute predictive percentile bands (using prior predictive samples)
-        # Bands correspond to 1σ, 2σ, 3σ credible regions
-        bands = [
-            (0.135, 99.865, "3σ (99.73%)", 0.10),
-            (2.275, 97.725, "2σ (95.45%)", 0.15),
-            (15.865, 84.135, "1σ (68.27%)", 0.25),
-        ]
-
-        color = "C0"
-        for lo_p, hi_p, label, alpha in bands:
-            lo, hi = np.percentile(spectrum_array, [lo_p, hi_p], axis=0)
-            ax.stairs(
-                hi,
-                baseline=lo,
-                edges=energies,
-                color=color,
-                alpha=alpha,
-                label=f"Prior predictive {label}",
-                fill=True,
-            )
-
-        # Median prior predictive curve
-        median = np.percentile(spectrum_array, 50, axis=0)
-        ax.stairs(
-            median,
-            edges=energies,
-            color=color,
-            lw=1.5,
-            ls="--",
-            label="Prior predictive median",
-        )
-
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Energy (keV)")
-        ax.set_ylabel("Counts")
-        ax.legend(frameon=False)
-
-        return fig
 
     def simulate(self, parameters_xspec, **kwargs):
         """Simulate spectra using XSPEC, optionally adding background counts.
@@ -1003,34 +918,71 @@ class SIXSASolver(object):
 
     def perform_inference_round(
         self,
-        proposal: RestrictedPrior | Any,
-        inference,
         num_simulations,
         *,
         embedding: Embedding,
-        is_last_round,
-        training_kwargs=None,
-        plot_embedding_coverage=False,
+        restricted_prior: bool = True,
+        reset_flow: bool = True,
+        training_kwargs: Optional[dict] = None,
+        plot_embedding_coverage=True,
         device="cpu",
     ):
         self.current_round += 1
-        round_path = os.path.join(self.outputfiles_basename, f"round_{self.current_round}")
+        self.embedding_list.append(embedding)
+        round_path = os.path.join(
+            self.outputfiles_basename, f"round_{self.current_round}"
+        )
         os.mkdir(round_path)
+        training_kwargs = training_kwargs if training_kwargs is not None else dict()
+
+        # Unpacking prior and proposal
+        prior = self.samplers["prior"]
+        proposal = list(self.samplers.values())[-1]
+
+        if restricted_prior and (prior != proposal):
+            accept_reject_fn = get_density_thresholder(
+                proposal, num_samples_to_estimate_support=100_000, quantile=1e-3
+            )
+
+            proposal = RestrictedPrior(
+                self.samplers["prior"],
+                accept_reject_fn,
+                posterior=proposal,
+                sample_with="sir",
+                device=device,
+            )
+
+        if reset_flow:
+            self.inference = NPE(
+                prior=self.samplers["prior"],
+                density_estimator=self.density_estimator_build_fun,
+                device=device,
+            )
+
+            inference = self.inference
+
+        else:
+            inference = self.inference
 
         theta = proposal.sample((num_simulations,)).cpu().numpy().T
         observation = self.observed_spectrum
-        parameters_xspec = self.unit_cube_to_xspec(theta)
+
         all_simulations = self.simulate(
-            parameters_xspec,
-            desc=f"Round {self.current_round} - " if self.current_round is not None else "",
+            self.unit_cube_to_xspec(theta),
+            desc=f"Round {self.current_round} - "
+            if self.current_round is not None
+            else "",
         )
 
-        if isinstance(embedding, TrainableEmbedding):
-            embedding.train(
-                all_simulations,
-                metrics_path=f"{round_path}/embedding_training.pdf"
-            ),
+        # Probably useless
+        all_simulations = np.clip(all_simulations, 0, np.inf)
 
+        if isinstance(embedding, TrainableEmbedding):
+            (
+                embedding.train(
+                    all_simulations, metrics_path=f"{round_path}/embedding_training.pdf"
+                ),
+            )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1041,7 +993,6 @@ class SIXSASolver(object):
                 ).to(embedding.device)
 
             features = embedding(all_simulations)
-            feature_names = embedding.names
 
         if not isinstance(theta, torch.Tensor):
             theta_train = torch.from_numpy(theta.T.astype(np.float32))
@@ -1057,18 +1008,12 @@ class SIXSASolver(object):
 
         if isinstance(embedding, TorchModuleEmbedding):
             x_o = embedding(observation[None, :]).to(device).squeeze()
+
         else:
             x_o = torch.from_numpy(np.squeeze(embedding(observation))).to(device)
 
         theta_train = theta_train.to(device).detach()
         x_train = x_train.to(device).detach()
-
-        if training_kwargs.get("retrain_from_scratch", True):
-            inference = NPE(
-                prior=self.samplers["prior"],
-                density_estimator=self.density_estimator_build_fun,
-                device=device,
-            )
 
         density_estimator = inference.append_simulations(
             theta_train, x_train, proposal=proposal
@@ -1087,56 +1032,22 @@ class SIXSASolver(object):
             return original_sample(*args, **kwargs)
 
         posterior.sample = sample
-
-        if not is_last_round:
-            accept_reject_fn = get_density_thresholder(
-                posterior, num_samples_to_estimate_support=100_000, quantile=1e-3
-            )
-
-            proposal = RestrictedPrior(
-                self.samplers["prior"],
-                accept_reject_fn,
-                posterior=posterior,
-                sample_with="sir",
-                device=device,
-            )
-
-        else:
-            proposal = posterior
-
         num_epochs = inference.summary["epochs_trained"][-1]
 
         self.epoch_trained.append(num_epochs)
         self.training_loss.extend(inference.summary["training_loss"][-num_epochs:])
         self.validation_loss.extend(inference.summary["validation_loss"][-num_epochs:])
 
+        self.samplers[f"round_{self.current_round}"] = posterior
+
         # Plot summary stat stuff
-        if self.embedding == "callable" and plot_embedding_coverage:
-            cols = int(np.ceil(np.sqrt(len(feature_names))))
-            rows = int(np.ceil(len(feature_names) / cols))
-
-            fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
-
-            axes = axes.flatten()
-
-            for i, feature_name in enumerate(feature_names):
-                axes[i].hist(
-                    x_train[:, i], bins=30, color="skyblue", edgecolor="black", log=True
-                )
-                axes[i].axvline(
-                    x_o[i].numpy(), color="red", linestyle="dashed", linewidth=2
-                )
-                axes[i].set_title(feature_name)
-
-            plt.suptitle(f"Summary stats - Round {self.current_round}")
-            plt.tight_layout()
-            plt.savefig(
-                f"{round_path}/features_round_{self.current_round}.pdf",
-                bbox_inches="tight",
+        if plot_embedding_coverage:
+            embedding.plot_coverage(
+                x_train,
+                x_o,
+                round_number=self.current_round,
+                save_to_path=f"{round_path}/features_round_{self.current_round}.pdf",
             )
-            plt.close()
-
-        return posterior, proposal, inference
 
     def get_xspec_best_fit(self):
         """Run an XSPEC fit and return best-fit parameters with covariance.
@@ -1170,19 +1081,41 @@ class SIXSASolver(object):
 
         return best_fit_parameters.ravel(), covariance
 
-    def chain_from_sample(self, samples, **kwargs):
+    def chain_from_sampler(self, sampler_name: str = "prior", n_samples=1000, **kwargs):
         parameter_names = self.parameter_names
+
+        samples = self.sample_parameters(
+            n_samples, kind="to_xspec", sampler_name=sampler_name
+        )
         param_dict = {}
 
         for i, t in enumerate(self.transformations):
             j = t["index"]
             name = parameter_names[j - 1]
-            param_dict[name] = [sample[j] for sample in samples]  # maybe change to i
+            param_dict[name] = [sample[j] for sample in samples]
 
         return Chain(samples=pd.DataFrame.from_dict(param_dict), **kwargs)
 
     def round_colors(self, num_rounds):
         return cmr.take_cmap_colors(cmr.cosmic_r, num_rounds, cmap_range=(0.1, 0.8))
+
+    def plot_posterior_from_rounds(self, n_samples=10_000):
+        cc = ChainConsumer()
+        colors = self.round_colors(self.current_round)
+
+        for i, color in zip(range(1, self.current_round + 1), colors):
+            cc.add_chain(
+                self.chain_from_sampler(
+                    f"round_{i}", name=f"round_{i}", color=color, n_samples=n_samples
+                )
+            )
+
+        figure = cc.plotter.plot(
+            filename=f"{self.outputfiles_basename}posterior_per_round.pdf"
+        )
+        plt.close("all")
+
+        return figure
 
     def plot_training_summary(self, figsize=(10, 7), filename=None):
         figure = plt.figure(figsize=figsize)

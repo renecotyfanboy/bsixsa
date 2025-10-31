@@ -152,10 +152,10 @@ def training_loop(
     patience=20,
     max_epochs=100,
     min_delta=1e-2,
-    learning_rate=5e-4,
+    learning_rate=3e-4,
     weight_decay=1e-5,
-    clip_grad_norm=5.0,
-    optimizer_cls: type[optim.Optimizer] = optim.Adam,
+    clip_grad_norm=1.0,
+    optimizer_cls: type[optim.Optimizer] = optim.AdamW,
     optimizer_kwargs: dict | None = None,
     metrics_path: str | Path | None = None,
     **kwargs,
@@ -310,6 +310,7 @@ class TorchModuleEmbedding(TrainableEmbedding, ABC):
     def build_model(self, **kwargs):
         pass
 
+    @property
     def names(self) -> list[str]:
         return [f"latent {i}" for i in range(1, self.embedding_dim + 1)]
 
