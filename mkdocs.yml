@@ -3,8 +3,10 @@ site_name: SIXSA
 nav:
   - Home:
     - Welcome: index.md
+    - How does it work?: inner_working.md
     - Examples:
         - examples/basic_fit.ipynb
+        - examples/step_by_step.ipynb
     - API Reference:
       - Solver: api/solver.md
       - Embedding: api/embedding.md
