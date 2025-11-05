@@ -1,5 +1,6 @@
 import numpy as np
 import xspec
+import torch
 from abc import ABC
 from .abc import Embedding
 from dataclasses import dataclass, field
@@ -8,9 +9,9 @@ from typing import Callable
 
 # Theses funcs assume a reduction over the last axis : (n_spectra, n_bins) -> (n_spectra,)
 basic_global_stats = {
-    "mean": lambda x: np.mean(x, axis=1),
-    "std": lambda x: np.std(x, axis=1),
-    "sum": lambda x: np.sum(x, axis=1),
+    "mean": lambda x: torch.mean(x, dim=1),
+    "std": lambda x: torch.std(x, axis=1),
+    "sum": lambda x: torch.sum(x, axis=1),
 }
 
 
@@ -52,7 +53,7 @@ class GlobalSummaryEmbedding(Embedding):
 def local_sum(bin_data, data, bin_summary):
     energy_low_observation, energy_high_observation = bin_data
     energy_low_summary, energy_high_summary = bin_summary
-    counts = np.zeros((len(data), len(energy_low_summary)))
+    counts = torch.zeros((len(data), len(energy_low_summary)))
 
     for i, (e_low_summary, e_high_summary) in enumerate(
         zip(energy_low_summary, energy_high_summary)
@@ -60,7 +61,7 @@ def local_sum(bin_data, data, bin_summary):
         bins_to_keep = (energy_low_observation >= e_low_summary) & (
             energy_high_observation <= e_high_summary
         )
-        counts_in_bin = np.sum(data[:, bins_to_keep], axis=1)
+        counts_in_bin = torch.sum(data[:, bins_to_keep], dim=1)
         counts[:, i] += counts_in_bin
 
     return counts
@@ -73,9 +74,9 @@ class LocalSummaryEmbedding(Embedding, ABC):
                 "There is no xspec data loaded. Please load your data before instanciating."
             )
 
-        self.energy_grid = energy_grid
-        self.energy_bins_data = np.asarray(xspec.AllData(1).energies).T
-        self.energy_bins_summary = np.stack([energy_grid[:-1], energy_grid[1:]])
+        self.energy_grid = torch.from_numpy(energy_grid)
+        self.energy_bins_data = torch.from_numpy(np.asarray(xspec.AllData(1).energies).T)
+        self.energy_bins_summary = torch.from_numpy(np.stack([energy_grid[:-1], energy_grid[1:]]))
 
 
 class LocalSumEmbedding(LocalSummaryEmbedding):

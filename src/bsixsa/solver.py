@@ -1,12 +1,13 @@
 from __future__ import print_function
 
-from typing import Any, Optional, Literal, Union, Tuple
+from typing import Optional, Literal, Union, Tuple
 
 import numpy as np
 from sbi.sbi_types import Shape
 from ultranest.plot import PredictionBand
 import os
 import shutil
+
 from math import isnan, isinf
 import numpy
 import warnings
@@ -19,14 +20,15 @@ import xspec
 import torch
 import torch.nn as nn
 import cmasher as cmr
+from .analysis.mapper import fit_parameter_mapper
 from sbi.inference import ImportanceSamplingPosterior
 from sbi.inference import NPE  # import FMPE as NPE
 from sbi.utils import BoxUniform
 from sbi.utils import RestrictedPrior, get_density_thresholder
 import matplotlib.pyplot as plt
 from .embedding.trainable import TrainableEmbedding, TorchModuleEmbedding
-from .xspec_stuff import parallel_folding, transform_parameters_for_xspec
-from .plotting import plot_ppc
+from .xspec import parallel_folding, transform_parameters_for_xspec
+from bsixsa.analysis.plotting import plot_ppc
 from tqdm.auto import tqdm
 from matplotlib.lines import Line2D
 from .embedding.abc import Embedding
@@ -385,18 +387,14 @@ class SIXSASolver(object):
             `xspec`. `sbi` require this parameter as in normal workflow, this function can be conditioned on any `x_o`.
 
         Parameters:
-            theta (numpy.ndarray): Array of samples on the unit cube
-            x_o (numpy.ndarray): Observed value, pass `None` if needed
+            theta (torch.Tensor): Array of samples on the unit cube
+            x_o (torch.Tensor): Observed value, pass `None` if needed
 
         """
 
-        theta = theta.numpy().T
-        parameters_xspec = self.unit_cube_to_xspec(theta)
-        cstat = parallel_folding(parameters_xspec, return_stat=True).squeeze()
-        ll = -0.5 * cstat  # - self.c_stat_conversion_factor
-        result = torch.from_numpy(ll)
-
-        return result
+        parameters_xspec = self.unit_cube_to_xspec(theta.numpy().T)
+        _, cstat = parallel_folding(parameters_xspec, desc="Evaluating C_stat - ")
+        return -0.5 * cstat  # - self.c_stat_conversion_factor
 
     @property
     def available_samplers(self) -> list[str]:
@@ -447,24 +445,19 @@ class SIXSASolver(object):
         return sampler
 
     def load_chain_in_xspec(self, n_samples, sampler_name: str = "exact_sampler"):
-        posterior_unit_cube = (
-            self.sample_parameters(
-                n_samples, kind="to_unit_cube", sampler_name=sampler_name
-            )
-            .numpy()
-            .T
-        )
-        posterior_bxa = self.unit_cube_to_bxa(posterior_unit_cube)
-        posterior_xspec = self.unit_cube_to_xspec(posterior_unit_cube)
 
-        posterior_stat = self.simulate(
-            posterior_xspec, return_stat=True, desc="Computing posterior statistic - "
+        posterior_unit_cube, _, c_stat = self.simulate(
+            n_samples,
+            sampler=sampler_name, desc="Computing posterior statistic - "
         )
+
+        posterior_bxa = self.unit_cube_to_bxa(posterior_unit_cube.numpy().T)
 
         chainfilename = "%schain.fits" % self.outputfiles_basename
         store_chain(
-            chainfilename, self.transformations, posterior_bxa.T, posterior_stat
+            chainfilename, self.transformations, posterior_bxa.T, c_stat
         )
+
         xspec.AllChains.clear()
         xspec.AllChains += chainfilename
 
@@ -884,22 +877,31 @@ class SIXSASolver(object):
 
         return pd.DataFrame.from_dict(dict_of_params)
 
-    def simulate(self, parameters_xspec, **kwargs):
-        """Simulate spectra using XSPEC, optionally adding background counts.
+    def simulate(
+            self,
+            n_samples,
+            *,
+            sampler:str,
+            **kwargs
+    ):
+        r"""Simulate spectra using XSPEC, optionally adding background counts.
 
         Parameters:
-            parameters_xspec (list[dict]): Parameter dictionaries suitable for
-                ``AllModels.setPars``.
+            n_samples (int): Number of samples to draw
+            sampler (str): Sampler to use for simulation.
             **kwargs: Additional keyword arguments forwarded to
                 ``parallel_folding``.
 
         Returns:
-            (numpy.ndarray): Simulated spectra (and optionally background) in
-                counts per bin.
+            (tuple[torch.Tensor, torch.Tensor, torch.Tensor]): Sampled parameters $\theta$, simulated spectra in counts per bin and Cash statistic as computed by `xspec`.
         """
 
+        parameters_unit_cube = self.sample_parameters(n_samples, kind="to_unit_cube", sampler_name=sampler)
+        parameters_xspec = self.unit_cube_to_xspec(parameters_unit_cube.numpy().T)
+
         if (not self.background_to_compute) or (kwargs.get("return_stat", False)):
-            return parallel_folding(parameters_xspec, **kwargs)
+            spectra, c_stat = parallel_folding(parameters_xspec, **kwargs)
+            return parameters_unit_cube, spectra, c_stat
 
         if self.background_to_compute:
             background = (
@@ -909,9 +911,9 @@ class SIXSASolver(object):
                 * self._backratio
             )
 
-            spectra = parallel_folding(parameters_xspec, **kwargs)
+            spectra, c_stat = parallel_folding(parameters_xspec, **kwargs)
 
-            return spectra + background
+            return parameters_unit_cube, spectra + background, c_stat
 
         else:
             raise NotImplementedError
@@ -937,7 +939,7 @@ class SIXSASolver(object):
 
         # Unpacking prior and proposal
         prior = self.samplers["prior"]
-        proposal = list(self.samplers.values())[-1]
+        proposal_name, proposal = list(self.samplers.items())[-1]
 
         if restricted_prior and (prior != proposal):
             accept_reject_fn = get_density_thresholder(
@@ -964,18 +966,15 @@ class SIXSASolver(object):
         else:
             inference = self.inference
 
-        theta = proposal.sample((num_simulations,)).cpu().numpy().T
-        observation = self.observed_spectrum
+        observation = torch.from_numpy(self.observed_spectrum)
 
-        all_simulations = self.simulate(
-            self.unit_cube_to_xspec(theta),
+        theta, all_simulations, _ = self.simulate(
+            num_simulations,
+            sampler=proposal_name,
             desc=f"Round {self.current_round} - "
             if self.current_round is not None
             else "",
         )
-
-        # Probably useless
-        all_simulations = np.clip(all_simulations, 0, np.inf)
 
         if isinstance(embedding, TrainableEmbedding):
             (
@@ -988,9 +987,7 @@ class SIXSASolver(object):
             warnings.simplefilter("ignore")
 
             if isinstance(embedding, TorchModuleEmbedding):
-                all_simulations = torch.from_numpy(
-                    all_simulations.astype(np.float32)
-                ).to(embedding.device)
+                all_simulations = all_simulations.to(embedding.device)
 
             features = embedding(all_simulations)
 
@@ -998,7 +995,7 @@ class SIXSASolver(object):
             theta_train = torch.from_numpy(theta.T.astype(np.float32))
 
         else:
-            theta_train = theta.T
+            theta_train = theta
 
         if not isinstance(features, torch.Tensor):
             x_train = torch.from_numpy(features.astype(np.float32))
@@ -1007,7 +1004,7 @@ class SIXSASolver(object):
             x_train = features
 
         if isinstance(embedding, TorchModuleEmbedding):
-            x_o = embedding(observation[None, :]).to(device).squeeze()
+            x_o = embedding(observation[None, :].to(embedding.device)).to(device).squeeze()
 
         else:
             x_o = torch.from_numpy(np.squeeze(embedding(observation))).to(device)
@@ -1048,6 +1045,21 @@ class SIXSASolver(object):
                 round_number=self.current_round,
                 save_to_path=f"{round_path}/features_round_{self.current_round}.pdf",
             )
+
+    def parameter_mapper(
+            self,
+            embedding: "Embedding",
+            *,
+            sampler_name: str = "prior",
+            n_samples: int = 50_000,
+    ):
+        return fit_parameter_mapper(
+            self,
+            embedding=embedding,
+            sampler_name=sampler_name,
+            n_samples=n_samples
+        )
+
 
     def get_xspec_best_fit(self):
         """Run an XSPEC fit and return best-fit parameters with covariance.

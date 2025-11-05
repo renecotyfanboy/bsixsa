@@ -2,6 +2,7 @@ import os
 import tempfile
 import xspec
 import numpy as np
+import torch
 import pathos.multiprocessing as multiprocessing  # pathos
 from tqdm.auto import tqdm
 from contextlib import contextmanager, nullcontext
@@ -126,10 +127,10 @@ def parallel_folding(
 
                 outputs = [result.get() for result in results]
 
-        if return_stat:
-            return np.vstack([stat for _, stat in outputs])
+        spectra = torch.from_numpy(np.vstack([spectra for spectra, _ in outputs]).astype(np.float32))
+        stat = torch.from_numpy(np.vstack([stat for _, stat in outputs]).squeeze().astype(np.float32))
 
-        return np.vstack([spectra for spectra, _ in outputs])
+        return spectra, stat
 
 
 def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):

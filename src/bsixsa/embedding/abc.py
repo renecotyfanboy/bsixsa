@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 
 class Embedding(ABC):
     trainable: bool = False
+    device: torch.device = torch.device("cpu")
 
     @abstractmethod
     def __call__(self, spectra):
