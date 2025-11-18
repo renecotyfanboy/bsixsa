@@ -94,7 +94,13 @@ def local_xcm_path(params, base_xcm_path, *, tmp_dir=None):
 def parallel_folding(
     params, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True
 ):
-    """Perform simulation in parallel with XSPEC"""
+    """Perform simulation in parallel with XSPEC.
+
+    Returns:
+        dict[str, torch.Tensor]: Dictionary containing the stacked spectra under
+            the ``spectra`` key and the corresponding Cash statistics under
+            ``cstat``.
+    """
     # Set up the number of workers
     if n_jobs is None:
         n_jobs = os.cpu_count()  # Use all available CPUs if n_jobs is not set
@@ -127,10 +133,17 @@ def parallel_folding(
 
                 outputs = [result.get() for result in results]
 
-        spectra = torch.from_numpy(np.vstack([spectra for spectra, _ in outputs]).astype(np.float32))
-        stat = torch.from_numpy(np.vstack([stat for _, stat in outputs]).squeeze().astype(np.float32))
+        spectra = torch.from_numpy(
+            np.vstack([spectra for spectra, _ in outputs]).astype(np.float32)
+        )
+        cstat = torch.from_numpy(
+            np.vstack([stat for _, stat in outputs]).squeeze().astype(np.float32)
+        )
 
-        return spectra, stat
+        return {
+            "spectra": spectra,
+            "cstat": cstat,
+        }
 
 
 def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):

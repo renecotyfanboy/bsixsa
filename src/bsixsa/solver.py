@@ -393,8 +393,10 @@ class SIXSASolver(object):
         """
 
         parameters_xspec = self.unit_cube_to_xspec(theta.numpy().T)
-        _, cstat = parallel_folding(parameters_xspec, desc="Evaluating C_stat - ")
-        return -0.5 * cstat  # - self.c_stat_conversion_factor
+        simulation_outputs = parallel_folding(
+            parameters_xspec, desc="Evaluating C_stat - "
+        )
+        return -0.5 * simulation_outputs["cstat"]  # - self.c_stat_conversion_factor
 
     @property
     def available_samplers(self) -> list[str]:
@@ -900,7 +902,9 @@ class SIXSASolver(object):
         parameters_xspec = self.unit_cube_to_xspec(parameters_unit_cube.numpy().T)
 
         if (not self.background_to_compute) or (kwargs.get("return_stat", False)):
-            spectra, c_stat = parallel_folding(parameters_xspec, **kwargs)
+            folding_outputs = parallel_folding(parameters_xspec, **kwargs)
+            spectra = folding_outputs["spectra"]
+            c_stat = folding_outputs["cstat"]
             return parameters_unit_cube, spectra, c_stat
 
         if self.background_to_compute:
@@ -911,7 +915,9 @@ class SIXSASolver(object):
                 * self._backratio
             )
 
-            spectra, c_stat = parallel_folding(parameters_xspec, **kwargs)
+            folding_outputs = parallel_folding(parameters_xspec, **kwargs)
+            spectra = folding_outputs["spectra"]
+            c_stat = folding_outputs["cstat"]
 
             return parameters_unit_cube, spectra + background, c_stat
 
