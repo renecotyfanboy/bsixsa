@@ -947,6 +947,9 @@ class SIXSASolver(object):
         prior = self.samplers["prior"]
         proposal_name, proposal = list(self.samplers.items())[-1]
 
+        if proposal_name == "exact_sampler":
+            proposal_name, proposal = list(self.samplers.items())[-2]
+
         if restricted_prior and (prior != proposal):
             accept_reject_fn = get_density_thresholder(
                 proposal, num_samples_to_estimate_support=100_000, quantile=1e-3
