@@ -198,7 +198,7 @@ class Autoencoder(nn.Module):
 
 
 class ResnetAutoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=32, hidden_features=128, num_blocks=2):
+    def __init__(self, input_dim, latent_dim=32, hidden_features=128, num_blocks=2, dropout_probability=0.1):
         super(ResnetAutoencoder, self).__init__()
 
         self.transform = LogTransform()
@@ -208,6 +208,7 @@ class ResnetAutoencoder(nn.Module):
             out_features=latent_dim,
             hidden_features=hidden_features,
             num_blocks=num_blocks,
+            dropout_probability=dropout_probability,
             use_batch_norm=True
         )
         self.decoder_module = nets.ResidualNet(
@@ -215,6 +216,7 @@ class ResnetAutoencoder(nn.Module):
             out_features=input_dim,
             hidden_features=hidden_features,
             num_blocks=num_blocks,
+            dropout_probability=dropout_probability,
             use_batch_norm=True
         )
 

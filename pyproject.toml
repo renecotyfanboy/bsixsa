@@ -17,6 +17,7 @@ dependencies = [
     "pathos>=0.3.3",
     "sbi>=0.25.0",
     "scipy>=1.16.2",
+    "torch>=2.5.1",
     "tqdm>=4.67.1",
 ]
 

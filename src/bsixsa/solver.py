@@ -839,8 +839,8 @@ class SIXSASolver(object):
         self,
         sampler: str = "exact_sampler",
         num_samples=10_000,
-        oversampling_factor=10,
-        weighted=True,
+        oversampling_factor:int|None=10,
+        weighted:bool|None=True,
         likelihood=True,
     ):
         """Build a posterior sample table from the fitted neural network.
@@ -855,6 +855,13 @@ class SIXSASolver(object):
         """
 
         dict_of_params = {}
+        sampler_kwargs = {}
+
+        if oversampling_factor is not None:
+            sampler_kwargs["oversampling_factor"] = oversampling_factor
+
+        if weighted is not None:
+            sampler_kwargs["weighted"] = weighted
 
         if weighted:
             samples, weights = self.samplers[sampler].sample(
@@ -866,7 +873,7 @@ class SIXSASolver(object):
 
         else:
             samples = self.samplers[sampler].sample(
-                (num_samples,), oversampling_factor=oversampling_factor, weighted=False
+                (num_samples,), **sampler_kwargs
             )
 
         warped_samples = self.unit_cube_to_xspec(samples.numpy().T)
