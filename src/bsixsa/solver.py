@@ -12,7 +12,6 @@ from math import isnan, isinf
 import numpy
 import warnings
 import pandas as pd
-from torchmin import minimize
 from xspec import Xset, AllModels, Fit, Plot
 from chainconsumer import ChainConsumer, Chain
 from sbi.neural_nets import posterior_nn
@@ -288,6 +287,9 @@ class SIXSASolver(object):
     def set_best_fit(self):
         """Set current XSPEC parameters to the maximum a posteriori sample."""
         # TODO : Update this function
+
+        raise NotImplementedError()
+
         x0 = self.posterior_unit_cube[
             :, self.posterior_sampler.log_prob(self.posterior_unit_cube.T).argmax()
         ]
