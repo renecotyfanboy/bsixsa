@@ -17,8 +17,10 @@ dependencies = [
     "pathos>=0.3.3",
     "sbi>=0.25.0",
     "scipy>=1.16.2",
+    "seaborn>=0.13.2",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
+    "ultranest>=4.4.0",
 ]
 
 [[tool.uv.index]]
