@@ -154,7 +154,7 @@ def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):
             xspec.Xset.restore(local_xcm)
 
         xspec.Fit.statMethod = "cstat"
-        xspec.Fit.bayes = "on"
+        xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
         model = xspec.AllModels(1)
         # model.setPars(params)
         count_list = []

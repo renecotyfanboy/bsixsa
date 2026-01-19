@@ -44,6 +44,8 @@ class GlobalSummaryEmbedding(Embedding):
         if data.ndim == 1:
             data = data[np.newaxis, :]  # (1, M)
 
+        data = torch.as_tensor(data)
+
         for func in self.stats.values():
             data_transformed_list.append(func(data))
 
@@ -90,6 +92,8 @@ class LocalSumEmbedding(LocalSummaryEmbedding):
         return names
 
     def __call__(self, data):
+        data = torch.as_tensor(data)
+
         return local_sum(self.energy_bins_data, data, self.energy_bins_summary)
 
 
@@ -146,6 +150,7 @@ class LocalSumWithExtra(LocalSummaryEmbedding):
         return names
 
     def __call__(self, data):
+        data = torch.as_tensor(data)
         embedded_data = []
 
         epsilon = 1

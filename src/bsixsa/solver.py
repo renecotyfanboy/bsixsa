@@ -258,8 +258,8 @@ class SIXSASolver(object):
 
         self.density_estimator_build_fun = posterior_nn(
             model="maf",
-            hidden_features=100,
-            num_transforms=10,
+            #hidden_features=100,
+            #num_transforms=10,
         )
 
         if self.background_to_compute:
@@ -395,10 +395,13 @@ class SIXSASolver(object):
         """
 
         parameters_xspec = self.unit_cube_to_xspec(theta.numpy().T)
+        #parameters_bxa = self.unit_cube_to_bxa(theta.numpy().T)
+
+
         simulation_outputs = parallel_folding(
             parameters_xspec, desc="Evaluating C_stat - "
         )
-        return -0.5 * simulation_outputs["cstat"]  # - self.c_stat_conversion_factor
+        return -0.5 * simulation_outputs["cstat"] #  + self.prior_logprob(theta.numpy().T) # - self.c_stat_conversion_factor
 
     @property
     def available_samplers(self) -> list[str]:
@@ -859,10 +862,10 @@ class SIXSASolver(object):
         dict_of_params = {}
         sampler_kwargs = {}
 
-        if oversampling_factor is not None:
+        if (oversampling_factor is not None) and sampler =="exact_sampler":
             sampler_kwargs["oversampling_factor"] = oversampling_factor
 
-        if weighted is not None:
+        if (weighted is not None) and sampler =="exact_sampler":
             sampler_kwargs["weighted"] = weighted
 
         if weighted:
