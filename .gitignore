@@ -10,7 +10,7 @@ doc/_build
 *.ipynb_checkpoints
 *.venv
 *sbi-logs
-*old_code
+_old_code
 *old
 run_*.py
 *.sh

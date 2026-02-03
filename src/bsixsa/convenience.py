@@ -1,48 +1,30 @@
-from . import create_uniform_prior_for, create_loguniform_prior_for
-from .solver import SIXSASolver, XSilence
+from __future__ import print_function
 
-import numpy as np
-import dill
 import xspec
-import pandas as pd
-from random import sample
+from xspec import Xset
+import re
 
+def build_parameter_name(xspec_model):
+    """
+    Return {XSPEC parameter index -> unique parameter name}.
+    """
+    name_map = {}
 
-def set_prior_and_build_transform(xspec_model, define_prior):
-    transform_build_dict = {
-        "uniform": create_uniform_prior_for,
-        "loguniform": create_loguniform_prior_for,
-    }
+    for comp_index, comp_name in enumerate(xspec_model.componentNames):
+        comp = getattr(xspec_model, comp_name)
 
-    parameter_to_set = {}
+        # Handle the weird situation where a component is defined multiple times
+        # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
+        # Doing so we ensure that every parameter is linked to its component number and avoid duplicates
+        # like powerlaw_3_3
+        if bool(re.fullmatch(r'.*_\d+$', comp_name)):
+            comp_name = comp_name.split('_')[0]
 
-    with XSilence():
-        for component, parameter, low, high, kind in define_prior:
-            assert kind in transform_build_dict.keys(), (
-                f"kind must be one of {transform_build_dict.keys()}"
-            )
+        for par_name in comp.parameterNames:
+            par = getattr(comp, par_name)
+            name_map[par.index] = f"{str(comp_name)}_{comp_index + 1}_{str(par_name)}"
 
-            xspec_comp = getattr(xspec_model, component)
-            xspec_par = getattr(xspec_comp, parameter)
-            parameter_to_set[xspec_par.index] = (
-                f"{np.random.uniform(low, high)},,{low},{low},{high},{high}"
-            )
-
-            if kind == "uniform":
-                xspec_par.prior = "cons"
-            else:
-                xspec_par.prior = "jeffreys"
-
-        xspec_model.setPars(parameter_to_set)
-
-        transformations = []
-
-        for component, parameter, low, high, kind in define_prior:
-            xspec_comp = getattr(xspec_model, component)
-            xspec_par = getattr(xspec_comp, parameter)
-            transformations.append(transform_build_dict[kind](xspec_model, xspec_par))
-
-    return transformations
+    return name_map
 
 
 def load_xspec_data(
@@ -68,46 +50,12 @@ def load_xspec_data(
     return xspec_model, xspec_observation
 
 
-def load_solver_from_pickle(transformations, path_pickle) -> SIXSASolver:
-    solver = SIXSASolver(transformations, outputfiles_basename="")
+class XSilence(object):
+    """Context for temporarily making xspec quiet."""
 
-    with open(path_pickle, "rb") as f:
-        new_solver = dill.load(f)
-        new_solver.transformations = solver.transformations
+    def __enter__(self):
+        self.oldchatter = Xset.chatter, Xset.logChatter
+        Xset.chatter, Xset.logChatter = 0, 0
 
-    return new_solver
-
-
-def build_dataframe_from_solver(path, solver, n_points=10000) -> pd.DataFrame:
-    indexes = np.sort([t["index"] for t in solver.transformations])
-
-    posterior = solver.fitted_posteriors[-1]
-    samples = posterior.sample((n_points,))
-    warped_samples = solver.unit_cube_to_xspec(samples.numpy().T)
-
-    dict_of_params = {}
-
-    for i in indexes:
-        name = solver.parameter_names[i - 1]
-        dict_of_params[name] = np.asarray(
-            [warped_samples[j][i] for j in range(len(warped_samples))]
-        )
-
-    df = pd.DataFrame.from_dict(dict_of_params)
-    df.to_csv(path)
-
-    return df
-
-
-def build_cstat_df(
-    path, solver: SIXSASolver, dataframe: pd.DataFrame, mapping, n_points=3000
-):
-    list_of_params = []
-
-    for pars in dataframe.to_dict(orient="records"):
-        param_dict = {indexes: pars[key] for key, indexes in mapping.items()}
-        list_of_params.append(param_dict)
-
-    c_stat = solver.simulate(sample(list_of_params, n_points), return_stat=True)
-
-    np.savetxt(path, c_stat)
+    def __exit__(self, *args):
+        Xset.chatter, Xset.logChatter = self.oldchatter

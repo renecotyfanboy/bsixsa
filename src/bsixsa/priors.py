@@ -1,167 +1,95 @@
 from __future__ import print_function
-from math import log10
 
+import numpy as np
+import re
+from .convenience import XSilence
+from scipy.stats import loguniform, norm
 
-def create_uniform_prior_for(model, par):
-    """Create a uniform prior transformation for location parameters.
+__all__ = [
+    'build_prior',
+    'loguniform',
+    'norm',
+    'uniform',
+]
 
-    Parameters:
-            model: XSPEC model that owns the parameter.
-            par: XSPEC parameter whose value should follow a uniform prior.
-
-    Returns:
-            dict: Metadata describing how to transform samples into parameter
-                    space.
+def uniform(low, high):
     """
-    pval, pdelta, pmin, pbottom, ptop, pmax = par.values
-    print("  uniform prior for %s between %f and %f " % (par.name, pmin, pmax))
-    # TODO: should we use min/max or bottom/top?
-    low = float(pmin)
-    spread = float(pmax - pmin)
-    if pmin > 0 and pmax / pmin > 100:
-        print(
-            "   note: this parameter spans several dex. Should it be log-uniform (create_jeffreys_prior_for)?"
-        )
-
-    def uniform_transform(x):
-        return x * spread + low
-
-    return dict(
-        model=model,
-        index=par._Parameter__index,
-        name=par.name,
-        transform=uniform_transform,
-        aftertransform=lambda x: x,
-    )
-
-
-def create_jeffreys_prior_for(model, par):
-    """Return a log-uniform prior transformation (deprecated wrapper).
-
-    Parameters:
-            model: XSPEC model that owns the parameter.
-            par: XSPEC parameter to transform.
-
-    Returns:
-            dict: Metadata describing how to transform samples into parameter
-                    space.
+    Simple wrapper around scipy.stats.uniform that returns a left-right defined distribution.
     """
-    return create_loguniform_prior_for(model, par)
+    from scipy.stats import uniform
+    return uniform(low, high-low)
 
 
-def create_loguniform_prior_for(model, par):
-    """Create a Jeffreys (log-uniform) prior transformation.
+class MultipleIndependent:
+    def __init__(self, dists):
+        self.dists = list(dists)
+        self.ndim = len(self.dists)
 
-    Parameters:
-            model: XSPEC model that owns the parameter.
-            par: XSPEC parameter whose scale should be log-uniform.
+    def sample(self, size=1, random_state=None):
+        rng = np.random.default_rng(random_state)
+        cols = [dist.rvs(size=size, random_state=rng) for dist in self.dists]
+        x = np.stack(cols, axis=-1)  # shape: size + (ndim,)
+        return x
 
-    Returns:
-            dict: Metadata describing how to transform samples into parameter
-                    space.
-    """
-    pval, pdelta, pmin, pbottom, ptop, pmax = par.values
-    # TODO: should we use min/max or bottom/top?
-    # print '  ', par.values
-    print("  jeffreys prior for %s between %e and %e " % (par.name, pmin, pmax))
-    if pmin == 0:
-        raise Exception(
-            "You forgot to set reasonable parameter limits on %s" % par.name
-        )
-    low = log10(pmin)
-    spread = log10(pmax) - log10(pmin)
-    if spread > 10:
-        print(
-            "   note: this parameter spans *many* dex. Double-check the limits are reasonable."
-        )
+    def log_prob(self, x):
+        x = np.asarray(x)
+        x2 = np.atleast_2d(x)
+        if x2.shape[-1] != self.ndim:
+            raise ValueError(f"Expected last dim = {self.ndim}, got {x2.shape[-1]}")
 
-    def log_transform(x):
-        return x * spread + low
+        lp = np.zeros(x2.shape[0], dtype=float)
+        for j, dist in enumerate(self.dists):
+            if hasattr(dist, "logpdf"):
+                lp += dist.logpdf(x2[:, j])
+            else:
+                lp += dist.logpmf(x2[:, j])
 
-    def log_after_transform(x):
-        return 10**x
-
-    return dict(
-        model=model,
-        index=par._Parameter__index,
-        name="log(%s)" % par.name,
-        transform=log_transform,
-        aftertransform=log_after_transform,
-    )
+        return lp[0] if x.ndim == 1 else lp
 
 
-def create_gaussian_prior_for(model, par, mean, std):
-    """Create a Gaussian prior transformation for informed parameters.
+def build_prior(xspec_model, define_prior, return_bounds=False):
 
-    Parameters:
-            model: XSPEC model that owns the parameter.
-            par: XSPEC parameter to transform.
-            mean (float): Mean of the Gaussian prior.
-            std (float): Standard deviation of the Gaussian prior.
+    parameter_to_set = {}
+    list_of_prior = []
+    parameters_index = []
+    bounds = []
 
-    Returns:
-            dict: Metadata describing how to transform samples into parameter
-                    space.
-    """
-    import scipy.stats
+    with XSilence():
+        for component, parameter, distribution in define_prior:
 
-    pval, pdelta, pmin, pbottom, ptop, pmax = par.values
-    rv = scipy.stats.norm(mean, std)
+            # Handle the weird situation where a component is defined multiple times
+            # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
+            # An insightful user might want to pass "powerlaw_2" & "powerlaw_3" instead of "powerlaw" & "powerlaw_3"
+            if bool(re.fullmatch(r'.*_\d+$', component)):
+                if component not in xspec_model.componentNames:
+                    split_name = component.split('_')[0]
+                    if split_name in xspec_model.componentNames:
+                        component = split_name
+                    else:
+                        raise ValueError(f"Component '{component}' or '{split_name}' not in {xspec_model.componentNames}")
 
-    def gauss_transform(x):
-        return max(pmin, min(pmax, rv.ppf(x)))
+            xspec_comp = getattr(xspec_model, component)
+            xspec_par = getattr(xspec_comp, parameter)
 
-    print("  gaussian prior for %s of %f +- %f" % (par.name, mean, std))
-    return dict(
-        model=model,
-        index=par._Parameter__index,
-        name=par.name,
-        transform=gauss_transform,
-        aftertransform=lambda x: x,
-    )
+            xspec_par.prior = "cons" # we handle the prior log_prob instead of XSPEC
+            low, high = distribution.support()
+            parameter_to_set[xspec_par.index] = (
+                f"{np.random.uniform(low, high)},,{low},{low},{high},{high}"
+            )
 
+            list_of_prior.append(distribution)
+            bounds.append([low, high])
+            parameters_index.append(xspec_par.index)
 
-def create_custom_prior_for(model, par, transform, aftertransform=lambda x: x):
-    """Create a prior transformation using caller-provided functions.
+        with XSilence():
+            xspec_model.setPars(parameter_to_set)
 
-    Parameters:
-            model: XSPEC model that owns the parameter.
-            par: XSPEC parameter to transform.
-            transform (Callable[[float], float]): Function that maps unit-cube
-                    samples onto the parameter support.
-            aftertransform (Callable[[float], float], optional): Reverse mapping
-                    from parameter space back to unit-cube space. Defaults to the
-                    identity function.
+    prior = MultipleIndependent(list_of_prior)
 
-    Returns:
-            dict: Metadata describing how to transform samples into parameter
-                    space.
-    """
-    print("  custom prior for %s" % (par.name))
-    return dict(
-        model=model,
-        index=par._Parameter__index,
-        name=par.name,
-        transform=transform,
-        aftertransform=aftertransform,
-    )
+    if not return_bounds:
 
+        return prior, parameters_index
 
-def create_prior_function(transformations):
-    """Compose prior transformations into a single callable.
+    else:
 
-    Parameters:
-            transformations (list[dict]): Sequence of prior transformation
-                    metadata dictionaries as returned by the helper constructors.
-
-    Returns:
-            Callable: Function that mutates an in-place unit-cube sample to obey
-                    the specified priors.
-    """
-
-    def prior(cube, ndim, nparams):
-        for i, t in enumerate(transformations):
-            transform = t["transform"]
-            cube[i] = transform(cube[i])
-
-    return prior
+        return prior, parameters_index, bounds

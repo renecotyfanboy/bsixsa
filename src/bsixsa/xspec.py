@@ -2,18 +2,9 @@ import os
 import tempfile
 import xspec
 import numpy as np
-import torch
-import pathos.multiprocessing as multiprocessing  # pathos
 from tqdm.auto import tqdm
 from contextlib import contextmanager, nullcontext
-
-
-def transform_parameters_for_xspec(transformations, theta) -> dict[int, float]:
-    """Transform the current parameters using BXA transformation for XSPEC (i.e. real space) and return a dictionary"""
-    return {
-        int(t["index"]): float(t["aftertransform"](theta[i]))
-        for i, t in enumerate(transformations)
-    }
+from .convenience import XSilence
 
 
 def get_model_block(lines):
@@ -58,7 +49,7 @@ def get_model_block(lines):
 
 
 @contextmanager
-def local_xcm_path(params, base_xcm_path, *, tmp_dir=None):
+def local_xcm_path(params, indexes, base_xcm_path, *, tmp_dir=None):
     """
     Build a local .xcm file path containing the values specified in params, using a base xcm path.
     """
@@ -67,8 +58,8 @@ def local_xcm_path(params, base_xcm_path, *, tmp_dir=None):
         lines = f.readlines()
         mapping = get_model_block(lines)
 
-    for par_index, value in params.items():
-        line, line_index = mapping[par_index]
+    for index, value in zip(indexes, params):
+        line, line_index = mapping[index]
         line = f"{value:.8g}".rjust(15) + line[15:]
         lines[line_index] = line
 
@@ -92,7 +83,7 @@ def local_xcm_path(params, base_xcm_path, *, tmp_dir=None):
 
 
 def parallel_folding(
-    params, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True
+    params, indexes, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True, pool=None
 ):
     """Perform simulation in parallel with XSPEC.
 
@@ -115,17 +106,30 @@ def parallel_folding(
             else nullcontext()
         )
 
+        #if isinstance(params, torch.Tensor):
+        #    params = np.asarray(params.to("cpu").numpy())
+
         with progress_cm as pbar:
 
             def update_progress(_):
                 if pbar is not None:
                     pbar.update()
 
-            with multiprocessing.Pool(processes=n_jobs) as pool:
+            in_pool = pool is not None
+
+            if not in_pool:
+
+                outputs = [
+                    folded_model_from_parameters(param, indexes, model_file, apply_stat, tmp_dir, in_pool)
+                    for param in params
+                ]
+
+            else:
+
                 results = [
                     pool.apply_async(
                         folded_model_from_parameters,
-                        (param, model_file, apply_stat, tmp_dir),
+                        (param, indexes, model_file, apply_stat, tmp_dir, in_pool),
                         callback=update_progress,
                     )
                     for param in params
@@ -133,12 +137,8 @@ def parallel_folding(
 
                 outputs = [result.get() for result in results]
 
-        spectra = torch.from_numpy(
-            np.vstack([spectra for spectra, _ in outputs]).astype(np.float32)
-        )
-        cstat = torch.from_numpy(
-            np.vstack([stat for _, stat in outputs]).squeeze().astype(np.float32)
-        )
+        spectra = np.vstack([spectra for spectra, _ in outputs])
+        cstat = np.vstack([stat for _, stat in outputs]).squeeze()
 
         return {
             "spectra": spectra,
@@ -146,23 +146,21 @@ def parallel_folding(
         }
 
 
-def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):
-    from bsixsa import XSilence
+def folded_model_from_parameters(params, indexes, model_file, apply_stat, tmp_dir, in_pool):
 
     with XSilence():
-        with local_xcm_path(params, model_file, tmp_dir=tmp_dir) as local_xcm:
+        with local_xcm_path(params, indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
         xspec.Fit.statMethod = "cstat"
         xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
         model = xspec.AllModels(1)
-        # model.setPars(params)
         count_list = []
         stat_list = []
 
         for n in range(1, xspec.AllData.nSpectra + 1):
             expected_rate = (
-                np.asarray(model.folded(n), dtype=np.float32)
+                np.asarray(model.folded(n))
                 * xspec.AllData(n).exposure
             )
             count_list.append(expected_rate)
@@ -174,6 +172,7 @@ def folded_model_from_parameters(params, model_file, apply_stat, tmp_dir):
 
         stat_list.append(float(xspec.Fit.statistic))
 
-        xspec.AllModels.clear()  # VERY IMPORTANT : speedup of ~4 for unknown reasons
+        if in_pool:
+            xspec.AllModels.clear()  # VERY IMPORTANT : speedup of ~4 for unknown reasons
 
-    return spectra, np.asarray(stat_list, dtype=np.float32).ravel()
+    return spectra, np.asarray(stat_list).ravel()
