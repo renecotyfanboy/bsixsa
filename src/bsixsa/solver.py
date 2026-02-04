@@ -559,6 +559,10 @@ class SIXSASolver(object):
             from .sampler.nautilus import NautilusSampler
             self.sampler = NautilusSampler(solver=self, **kwargs)
 
+        elif self.sampler_kind == "ultranest":
+            from .sampler.ultranest import UltranestSampler
+            self.sampler = UltranestSampler(solver=self, **kwargs)
+
         else:
             raise NotImplementedError()
 

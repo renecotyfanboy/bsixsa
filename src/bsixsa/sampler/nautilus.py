@@ -1,7 +1,10 @@
 import numpy as np
 from .abc import Sampler
 from nautilus import Prior, Sampler as NestedSampler
+import typing
 
+if typing.TYPE_CHECKING:
+    from ..solver import SIXSASolver
 
 class NautilusSampler(Sampler):
 
