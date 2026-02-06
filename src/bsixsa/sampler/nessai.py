@@ -15,9 +15,9 @@ class ModelFromSolver(NessaiModel):
     def __init__(self, solver):
         # Names of parameters to sample
         self.solver = solver
-        self.names = [solver.parameter_names[idx] for idx in solver.indexes]
+        self.names = [solver.parameter_names[model_nb][idx] for model_nb in range(solver.nb_models) for idx in solver.indexes[model_nb]]
         # Prior bounds for each parameter
-        self.bounds = {solver.parameter_names[idx]: bound for idx, bound in zip(solver.indexes, solver.bounds)}
+        self.bounds = {self.names[idx]: bound for idx, bound in zip(range(len(self.names)), solver.bounds)}
 
     def to_array(self, x):
         new_array = live_points_to_array(x, names=self.names, copy=True)
