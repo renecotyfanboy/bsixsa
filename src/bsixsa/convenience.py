@@ -4,25 +4,30 @@ import xspec
 from xspec import Xset
 import re
 
-def build_parameter_name(xspec_model):
+def build_parameter_name():
     """
     Return {XSPEC parameter index -> unique parameter name}.
     """
-    name_map = {}
 
-    for comp_index, comp_name in enumerate(xspec_model.componentNames):
-        comp = getattr(xspec_model, comp_name)
+    sources_models = xspec.AllModels.sources
 
-        # Handle the weird situation where a component is defined multiple times
-        # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
-        # Doing so we ensure that every parameter is linked to its component number and avoid duplicates
-        # like powerlaw_3_3
-        if bool(re.fullmatch(r'.*_\d+$', comp_name)):
-            comp_name = comp_name.split('_')[0]
+    name_map = [{} for k in range(len(sources_models))]
 
-        for par_name in comp.parameterNames:
-            par = getattr(comp, par_name)
-            name_map[par.index] = f"{str(comp_name)}_{comp_index + 1}_{str(par_name)}"
+    for model_nb, (source, model_name) in enumerate(zip(sources_models.keys(), sources_models.values())):
+        xspec_model = xspec.AllModels(1, model_name)
+        for comp_index, comp_name in enumerate(xspec_model.componentNames):
+            comp = getattr(xspec_model, comp_name)
+
+            # Handle the weird situation where a component is defined multiple times
+            # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
+            # Doing so we ensure that every parameter is linked to its component number and avoid duplicates
+            # like powerlaw_3_3
+            if bool(re.fullmatch(r'.*_\d+$', comp_name)):
+                comp_name = comp_name.split('_')[0]
+
+            for par_name in comp.parameterNames:
+                par = getattr(comp, par_name)
+                name_map[model_nb][par.index] = f"{str(comp_name)}_{comp_index + 1}_{str(par_name)}"
 
     return name_map
 

@@ -3,7 +3,7 @@ import numpy as np
 import catppuccin
 from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
-from xspec import Plot, AllData
+from xspec import Plot, AllData, AllModels
 
 PALETTE = catppuccin.PALETTE.latte
 
@@ -129,7 +129,23 @@ def plot_ppc(
     bin_edges = np.append(low_energy, high_energy[-1])
 
     area = get_effective_area()
-    denominator = area * data["width"] * 2 * AllData(1).exposure
+
+    denominators = []
+    sources_models = AllModels.sources
+    nsources = len(sources_models)
+
+    try :
+
+        AllData(1).multiresponse[0]
+        for k in range(nsources):
+            try :
+                AllData(1).multiresponse[k].arf
+                denominators.append(data["width"] * 2 * AllData(1).exposure)
+            except :
+                denominators.append(data["width"] * 2 * AllData(1).exposure)
+
+    except:
+        denominators.append(data["width"] * 2 * AllData(1).exposure)
 
     fig, axs = plt.subplots(
         nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
@@ -139,9 +155,9 @@ def plot_ppc(
         count_data, sigma=1
     )
     y_observed, y_observed_low, y_observed_high = (
-        y_observed / denominator,
-        y_observed_low / denominator,
-        y_observed_high / denominator,
+        y_observed / denominators[0],
+        y_observed_low / denominators[0],
+        y_observed_high / denominators[0],
     )
 
     error_bar = axs[0].errorbar(
@@ -166,6 +182,8 @@ def plot_ppc(
 
     linestyles = ["solid"] + ["dashdot"] * (n_components - 1)
 
+
+
     for i, (color, component_name, linestyle) in enumerate(
         zip(COLOR_CYCLE, component_names, linestyles)
     ):
@@ -184,7 +202,11 @@ def plot_ppc(
 
             local_component += background
 
-        local_component = local_component / denominator
+        if i< nsources :
+
+            local_component = local_component / denominators[i]
+        else :
+            local_component = local_component / denominators[0]
 
         median = axs[0].stairs(
             np.median(local_component, axis=0),
@@ -236,9 +258,9 @@ def plot_ppc(
             y_observed_high_bkg * solver._backratio,
         )
         y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
-            y_observed_bkg / denominator,
-            y_observed_low_bkg / denominator,
-            y_observed_high_bkg / denominator,
+            y_observed_bkg / denominators[0],
+            y_observed_low_bkg / denominators[0],
+            y_observed_high_bkg / denominators[0],
         )
 
         """
@@ -266,7 +288,7 @@ def plot_ppc(
             * solver._backratio
         )
 
-        background_envelope = background_envelope / denominator
+        background_envelope = background_envelope / denominators[0]
 
         median = axs[0].stairs(
             np.median(background_envelope, axis=0),
@@ -300,7 +322,7 @@ def plot_ppc(
 
         total += background
 
-    total = total / denominator
+    total = total / denominators[0]
 
     divider = np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0)
     residuals = (total - y_observed) / np.where(divider > 0, divider, 1.0)
@@ -357,7 +379,7 @@ def plot_ppc(
     axs[1].set_xlabel("Energy [keV]")
     axs[0].set_ylabel(
         "Observed Spectrum \n"
-        + r"[$\frac{\text{Counts}}{\text{cm}^2  \text{keV} \text{s}}$]"
+        + r"[$\frac{\text{Counts}}{\text{keV} \text{s}}$]"
     )
     axs[1].set_yticks([-3, 0, 3])
 

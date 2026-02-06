@@ -5,6 +5,8 @@ import re
 from .convenience import XSilence
 from scipy.stats import loguniform, norm
 
+from xspec import AllModels
+
 __all__ = [
     'build_prior',
     'loguniform',
@@ -83,6 +85,66 @@ def build_prior(xspec_model, define_prior, return_bounds=False):
 
         with XSilence():
             xspec_model.setPars(parameter_to_set)
+
+    prior = MultipleIndependent(list_of_prior)
+
+    if not return_bounds:
+
+        return prior, parameters_index
+
+    else:
+
+        return prior, parameters_index, bounds
+
+def build_prior_me(define_prior, return_bounds=False):
+
+    sources_models = AllModels.sources
+
+    parameter_to_set = {}
+    list_of_prior = []
+    parameters_index = [[] for k in range(len(sources_models))]
+    bounds = []
+
+
+    for model_nb, (source, model_name) in enumerate(zip(sources_models.keys(), sources_models.values())):
+
+        xspec_model = AllModels(1,model_name)
+        with XSilence():
+            for component, parameter, distribution in define_prior:
+
+                # Handle the weird situation where a component is defined multiple times
+                # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
+                # An insightful user might want to pass "powerlaw_2" & "powerlaw_3" instead of "powerlaw" & "powerlaw_3"
+
+                if bool(re.fullmatch(r'.*_\d+$', component)):
+                    if component not in xspec_model.componentNames:
+                        split_name = component.split('_')[0]
+                        if split_name in xspec_model.componentNames:
+                            component = split_name
+                        else:
+                            raise ValueError(f"Component '{component}' or '{split_name}' not in {xspec_model.componentNames}")
+
+                try :
+                    xspec_comp = getattr(xspec_model, component)
+                    xspec_par = getattr(xspec_comp, parameter)
+
+                    xspec_par.prior = "cons" # we handle the prior log_prob instead of XSPEC
+                    low, high = distribution.support()
+                    parameter_to_set[xspec_par.index] = (
+                        f"{np.random.uniform(low, high)},,{low},{low},{high},{high}"
+                    )
+
+                    list_of_prior.append(distribution)
+                    bounds.append([low, high])
+                    parameters_index[model_nb].append(xspec_par.index)
+
+                    with XSilence():
+                        xspec_model.setPars(parameter_to_set)
+
+                except :
+                    pass
+
+
 
     prior = MultipleIndependent(list_of_prior)
 

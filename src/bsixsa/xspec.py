@@ -15,7 +15,8 @@ def get_model_block(lines):
     in_model_block = False
     out_lines = []
     out_lines_indexes = []
-
+    output = []
+    nb_of_models = 0
     for i, line in enumerate(lines):
         stripped = line.lstrip()
 
@@ -26,11 +27,38 @@ def get_model_block(lines):
         head = tokens[0]
 
         if head == "model":
+
+            nb_of_models += 1
             in_model_block = True
+            if nb_of_models >=2 :
+
+                parameter_index = np.argsort(out_lines_indexes) + 1
+                output.append(
+                                {
+                                int(par_index): (out_line, line_number)
+                                for par_index, out_line, line_number in zip(
+                                    parameter_index, out_lines, out_lines_indexes
+                                )
+                                }
+                             )
+                out_lines = []
+                out_lines_indexes = []
+
+
             continue
 
         if head == "bayes":
             in_model_block = False
+
+            if i == len(lines)-1:
+                output.append(
+                                {
+                                int(par_index): (out_line, line_number)
+                                for par_index, out_line, line_number in zip(
+                                    parameter_index, out_lines, out_lines_indexes
+                                )
+                                }
+                             )
             continue
 
         if in_model_block:
@@ -38,18 +66,15 @@ def get_model_block(lines):
             out_lines_indexes.append(i)
             continue
 
-    parameter_index = np.argsort(out_lines_indexes) + 1
+        parameter_index = np.argsort(out_lines_indexes) + 1
 
-    return {
-        int(par_index): (out_line, line_number)
-        for par_index, out_line, line_number in zip(
-            parameter_index, out_lines, out_lines_indexes
-        )
-    }
+
+
+    return output
 
 
 @contextmanager
-def local_xcm_path(params, indexes, base_xcm_path, *, tmp_dir=None):
+def local_xcm_path(params, indexes, nb_models, base_xcm_path, *, tmp_dir=None):
     """
     Build a local .xcm file path containing the values specified in params, using a base xcm path.
     """
@@ -58,10 +83,20 @@ def local_xcm_path(params, indexes, base_xcm_path, *, tmp_dir=None):
         lines = f.readlines()
         mapping = get_model_block(lines)
 
-    for index, value in zip(indexes, params):
-        line, line_index = mapping[index]
-        line = f"{value:.8g}".rjust(15) + line[15:]
-        lines[line_index] = line
+    #for index, value in zip(indexes, params):
+    #    line, line_index = mapping[index]
+    #    line = f"{value:.8g}".rjust(15) + line[15:]
+    #    lines[line_index] = line
+
+    idx = 0
+    for model_nr in range(nb_models):
+        nb_params_model = len(indexes[model_nr])
+        for index, value in zip(indexes[model_nr], params[idx:idx+nb_params_model]):
+            line, line_index = mapping[model_nr][index]
+            line = f"{value:.8g}".rjust(15) + line[15:]
+            lines[line_index] = line
+        idx += nb_params_model
+
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -83,7 +118,7 @@ def local_xcm_path(params, indexes, base_xcm_path, *, tmp_dir=None):
 
 
 def parallel_folding(
-    params, indexes, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True, pool=None
+    params, indexes, nb_models, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True, pool=None
 ):
     """Perform simulation in parallel with XSPEC.
 
@@ -120,7 +155,7 @@ def parallel_folding(
             if not in_pool:
 
                 outputs = [
-                    folded_model_from_parameters(param, indexes, model_file, apply_stat, tmp_dir, in_pool)
+                    folded_model_from_parameters(param, indexes, nb_models, model_file, apply_stat, tmp_dir, in_pool)
                     for param in params
                 ]
 
@@ -129,7 +164,7 @@ def parallel_folding(
                 results = [
                     pool.apply_async(
                         folded_model_from_parameters,
-                        (param, indexes, model_file, apply_stat, tmp_dir, in_pool),
+                        (param, indexes, nb_models, model_file, apply_stat, tmp_dir, in_pool),
                         callback=update_progress,
                     )
                     for param in params
@@ -146,24 +181,27 @@ def parallel_folding(
         }
 
 
-def folded_model_from_parameters(params, indexes, model_file, apply_stat, tmp_dir, in_pool):
+def folded_model_from_parameters(params, indexes,nb_models, model_file, apply_stat, tmp_dir, in_pool):
 
     with XSilence():
-        with local_xcm_path(params, indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
+        with local_xcm_path(params, indexes, nb_models, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
         xspec.Fit.statMethod = "cstat"
         xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
-        model = xspec.AllModels(1)
+        sources_models = xspec.AllModels.sources
+
+
         count_list = []
         stat_list = []
 
         for n in range(1, xspec.AllData.nSpectra + 1):
-            expected_rate = (
-                np.asarray(model.folded(n))
-                * xspec.AllData(n).exposure
-            )
-            count_list.append(expected_rate)
+            expected_rate = 0
+            for source, model_name in zip(sources_models.keys(), sources_models.values()):
+                model = xspec.AllModels(1,model_name)
+                expected_rate += np.asarray(model.folded(n)) * xspec.AllData(n).exposure
+
+            count_list.append((expected_rate))
 
         if apply_stat:
             spectra = np.random.poisson(np.hstack(count_list))

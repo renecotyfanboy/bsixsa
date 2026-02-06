@@ -10,12 +10,12 @@ import shutil
 import numpy
 import warnings
 import pandas as pd
-from xspec import Xset, AllModels, Fit, Plot
+from xspec import Xset, AllModels, Fit, Plot, AllData
 import xspec
 import torch
 
 from .convenience import XSilence
-from .priors import build_prior
+from .priors import build_prior_me
 import matplotlib.pyplot as plt
 from .xspec import parallel_folding
 import pathos.multiprocessing as multiprocessing  # pathos
@@ -71,7 +71,16 @@ def set_parameters(values, indexes):
     Parameters:
         values (Sequence[float]): Parameter values in the physical space
     """
-    AllModels(1).setPars({index:float(value) for index,value in zip(indexes, values)})
+    #AllModels(1).setPars({index:float(value) for index,value in zip(indexes, values)})
+    idx = 0
+    sources_models = AllModels.sources
+
+    for model_nb, (source, model_name) in enumerate(zip(sources_models.keys(), sources_models.values())):
+        model = AllModels(1, model_name)
+
+        values_model = values[idx : idx + len(indexes[model_nb])]
+        model.setPars({index:float(value) for index,value in zip(indexes[model_nb], values_model)})
+        idx += len(indexes[model_nb])
 
 
 class SIXSASolver(object):
@@ -86,10 +95,12 @@ class SIXSASolver(object):
         sampler="nessai"
     ):
 
-        model = AllModels(1)
-        prior, indexes, bounds = build_prior(model, prior, return_bounds=True)
+        #model = AllModels(1)
+        prior, indexes, bounds = build_prior_me(prior, return_bounds=True)
 
         self.indexes = indexes
+        sources_models = AllModels.sources
+        self.nb_models = len(sources_models)
         self.prior = prior
         self.samplers = {"prior": prior}
         self.bounds = bounds
@@ -183,7 +194,7 @@ class SIXSASolver(object):
             pool = self.pool
 
         simulation_outputs = parallel_folding(
-            theta, self.indexes, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
+            theta, self.indexes, self.nb_models, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
         )
 
         return -0.5 * simulation_outputs["cstat"]
@@ -401,16 +412,23 @@ class SIXSASolver(object):
             Plot.device = "/null"
 
             # plot models
-            maxncomp = 100 if Plot.add else 0
+            Plot(plottype)
+
             for k, row in enumerate(tqdm(parameters, disable=None)):
                 set_parameters(row, self.indexes)
-                Plot(plottype)
+
+                sources_models = xspec.AllModels.sources
+
+
+
+                maxncomp = 0
                 # get plot data
                 if plottype == "model":
                     base_content = numpy.transpose(
                         [Plot.x(), Plot.xErr(), Plot.model()]
                     )
                 elif Plot.background:
+                    """
                     base_content = numpy.transpose(
                         [
                             Plot.x(),
@@ -422,10 +440,56 @@ class SIXSASolver(object):
                             Plot.model(),
                         ]
                     )
+                    """
+                    e = numpy.mean(numpy.asarray(AllData(1).energies), axis = 1)
+                    e_widths = numpy.diff(numpy.asarray(AllData(1).energies), axis = 1).flatten()
+
+
+                    expected_rates = []
+
+                    # Check each model
+                    for source, model_name in zip(sources_models.keys(), sources_models.values()):
+                        Plot(plottype, 'model ' + model_name)
+
+                        # If the model has additive components
+                        if Plot.nAddComps() != maxncomp :
+                            maxncomp += Plot.nAddComps()
+                            for i in range(1,maxncomp+1):
+                                expected_rates.append(Plot.addComp(i))
+
+                        # If not, plot the raw model
+                        else :
+                            model = AllModels(1,model_name)
+                            expected_rates.append(numpy.asarray(model.folded(1)) * xspec.AllData(1).exposure / e_widths)
+
+                    total_rate = np.sum(np.asarray(expected_rates), axis = 0)
+
+                    data = numpy.asarray(xspec.AllData(1).values) * xspec.AllData(1).exposure / e_widths
+                    data_err = numpy.sqrt(data / e_widths) #don't know why /e_widths but that matches pyxpec
+
+                    base_content = [
+                            e,
+                            e_widths/2,
+                            data,
+                            data_err,
+                            Plot.backgroundVals(),
+                            numpy.zeros_like(Plot.backgroundVals()),
+                            total_rate,
+                        ]
+
+                    # Add the model, where each model has its own additive components separated
+                    for rate in expected_rates :
+                        base_content.append(rate)
+
+
+                    base_content = numpy.transpose(base_content)
+
+
                 else:
                     base_content = numpy.transpose(
                         [Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(), Plot.model()]
                     )
+                """
                 # get additive components, if there are any
                 comp = []
                 for i in range(1, maxncomp):
@@ -443,7 +507,8 @@ class SIXSASolver(object):
                         numpy.transpose(comp).reshape((len(base_content), -1)),
                     )
                 )
-                yield content
+                """
+                yield base_content
             Plot.device = olddevice
 
     @property
@@ -456,7 +521,7 @@ class SIXSASolver(object):
         """
 
         from .convenience import build_parameter_name
-        return build_parameter_name(xspec.AllModels(1))
+        return build_parameter_name()
 
     def build_dataframe(
         self,
@@ -512,12 +577,18 @@ class SIXSASolver(object):
 
             return cov_matrix
 
-        xspec_model = xspec.AllModels(1)
-        best_fit_parameters = np.asarray(
-            [xspec_model(i + 1).values[0] for i in range(xspec_model.nParameters)]
-        )
-        covariance = build_covariance_matrix_np(xspec.Fit.covariance)
+        sources_models = xspec.AllModels.sources
+        best_fit_parameters = []
+        for source, model_name in zip(sources_models.keys(), sources_models.values()):
 
+            xspec_model = xspec.AllModels(1,model_name)
+
+
+            best_fit_parameters.extend(
+                [xspec_model(i + 1).values[0] for i in range(xspec_model.nParameters)]
+            )
+        covariance = build_covariance_matrix_np(xspec.Fit.covariance)
+        best_fit_parameters = np.asarray(best_fit_parameters)
         return best_fit_parameters.ravel(), covariance
 
 
