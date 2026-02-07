@@ -2,7 +2,7 @@ import numpy as np
 from .abc import Sampler
 import typing
 import ultranest
-
+from ..convenience import iter_thawn_parameters
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
@@ -15,9 +15,9 @@ class UltranestSampler(Sampler):
         super().__init__(solver=solver)
 
         self.sampler = ultranest.ReactiveNestedSampler(
-            [solver.parameter_names[i] for i in solver.indexes],
+            [par.name for par in iter_thawn_parameters()],
             self.likelihood,
-            transform=self.prior_transform,
+            transform=lambda cube: self.prior_transform(cube),
             log_dir=self.solver.outputfiles_basename,
             vectorized=True,
             resume=resume

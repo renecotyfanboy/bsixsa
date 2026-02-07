@@ -2,6 +2,7 @@ import os
 import tempfile
 import xspec
 import numpy as np
+import re
 from tqdm.auto import tqdm
 from contextlib import contextmanager, nullcontext
 from .convenience import XSilence
@@ -15,8 +16,11 @@ def get_model_block(lines):
     in_model_block = False
     out_lines = []
     out_lines_indexes = []
-    output = []
-    nb_of_models = 0
+    model_indexes = []
+    parameter_indexes = []
+
+    model_pattern = re.compile(r'^model(?:\s+(?:(\d+):(\S+)))?\b')
+
     for i, line in enumerate(lines):
         stripped = line.lstrip()
 
@@ -27,54 +31,48 @@ def get_model_block(lines):
         head = tokens[0]
 
         if head == "model":
-
-            nb_of_models += 1
             in_model_block = True
-            if nb_of_models >=2 :
+            m = model_pattern.match(stripped)
 
-                parameter_index = np.argsort(out_lines_indexes) + 1
-                output.append(
-                                {
-                                int(par_index): (out_line, line_number)
-                                for par_index, out_line, line_number in zip(
-                                    parameter_index, out_lines, out_lines_indexes
-                                )
-                                }
-                             )
-                out_lines = []
-                out_lines_indexes = []
+            current_parameter_index = 1
 
+            if m.group(1) is not None:
+                current_model_index = int(m.group(1))
+            else:
+                current_model_index = None
 
+            if m.group(2) is not None:
+                current_model_name = str(m.group(2))
+            else:
+                current_model_name = ""
+
+            # Than we skip to the next iteration
             continue
 
         if head == "bayes":
             in_model_block = False
-
-            if i == len(lines)-1:
-                output.append(
-                                {
-                                int(par_index): (out_line, line_number)
-                                for par_index, out_line, line_number in zip(
-                                    parameter_index, out_lines, out_lines_indexes
-                                )
-                                }
-                             )
             continue
 
         if in_model_block:
             out_lines.append(line)
             out_lines_indexes.append(i)
+            parameter_indexes.append(current_parameter_index)
+            model_indexes.append(current_model_name)
+
+            current_parameter_index += 1
             continue
 
-        parameter_index = np.argsort(out_lines_indexes) + 1
 
-
-
-    return output
+    return {
+        (model_name, int(par_index)): (out_line, line_number)
+        for par_index, model_name, out_line, line_number in zip(
+            parameter_indexes, model_indexes, out_lines, out_lines_indexes
+        )
+    }
 
 
 @contextmanager
-def local_xcm_path(params, indexes, nb_models, base_xcm_path, *, tmp_dir=None):
+def local_xcm_path(params, indexes, model_indexes, base_xcm_path, *, tmp_dir=None):
     """
     Build a local .xcm file path containing the values specified in params, using a base xcm path.
     """
@@ -83,20 +81,10 @@ def local_xcm_path(params, indexes, nb_models, base_xcm_path, *, tmp_dir=None):
         lines = f.readlines()
         mapping = get_model_block(lines)
 
-    #for index, value in zip(indexes, params):
-    #    line, line_index = mapping[index]
-    #    line = f"{value:.8g}".rjust(15) + line[15:]
-    #    lines[line_index] = line
-
-    idx = 0
-    for model_nr in range(nb_models):
-        nb_params_model = len(indexes[model_nr])
-        for index, value in zip(indexes[model_nr], params[idx:idx+nb_params_model]):
-            line, line_index = mapping[model_nr][index]
-            line = f"{value:.8g}".rjust(15) + line[15:]
-            lines[line_index] = line
-        idx += nb_params_model
-
+    for model_name, parameter_index, value in zip(model_indexes, indexes, params):
+        line, line_index = mapping[(model_name, parameter_index)]
+        line = f"{value:.8g}".rjust(15) + line[15:]
+        lines[line_index] = line
 
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -118,7 +106,7 @@ def local_xcm_path(params, indexes, nb_models, base_xcm_path, *, tmp_dir=None):
 
 
 def parallel_folding(
-    params, indexes, nb_models, n_jobs=None, return_stat=False, apply_stat=True, desc="", progress_bar=True, pool=None
+    params, indexes, model_indexes, apply_stat=True, desc="", progress_bar=True, pool=None
 ):
     """Perform simulation in parallel with XSPEC.
 
@@ -127,9 +115,6 @@ def parallel_folding(
             the ``spectra`` key and the corresponding Cash statistics under
             ``cstat``.
     """
-    # Set up the number of workers
-    if n_jobs is None:
-        n_jobs = os.cpu_count()  # Use all available CPUs if n_jobs is not set
 
     with tempfile.TemporaryDirectory(prefix="parallel_folding_") as tmp_dir:
         model_file = os.path.join(tmp_dir, "model_template.xcm")
@@ -140,9 +125,6 @@ def parallel_folding(
             if progress_bar
             else nullcontext()
         )
-
-        #if isinstance(params, torch.Tensor):
-        #    params = np.asarray(params.to("cpu").numpy())
 
         with progress_cm as pbar:
 
@@ -155,7 +137,7 @@ def parallel_folding(
             if not in_pool:
 
                 outputs = [
-                    folded_model_from_parameters(param, indexes, nb_models, model_file, apply_stat, tmp_dir, in_pool)
+                    folded_model_from_parameters(param, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool)
                     for param in params
                 ]
 
@@ -164,7 +146,7 @@ def parallel_folding(
                 results = [
                     pool.apply_async(
                         folded_model_from_parameters,
-                        (param, indexes, nb_models, model_file, apply_stat, tmp_dir, in_pool),
+                        (param, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool),
                         callback=update_progress,
                     )
                     for param in params
@@ -181,10 +163,10 @@ def parallel_folding(
         }
 
 
-def folded_model_from_parameters(params, indexes,nb_models, model_file, apply_stat, tmp_dir, in_pool):
+def folded_model_from_parameters(params, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool):
 
     with XSilence():
-        with local_xcm_path(params, indexes, nb_models, model_file, tmp_dir=tmp_dir) as local_xcm:
+        with local_xcm_path(params, indexes, model_indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
         xspec.Fit.statMethod = "cstat"

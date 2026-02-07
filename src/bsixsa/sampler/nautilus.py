@@ -1,6 +1,7 @@
 import numpy as np
 from .abc import Sampler
 from nautilus import Prior, Sampler as NestedSampler
+from ..convenience import iter_thawn_parameters
 import typing
 
 if typing.TYPE_CHECKING:
@@ -14,8 +15,8 @@ class NautilusSampler(Sampler):
 
         prior = Prior()
 
-        for index, dist in zip(self.solver.indexes, self.solver.prior.dists):
-            prior.add_parameter(self.solver.parameter_names[index], dist)
+        for par, dist in zip(iter_thawn_parameters(), self.solver.prior.dists):
+            prior.add_parameter(par.name, dist)
 
         self.n_live_points = n_live_points
 

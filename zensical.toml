@@ -47,11 +47,15 @@ Copyright &copy; 2026 The authors
 #
 # Read more: https://zensical.org/docs/setup/navigation/
 nav = [
-    { "Index" = [
+    { "Home" = [
         "index.md",
-      "demo.md"
     ]},
-
+    { "Examples" = [
+        "examples/demo.md"
+    ]},
+    { "Reference" = [
+        "reference/api.md"
+    ]},
     { "Doc building" = [
         "doc_building/index.md",
         "doc_building/markdown.md"

@@ -128,6 +128,8 @@ def plot_ppc(
     low_energy, high_energy = data["bins"] - data["width"], data["bins"] + data["width"]
     bin_edges = np.append(low_energy, high_energy[-1])
 
+    # TODO : iterate over each spectrum and each response
+    # Try to get area ? How do we handle multiresponse without area ?
     area = get_effective_area()
 
     denominators = []

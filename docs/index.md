@@ -1,4 +1,10 @@
-# Welcome to (B)SIXSA's documentation!
+---
+icon: lucide/rocket
+---
+
+# Welcome 
+
+## Welcome to (B)SIXSA's documentation!
 
 `(B)SIXSA` is a friendly implementation of the simulation-based inference methodology developed in the "SBI with NPE applied to X-ray spectral fitting" paper serie[^1][^2].
 In originally started as a fork the [Bayesian X-ray Analysis toolkit (`BXA`)](https://johannesbuchner.github.io/BXA/index.html) and implements a similar syntax using `xspec` as a backend.

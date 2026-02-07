@@ -15,7 +15,7 @@ import xspec
 import torch
 
 from .convenience import XSilence
-from .priors import build_prior_me
+from .priors import build_prior
 import matplotlib.pyplot as plt
 from .xspec import parallel_folding
 import pathos.multiprocessing as multiprocessing  # pathos
@@ -65,23 +65,21 @@ def store_chain(chainfilename, posterior, indexes, parameter_names, fit_statisti
     tbhdu.writeto(chainfilename, overwrite=True)
 
 
-def set_parameters(values, indexes):
+def set_parameters(values, indexes, model_indexes):
     """Update the active XSPEC parameters using transformed values.
 
     Parameters:
         values (Sequence[float]): Parameter values in the physical space
     """
-    #AllModels(1).setPars({index:float(value) for index,value in zip(indexes, values)})
-    idx = 0
-    sources_models = AllModels.sources
+    parameter_to_set = {}  # Will contain {model : {par_index:prior}}
 
-    for model_nb, (source, model_name) in enumerate(zip(sources_models.keys(), sources_models.values())):
-        model = AllModels(1, model_name)
 
-        values_model = values[idx : idx + len(indexes[model_nb])]
-        model.setPars({index:float(value) for index,value in zip(indexes[model_nb], values_model)})
-        idx += len(indexes[model_nb])
+    for value, index, model_name in zip(values, indexes, model_indexes):
+        parameter_to_set[model_name] = parameter_to_set.get(model_name, {})
+        parameter_to_set[model_name][index] = float(value)
 
+    parameter_to_set = sum(((AllModels(1, modName=k), v) for k, v in parameter_to_set.items()), ())
+    AllModels.setPars(*parameter_to_set)
 
 class SIXSASolver(object):
     allowed_stats = ["cstat", "pstat"]
@@ -96,9 +94,10 @@ class SIXSASolver(object):
     ):
 
         #model = AllModels(1)
-        prior, indexes, bounds = build_prior_me(prior, return_bounds=True)
+        prior, indexes, model_indexes, bounds = build_prior(prior, return_bounds=True)
 
         self.indexes = indexes
+        self.model_indexes = model_indexes
         sources_models = AllModels.sources
         self.nb_models = len(sources_models)
         self.prior = prior
@@ -194,7 +193,7 @@ class SIXSASolver(object):
             pool = self.pool
 
         simulation_outputs = parallel_folding(
-            theta, self.indexes, self.nb_models, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
+            theta, self.indexes, self.model_indexes, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
         )
 
         return -0.5 * simulation_outputs["cstat"]
@@ -243,7 +242,7 @@ class SIXSASolver(object):
             # plot models
             flux = []
             for k, row in enumerate(tqdm(self.posterior[:nsamples], disable=None)):
-                set_parameters(row, self.indexes)
+                set_parameters(row, self.indexes, self.model_indexes)
                 AllModels.calcFlux(erange)
                 f = spectrum.flux
                 # compute flux in current energies
@@ -415,11 +414,9 @@ class SIXSASolver(object):
             Plot(plottype)
 
             for k, row in enumerate(tqdm(parameters, disable=None)):
-                set_parameters(row, self.indexes)
+                set_parameters(row, self.indexes, self.model_indexes)
 
                 sources_models = xspec.AllModels.sources
-
-
 
                 maxncomp = 0
                 # get plot data
@@ -511,8 +508,9 @@ class SIXSASolver(object):
                 yield base_content
             Plot.device = olddevice
 
+
     @property
-    def parameter_names(self):
+    def parameter_names(self) -> list[str]:
         """Return unique parameter names aligned with XSPEC ordering.
 
         Returns:
@@ -520,14 +518,15 @@ class SIXSASolver(object):
                 avoid duplicates.
         """
 
-        from .convenience import build_parameter_name
-        return build_parameter_name()
+        from .convenience import iter_thawn_parameters
+        return [parameter.name for parameter in iter_thawn_parameters()]
+
 
     def build_dataframe(
         self,
         sampler: str = "exact_sampler",
         num_samples=10_000,
-    ):
+    ) -> pd.DataFrame:
         """Build a posterior sample table from the fitted neural network.
 
         Parameters:
@@ -539,16 +538,16 @@ class SIXSASolver(object):
                 importance weights.
         """
 
-        dict_of_params = {}
+
         sampler_kwargs = {}
 
         samples = self.samplers[sampler].sample(
             (num_samples,), **sampler_kwargs
         )
 
-        for index, parameters in zip(self.indexes, samples.T):
-            name = self.parameter_names[index]
-            dict_of_params[name] = parameters
+        dict_of_params = {
+            name: parameters for name, parameters in zip(self.parameter_names, samples.T)
+        }
 
         return pd.DataFrame.from_dict(dict_of_params)
 
