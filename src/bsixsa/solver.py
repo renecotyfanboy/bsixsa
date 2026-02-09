@@ -444,20 +444,21 @@ class SIXSASolver(object):
 
                     expected_rates = []
 
-                    # Check each model
+                    add_comps_counter = 1
                     for source, model_name in zip(sources_models.keys(), sources_models.values()):
-                        Plot(plottype, 'model ' + model_name)
-
+                        xspec.Plot('counts', 'model ' + model_name)
+                        model = xspec.AllModels(1,model_name)
+                    
                         # If the model has additive components
-                        if Plot.nAddComps() != maxncomp :
-                            maxncomp += Plot.nAddComps()
-                            for i in range(1,maxncomp+1):
-                                expected_rates.append(Plot.addComp(i))
-
+                        nb_of_add_components = model.expression.count('+')
+                        if nb_of_add_components >= 1 :
+                            for i in range(add_comps_counter, add_comps_counter + nb_of_add_components):
+                                expected_rates.append(xspec.Plot.addComp(i))
+                            add_comps_counter += nb_of_add_components
+                    
                         # If not, plot the raw model
                         else :
-                            model = AllModels(1,model_name)
-                            expected_rates.append(numpy.asarray(model.folded(1)) * xspec.AllData(1).exposure / e_widths)
+                            expected_rates.append(np.asarray(model.folded(1)) * xspec.AllData(1).exposure / e_widths)
 
                     total_rate = np.sum(np.asarray(expected_rates), axis = 0)
 
