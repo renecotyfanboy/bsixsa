@@ -118,7 +118,7 @@ def build_prior(define_prior, return_bounds=False):
 
             low, high = prior.support()
             parameter_to_set[par.model] = parameter_to_set.get(par.model, {})
-            parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},,{low},{low},{high},{high}"
+            parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},0.1,{low},{low},{high},{high}"
 
             list_of_prior.append(prior)
             model_names.append(par.model.name)
