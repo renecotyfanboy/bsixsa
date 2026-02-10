@@ -2,6 +2,7 @@ import numpy as np
 from .abc import Sampler
 import typing
 import ultranest
+import pandas as pd
 from ..convenience import iter_thawn_parameters
 
 if typing.TYPE_CHECKING:
@@ -35,9 +36,23 @@ class UltranestSampler(Sampler):
         return self.solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
 
     def run(self):
+        from ..solver import FitResults
+        from ..convenience import catchtime
+        with catchtime("Running nested sampler", print_time=False) as run_time:
+            results = self.sampler.run(**self.sampler_kwargs)
 
-        results = self.sampler.run(**self.sampler_kwargs)
         self.results = results
+
+        posterior_dict = {name:results["samples"][:, i] for i, name in enumerate(self.solver.parameter_names)}
+
+        self.solver.fit_result = FitResults(
+            time=float(run_time()),
+            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            n_likelihood_evaluations=results["ncall"],
+            log_Z=float(results["logz"]),
+            log_Z_err=float(results["logzerr"])
+        )
+
         return results
 
     def sample(self, shape):

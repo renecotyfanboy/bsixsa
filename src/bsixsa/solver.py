@@ -6,7 +6,7 @@ import numpy as np
 from ultranest.plot import PredictionBand
 import os
 import shutil
-
+import time
 import numpy
 import warnings
 import pandas as pd
@@ -14,6 +14,7 @@ from xspec import Xset, AllModels, Fit, Plot, AllData
 import xspec
 import torch
 
+from numpy.typing import ArrayLike
 from .convenience import XSilence
 from .priors import build_prior
 import matplotlib.pyplot as plt
@@ -21,6 +22,16 @@ from .xspec import parallel_folding
 import pathos.multiprocessing as multiprocessing  # pathos
 from bsixsa.analysis.plotting import plot_ppc
 from tqdm.auto import tqdm
+from dataclasses import dataclass
+
+
+@dataclass
+class FitResults:
+    time: float
+    posterior_samples: pd.DataFrame
+    n_likelihood_evaluations: int
+    log_Z: float
+    log_Z_err: float
 
 
 def store_chain(chainfilename, posterior, indexes, parameter_names, fit_statistic):
@@ -621,6 +632,7 @@ class SIXSASolver(object):
 
     def run(self, **kwargs):
 
+
         # TODO : check for a way to distinguish sampler & samplers
         if self.sampler_kind == "nessai":
             from .sampler.nessai import NessaiSampler
@@ -639,6 +651,5 @@ class SIXSASolver(object):
 
         self.posterior_samples = self.sampler.run()
         self.samplers["posterior"] = self.sampler
+
         return self.sampler.sampler
-
-

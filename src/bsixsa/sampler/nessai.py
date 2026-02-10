@@ -2,10 +2,12 @@ import torch
 import typing
 from .abc import Sampler
 import warnings
+import pandas as pd
 from nessai.model import Model as NessaiModel
 from nessai.flowsampler import FlowSampler
-from nessai.livepoint import live_points_to_array
+from nessai.livepoint import live_points_to_array, live_points_to_dict
 from nessai.posterior import draw_posterior_samples
+
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
@@ -63,8 +65,19 @@ class NessaiSampler(Sampler):
         )
 
     def run(self):
-
+        from ..solver import FitResults
         self.sampler.run()
+
+        posterior_dict = live_points_to_dict(self.sampler.posterior_samples, names=self.solver.parameter_names)
+
+        self.solver.fit_result = FitResults(
+            time=float(self.sampler.ns.current_sampling_time.total_seconds()),
+            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            n_likelihood_evaluations=self.sampler.ns.total_likelihood_evaluations,
+            log_Z=float(self.sampler.log_evidence),
+            log_Z_err=float(self.sampler.log_evidence_error),
+        )
+
         return self.sampler
 
     def sample(self, shape):

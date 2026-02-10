@@ -17,3 +17,4 @@ run_*.py
 *data
 *dev
 .env
+*nuwa
