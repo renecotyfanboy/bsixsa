@@ -4,6 +4,9 @@ import catppuccin
 from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
 from xspec import Plot, AllData, AllModels
+from tqdm.auto import tqdm
+
+from ..convenience import XSilence
 
 PALETTE = catppuccin.PALETTE.latte
 
@@ -63,6 +66,128 @@ def poisson_error_bars(observed_counts, sigma=1):
     return y_observed, y_observed_low, y_observed_high
 
 
+def posterior_predictions_plot(solver, plottype, sampler=None, n_samples=None):
+    """Yield XSPEC plot arrays for posterior predictive visualisations."""
+    from ..solver import set_parameters
+
+    parameters = solver.sample_parameters(sampler_name=sampler, n_samples=n_samples)
+
+    with XSilence():
+        olddevice = Plot.device
+        Plot.device = "/null"
+
+        Plot(plottype)
+
+        for row in tqdm(parameters, disable=None):
+            set_parameters(row, solver.indexes, solver.model_indexes)
+
+            sources_models = AllModels.sources
+
+            if plottype == "model":
+                base_content = np.transpose([Plot.x(), Plot.xErr(), Plot.model()])
+            elif Plot.background:
+                e = np.mean(np.asarray(AllData(1).energies), axis=1)
+                e_widths = np.diff(np.asarray(AllData(1).energies), axis=1).flatten()
+
+                expected_rates = []
+
+                add_comps_counter = 1
+                for source, model_name in zip(
+                    sources_models.keys(), sources_models.values()
+                ):
+                    Plot("counts", "model " + model_name)
+                    model = AllModels(1, model_name)
+
+                    nb_of_add_components = model.expression.count("+")
+                    if nb_of_add_components >= 1:
+                        for i in range(
+                            add_comps_counter,
+                            add_comps_counter + nb_of_add_components,
+                        ):
+                            expected_rates.append(Plot.addComp(i))
+                        add_comps_counter += nb_of_add_components
+                    else:
+                        expected_rates.append(
+                            np.asarray(model.folded(1))
+                            * AllData(1).exposure
+                            / e_widths
+                        )
+
+                total_rate = np.sum(np.asarray(expected_rates), axis=0)
+
+                data = (
+                    np.asarray(AllData(1).values) * AllData(1).exposure / e_widths
+                )
+                data_err = np.sqrt(data / e_widths)
+
+                base_content = [
+                    e,
+                    e_widths / 2,
+                    data,
+                    data_err,
+                    Plot.backgroundVals(),
+                    np.zeros_like(Plot.backgroundVals()),
+                    total_rate,
+                ]
+
+                for rate in expected_rates:
+                    base_content.append(rate)
+
+                base_content = np.transpose(base_content)
+            else:
+                base_content = np.transpose(
+                    [Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(), Plot.model()]
+                )
+
+            yield base_content
+
+        Plot.device = olddevice
+
+
+def posterior_predictions_convolved(
+    solver,
+    component_names=None,
+    plot_args=None,
+    n_samples=400,
+    sampler=None,
+    plottype="counts",
+):
+    """Generate convolved posterior predictive bands for plotting."""
+    data = [None]
+    models = []
+
+    Plot.background = True
+    Plot.add = True
+
+    for content in posterior_predictions_plot(
+        solver, plottype=plottype, sampler=sampler, n_samples=n_samples
+    ):
+        ndata_columns = 6 if Plot.background else 4
+        ncomponents = content.shape[1] - ndata_columns
+        if data[0] is None:
+            data[0] = content[:, 0:ndata_columns]
+        model_contributions = []
+        for component in range(ncomponents):
+            y = content[:, ndata_columns + component]
+            model_contributions.append(y)
+        models.append(model_contributions)
+
+    if Plot.background:
+        results = dict(
+            list(
+                zip(
+                    "bins,width,data,error,background,backgrounderr".split(","),
+                    data[0].transpose(),
+                )
+            )
+        )
+    else:
+        results = dict(list(zip("bins,width,data,error".split(","), data[0].transpose())))
+
+    results["models"] = np.array(models)
+    return results
+
+
 def plot_ppc(
     solver,
     sampler,
@@ -105,7 +230,8 @@ def plot_ppc(
     if component_names is None:
         raise ValueError("component_names must be specified")
 
-    data = solver.posterior_predictions_convolved(
+    data = posterior_predictions_convolved(
+        solver,
         component_names=component_names,
         n_samples=n_samples,
         plottype="counts",
@@ -127,10 +253,6 @@ def plot_ppc(
 
     low_energy, high_energy = data["bins"] - data["width"], data["bins"] + data["width"]
     bin_edges = np.append(low_energy, high_energy[-1])
-
-    # TODO : iterate over each spectrum and each response
-    # Try to get area ? How do we handle multiresponse without area ?
-    area = get_effective_area()
 
     denominators = []
     sources_models = AllModels.sources
@@ -183,8 +305,6 @@ def plot_ppc(
     legend_list = [error_bar]
 
     linestyles = ["solid"] + ["dashdot"] * (n_components - 1)
-
-
 
     for i, (color, component_name, linestyle) in enumerate(
         zip(COLOR_CYCLE, component_names, linestyles)
@@ -264,26 +384,6 @@ def plot_ppc(
             y_observed_low_bkg / denominators[0],
             y_observed_high_bkg / denominators[0],
         )
-
-        """
-        error_bar_bkg = axs[0].errorbar(
-            np.sqrt(bin_edges[:-1] * bin_edges[1:]),
-            y_observed_bkg,
-            xerr=np.abs(np.stack([bin_edges[:-1], bin_edges[1:]]) - np.sqrt(bin_edges[:-1] * bin_edges[1:])),
-            yerr=[
-                np.maximum(y_observed_bkg - y_observed_low_bkg, 0),
-                np.maximum(y_observed_high_bkg - y_observed_bkg, 0),
-            ],
-            linestyle="none",
-            color=BACKGROUND_DATA_COLOR,
-            alpha=0.2,
-            capsize=2,
-            zorder=10,
-            label="Background"
-        )
-        """
-
-        # legend_list.append(error_bar_bkg)
 
         background_envelope = (
             np.random.poisson(np.repeat(solver._background[None, :], 1000, axis=0))
@@ -391,15 +491,3 @@ def plot_ppc(
     fig.align_ylabels()
 
     return fig
-
-
-def get_effective_area():
-    Plot.area = True
-    Plot("ldata")
-    res_divided_by_area = Plot.model()
-
-    Plot.area = False
-    Plot("ldata")
-    res_not_divided_by_area = Plot.model()
-
-    return np.asarray(res_not_divided_by_area) / np.asarray(res_divided_by_area)

@@ -42,11 +42,20 @@ class XspecParameter:
     absolute_idx: int # Model independent index for thawn parameters
 
 
-def iter_components(model: Model) -> Iterator[Component]:
-    """Iterate over all components of a given xspec model."""
+def iter_components(model: Model, additive_only: bool = False) -> Iterator[Component]:
+    """Iterate over components of a given xspec model.
+
+    Parameters
+    ----------
+        additive_only (bool): If ``True``, yield only additive components as
+            identified by the presence of a ``norm`` parameter.
+    """
 
     for component_name in model.componentNames:
-        yield getattr(model, component_name)
+        component = getattr(model, component_name)
+        if additive_only and "norm" not in component.parameterNames:
+            continue
+        yield component
 
 
 def iter_parameters(component: Component) -> Iterator[Parameter]:

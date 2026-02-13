@@ -50,7 +50,7 @@ class MultipleIndependent:
 
 
 def build_prior(define_prior, return_bounds=False):
-
+    # TODO : rewrite with defaultdict to avoid weird getters
     model_list = [AllModels(1, modName=name) for name in AllModels.sources.values()]
 
     is_single_model_prior = all(len(definition) == 3 for definition in define_prior)

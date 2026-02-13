@@ -8,6 +8,92 @@ from contextlib import contextmanager, nullcontext
 from .convenience import XSilence
 
 
+class SpectrumState:
+    """
+    A class which helps in extracting the current XSPEC state with less verbose for a given spectrum.
+    """
+
+    def __init__(self, spectrum_index: int = 1):
+        self.idx = spectrum_index
+        self.spectrum: xspec.Spectrum = xspec.AllData(self.idx)
+
+    @property
+    def exposure(self) -> float:
+        """
+        Return the exposure of the observed spectrum in seconds.
+        """
+        return float(self.spectrum.exposure)
+
+    @property
+    def observed_counts(self) -> np.ndarray:
+        """
+        Return the observed spectrum in counts per bin.
+        """
+        return np.asarray(self.spectrum.values) * self.exposure
+
+    @property
+    def bin_edges(self) -> np.ndarray:
+        """
+        Return the bin edges in KeV. `bin_edges[0]` yields the lower values and `bin_edges[1]` the upper ones.
+        """
+        return np.asarray(self.spectrum.energies).T
+
+    @property
+    def bin_edges_1d(self) -> np.ndarray:
+
+        return np.append(self.bin_edges[0], self.bin_edges[1][:-1])
+
+    @property
+    def bin_width(self) -> np.ndarray:
+        return np.diff(self.bin_edges, axis=0).squeeze()
+
+    @property
+    def bin_center(self, log=True) -> np.ndarray:
+
+        if log:
+            return np.sqrt(np.prod(self.bin_width, axis=0).squeeze())
+        else:
+            return np.mean(self.bin_width, axis=0).squeeze()
+
+    @property
+    def component_counts(self) -> dict[str, np.ndarray]:
+
+        xspec.Plot.add = True
+        xspec.Plot("counts")
+
+        total_add_idx = 1
+        component_counts = {}
+
+        for model_name in xspec.AllModels.sources.values():
+            model = xspec.AllModels(1, model_name)
+
+            n_add_components = sum(1 for _ in iter_components(model, additive_only=True))
+
+            if n_add_components > 1:
+                for i, component in enumerate(iter_components(model, additive_only=True)):
+                    component_counts[f"{model_name}_{component.name}"] = np.asarray(
+                        xspec.Plot.addComp(total_add_idx)) * self.bin_width
+                    total_add_idx += 1
+
+        return component_counts
+
+    @property
+    def model_counts(self) -> dict[str, np.ndarray]:
+
+        model_counts = {}
+
+        for model_name in xspec.AllModels.sources.values():
+            model = xspec.AllModels(1, model_name)
+            model_counts[model_name] = np.asarray(model.folded(1)) * self.exposure
+
+        return model_counts
+
+    @property
+    def total_model_counts(self) -> np.ndarray:
+
+        return sum(self.model_counts.values())
+
+
 def get_model_block(lines):
     """
     Find the lines related to the model parameters in an .xcm file
@@ -106,7 +192,7 @@ def local_xcm_path(params, indexes, model_indexes, base_xcm_path, *, tmp_dir=Non
 
 
 def parallel_folding(
-    params, indexes, model_indexes, apply_stat=True, desc="", progress_bar=True, pool=None
+    params, indexes, model_indexes, apply_stat=True, desc="", progress_bar=True, pool=None, return_model=False
 ):
     """Perform simulation in parallel with XSPEC.
 
@@ -134,19 +220,22 @@ def parallel_folding(
 
             in_pool = pool is not None
 
+            kwargs = dict(model_file=model_file, apply_stat=apply_stat, tmp_dir=tmp_dir, in_pool=in_pool, return_model=return_model)
+
             if not in_pool:
 
-                outputs = [
-                    folded_model_from_parameters(param, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool)
-                    for param in params
-                ]
+                outputs = []
+                for param in params:
+                    outputs.append(folded_model_from_parameters(param, indexes, model_indexes, **kwargs))
+                    update_progress(1)
 
             else:
 
                 results = [
                     pool.apply_async(
                         folded_model_from_parameters,
-                        (param, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool),
+                        (param, indexes, model_indexes),
+                        kwds=kwargs,
                         callback=update_progress,
                     )
                     for param in params
@@ -154,45 +243,50 @@ def parallel_folding(
 
                 outputs = [result.get() for result in results]
 
-        spectra = np.vstack([spectra for spectra, _ in outputs])
-        cstat = np.vstack([stat for _, stat in outputs]).squeeze()
-
-        return {
-            "spectra": spectra,
-            "cstat": cstat,
+        return_dict = {
+            "spectra": None,
+            "cstat": None,
         }
 
+        if return_model:
+            return_dict["spectra"] = np.vstack([spectra for spectra, _ in outputs])
+            return_dict["cstat"] = np.vstack([stat for _, stat in outputs]).squeeze()
 
-def folded_model_from_parameters(params, indexes, model_indexes, model_file, apply_stat, tmp_dir, in_pool):
+        else:
+            return_dict["cstat"] = np.vstack([stat for stat in outputs]).squeeze()
+
+        return return_dict
+
+
+def folded_model_from_parameters(
+        params, indexes, model_indexes,
+        *, model_file, apply_stat, tmp_dir, in_pool, return_model=False
+):
 
     with XSilence():
         with local_xcm_path(params, indexes, model_indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
-        xspec.Fit.statMethod = "cstat"
-        xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
-        sources_models = xspec.AllModels.sources
+        #xspec.Fit.statMethod = "cstat" # <- we force cstat, sorry
+        #xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
+        cstat = float(xspec.Fit.statistic)
 
+        if return_model:
+            s = SpectrumState(1)
+            count_list = []
+            for n in range(1, xspec.AllData.nSpectra + 1):
+                count_list.append((s.total_model_counts))
 
-        count_list = []
-        stat_list = []
+            if apply_stat:
+                spectra = np.random.poisson(np.hstack(count_list))
 
-        for n in range(1, xspec.AllData.nSpectra + 1):
-            expected_rate = 0
-            for source, model_name in zip(sources_models.keys(), sources_models.values()):
-                model = xspec.AllModels(1,model_name)
-                expected_rate += np.asarray(model.folded(n)) * xspec.AllData(n).exposure
-
-            count_list.append((expected_rate))
-
-        if apply_stat:
-            spectra = np.random.poisson(np.hstack(count_list))
-        else:
-            spectra = np.hstack(count_list)
-
-        stat_list.append(float(xspec.Fit.statistic))
+            else:
+                spectra = np.hstack(count_list)
 
         if in_pool:
             xspec.AllModels.clear()  # VERY IMPORTANT : speedup of ~4 for unknown reasons
 
-    return spectra, np.asarray(stat_list).ravel()
+        if return_model:
+            return spectra, cstat
+        else:
+            return cstat

@@ -1,28 +1,18 @@
 from __future__ import print_function
 
-from typing import Union, Tuple
-
-import numpy as np
-from ultranest.plot import PredictionBand
 import os
 import shutil
-import time
-import numpy
-import warnings
-import pandas as pd
-from xspec import Xset, AllModels, Fit, Plot, AllData
-import xspec
-import torch
+from dataclasses import dataclass
 
-from numpy.typing import ArrayLike
+import numpy as np
+import pandas as pd
+import xspec
+from xspec import AllModels
+
 from .convenience import XSilence
 from .priors import build_prior
-import matplotlib.pyplot as plt
 from .xspec import parallel_folding
 import pathos.multiprocessing as multiprocessing  # pathos
-from bsixsa.analysis.plotting import plot_ppc
-from tqdm.auto import tqdm
-from dataclasses import dataclass
 
 
 @dataclass
@@ -34,48 +24,6 @@ class FitResults:
     log_Z_err: float
 
 
-def store_chain(chainfilename, posterior, indexes, parameter_names, fit_statistic):
-    """Write samples to an XSPEC-compatible chain FITS file.
-
-    Parameters:
-        chainfilename (str): Destination path for the FITS chain file.
-        posterior (numpy.ndarray): Posterior samples with shape
-            ``(n_samples, n_parameters)`` in unit-cube space.
-        fit_statistic (numpy.ndarray): Fit statistic associated with each
-            sample.
-    """
-
-    import astropy.io.fits as pyfits
-
-    group_index = 1
-
-    names = []
-
-    for index in indexes:
-
-        names.append(
-            "%s__%d"
-            % (parameter_names[index], index + (group_index - 1) * len(indexes))
-        )
-
-    columns = [
-        pyfits.Column(name=name, format="D", array=np.asarray(posterior[:, i].numpy()))
-        for i, name in enumerate(names)
-    ]
-
-    columns.append(pyfits.Column(name="FIT_STATISTIC", format="D", array=fit_statistic))
-    table = pyfits.ColDefs(columns)
-    header = pyfits.Header()
-    header.add_comment("""Created with B-SISXA""")
-    header.add_comment("""Based on BXA (Bayesian X-ray spectal Analysis) for Xspec""")
-    header.add_comment("""refer to https://github.com/JohannesBuchner/""")
-    header["TEMPR001"] = 1.0
-    header["STROW001"] = 1
-    header["EXTNAME"] = "CHAIN"
-    tbhdu = pyfits.BinTableHDU.from_columns(table, header=header)
-    tbhdu.writeto(chainfilename, overwrite=True)
-
-
 def set_parameters(values, indexes, model_indexes):
     """Update the active XSPEC parameters using transformed values.
 
@@ -83,14 +31,15 @@ def set_parameters(values, indexes, model_indexes):
         values (Sequence[float]): Parameter values in the physical space
     """
     parameter_to_set = {}  # Will contain {model : {par_index:prior}}
-
-
     for value, index, model_name in zip(values, indexes, model_indexes):
         parameter_to_set[model_name] = parameter_to_set.get(model_name, {})
         parameter_to_set[model_name][index] = float(value)
 
-    parameter_to_set = sum(((AllModels(1, modName=k), v) for k, v in parameter_to_set.items()), ())
+    parameter_to_set = sum(
+        ((AllModels(1, modName=k), v) for k, v in parameter_to_set.items()), ()
+    )
     AllModels.setPars(*parameter_to_set)
+
 
 class SIXSASolver(object):
     allowed_stats = ["cstat", "pstat"]
@@ -153,7 +102,7 @@ class SIXSASolver(object):
 
     @property
     def num_parameters(self):
-        return len(self.transformations)
+        return len(self.indexes)
 
     def sample_parameters(
         self,
@@ -213,54 +162,6 @@ class SIXSASolver(object):
 
         return self.samplers["prior"].log_prob(theta)
 
-    def load_chain_in_xspec(self, n_samples, sampler_name: str = "exact_sampler"):
-
-        posterior, _, c_stat = self.simulate(
-            n_samples,
-            sampler=sampler_name, desc="Computing posterior statistic - "
-        )
-
-        chainfilename = "%schain.fits" % self.outputfiles_basename
-
-        store_chain(
-            chainfilename, posterior, self.indexes, self.parameter_names, c_stat
-        )
-
-        xspec.AllChains.clear()
-        xspec.AllChains += chainfilename
-
-        warnings.warn("Cstat in chain does not account for prior logprob")
-
-
-    def create_flux_chain(self, spectrum, erange="2.0 10.0", nsamples=None):
-        """Evaluate fluxes for posterior samples within a given energy band.
-
-        Parameters:
-            spectrum: XSPEC spectrum object providing the ``flux`` attribute.
-            erange (str, optional): Energy band passed to
-                ``AllModels.calcFlux``. Defaults to ``"2.0 10.0"``.
-            nsamples (int | None): Number of posterior samples to consider.
-                Defaults to all available samples.
-
-        Returns:
-            (numpy.ndarray): Two-column array containing energy flux and photon
-                flux for each posterior sample.
-        """
-        # prefix = analyzer.outputfiles_basename
-        # modelnames = set([t['model'].name for t in transformations])
-
-        with XSilence():
-            # plot models
-            flux = []
-            for k, row in enumerate(tqdm(self.posterior[:nsamples], disable=None)):
-                set_parameters(row, self.indexes, self.model_indexes)
-                AllModels.calcFlux(erange)
-                f = spectrum.flux
-                # compute flux in current energies
-                flux.append([f[0], f[3]])
-
-            return numpy.array(flux)
-
     def posterior_predictions_convolved(
         self,
         component_names=None,
@@ -269,256 +170,26 @@ class SIXSASolver(object):
         sampler=None,
         plottype="counts",
     ):
-        """Generate convolved posterior predictive bands for plotting.
+        from .analysis.plotting import posterior_predictions_convolved
 
-        Parameters:
-            component_names (list[str] | None): Labels associated with each
-                additive model component. Use ``"ignore"`` to skip a component
-                in the plot.
-            plot_args (list[dict] | None): Matplotlib keyword arguments per
-                component.
-            n_samples (int, optional): Number of posterior samples to draw.
-                Defaults to 400.
-            plottype (str, optional): XSPEC plot type passed to ``Plot``.
-                Defaults to ``"counts"``.
-
-        Returns:
-            dict: Observational data, model bands, and metadata needed for
-                plotting posterior predictive checks.
-        """
-        # get data, binned to 10 counts
-        # overplot models
-        # can we do this component-wise?
-        data = [None]  # bin, bin width, data and data error
-        models = []  #
-        if component_names is None:
-            component_names = ["convolved model"] + [
-                "component%d" for i in range(100 - 1)
-            ]
-        if plot_args is None:
-            plot_args = [{}] * 100
-            for i, c in enumerate(plt.rcParams["axes.prop_cycle"].by_key()["color"]):
-                plot_args[i] = dict(color=c)
-                del i, c
-        bands = []
-        Plot.background = True
-        Plot.add = True
-
-        for content in self.posterior_predictions_plot(
-            sampler=sampler, plottype=plottype, n_samples=n_samples
-        ):
-            xmid = content[:, 0]
-            ndata_columns = 6 if Plot.background else 4
-            ncomponents = content.shape[1] - ndata_columns
-            if data[0] is None:
-                data[0] = content[:, 0:ndata_columns]
-            model_contributions = []
-            for component in range(ncomponents):
-                y = content[:, ndata_columns + component]
-                if component >= len(bands):
-                    bands.append(PredictionBand(xmid))
-                bands[component].add(y)
-
-                model_contributions.append(y)
-            models.append(model_contributions)
-
-        for band, label, component_plot_args in zip(bands, component_names, plot_args):
-            if label == "ignore":
-                continue
-            lineargs = dict(drawstyle="steps", color="k")
-            lineargs.update(component_plot_args)
-            shadeargs = dict(color=lineargs["color"])
-            band.shade(alpha=0.5, **shadeargs)
-            band.shade(q=0.495, alpha=0.1, **shadeargs)
-            band.line(label=label, **lineargs)
-
-        if Plot.background:
-            results = dict(
-                list(
-                    zip(
-                        "bins,width,data,error,background,backgrounderr".split(","),
-                        data[0].transpose(),
-                    )
-                )
-            )
-        else:
-            results = dict(
-                list(zip("bins,width,data,error".split(","), data[0].transpose()))
-            )
-        results["models"] = numpy.array(models)
-        return results
-
-    def posterior_predictions_unconvolved(
-        self,
-        component_names=None,
-        plot_args=None,
-        nsamples=400,
-        plottype="model",
-    ):
-        """Generate unconvolved posterior predictive bands for each component.
-
-        Parameters:
-            component_names (list[str] | None): Labels for model components;
-                use ``"ignore"`` to skip drawing a component.
-            plot_args (list[dict] | None): Matplotlib keyword arguments per
-                component.
-            nsamples (int, optional): Number of posterior samples to draw.
-                Defaults to 400.
-            plottype (str, optional): Argument passed to ``xspec.Plot``.
-                Defaults to ``"model"``.
-        """
-        if component_names is None:
-            component_names = ["model"] + ["component%d" for i in range(100 - 1)]
-        if plot_args is None:
-            plot_args = [{}] * 100
-            for i, c in enumerate(plt.rcParams["axes.prop_cycle"].by_key()["color"]):
-                plot_args[i] = dict(color=c)
-                del i, c
-        Plot.add = True
-        bands = []
-
-        for content in self.posterior_predictions_plot(
-            plottype=plottype, n_samples=nsamples
-        ):
-            xmid = content[:, 0]
-            ncomponents = content.shape[1] - 2
-            for component in range(ncomponents):
-                y = content[:, 2 + component]
-
-                if component >= len(bands):
-                    bands.append(PredictionBand(xmid))
-                bands[component].add(y)
-
-        for band, label, component_plot_args in zip(bands, component_names, plot_args):
-            if label == "ignore":
-                continue
-            lineargs = dict(drawstyle="steps", color="k")
-            lineargs.update(component_plot_args)
-            shadeargs = dict(color=lineargs["color"])
-            band.shade(alpha=0.5, **shadeargs)
-            band.shade(q=0.495, alpha=0.1, **shadeargs)
-            band.line(label=label, **lineargs)
-
-    def posterior_predictions_plot(self, plottype, sampler=None, n_samples=None):
-        """Yield XSPEC plot arrays for posterior predictive visualisations.
-
-        Parameters:
-            plottype (str): Plot type forwarded to ``xspec.Plot``.
-            n_samples (int | None): Number of posterior samples to evaluate.
-
-        Returns:
-            (numpy.ndarray): Arrays containing plot-ready data for each sampled
-                posterior draw.
-        """
-        # for plotting, we don't need so many points, and especially the
-        # points that barely made it into the analysis are not that interesting.
-        # so pick a random subset of at least nsamples points
-        parameters = self.sample_parameters(
-            sampler_name=sampler, n_samples=n_samples
+        return posterior_predictions_convolved(
+            self,
+            component_names=component_names,
+            plot_args=plot_args,
+            n_samples=n_samples,
+            sampler=sampler,
+            plottype=plottype,
         )
 
-        with XSilence():
-            olddevice = Plot.device
-            Plot.device = "/null"
+    def posterior_predictions_plot(self, plottype, sampler=None, n_samples=None):
+        from .analysis.plotting import posterior_predictions_plot
 
-            # plot models
-            Plot(plottype)
-
-            for k, row in enumerate(tqdm(parameters, disable=None)):
-                set_parameters(row, self.indexes, self.model_indexes)
-
-                sources_models = xspec.AllModels.sources
-
-                maxncomp = 0
-                # get plot data
-                if plottype == "model":
-                    base_content = numpy.transpose(
-                        [Plot.x(), Plot.xErr(), Plot.model()]
-                    )
-                elif Plot.background:
-                    """
-                    base_content = numpy.transpose(
-                        [
-                            Plot.x(),
-                            Plot.xErr(),
-                            Plot.y(),
-                            Plot.yErr(),
-                            Plot.backgroundVals(),
-                            numpy.zeros_like(Plot.backgroundVals()),
-                            Plot.model(),
-                        ]
-                    )
-                    """
-                    e = numpy.mean(numpy.asarray(AllData(1).energies), axis = 1)
-                    e_widths = numpy.diff(numpy.asarray(AllData(1).energies), axis = 1).flatten()
-
-
-                    expected_rates = []
-
-                    add_comps_counter = 1
-                    for source, model_name in zip(sources_models.keys(), sources_models.values()):
-                        xspec.Plot('counts', 'model ' + model_name)
-                        model = xspec.AllModels(1,model_name)
-                    
-                        # If the model has additive components
-                        nb_of_add_components = model.expression.count('+')
-                        if nb_of_add_components >= 1 :
-                            for i in range(add_comps_counter, add_comps_counter + nb_of_add_components):
-                                expected_rates.append(xspec.Plot.addComp(i))
-                            add_comps_counter += nb_of_add_components
-                    
-                        # If not, plot the raw model
-                        else :
-                            expected_rates.append(np.asarray(model.folded(1)) * xspec.AllData(1).exposure / e_widths)
-
-                    total_rate = np.sum(np.asarray(expected_rates), axis = 0)
-
-                    data = numpy.asarray(xspec.AllData(1).values) * xspec.AllData(1).exposure / e_widths
-                    data_err = numpy.sqrt(data / e_widths) #don't know why /e_widths but that matches pyxpec
-
-                    base_content = [
-                            e,
-                            e_widths/2,
-                            data,
-                            data_err,
-                            Plot.backgroundVals(),
-                            numpy.zeros_like(Plot.backgroundVals()),
-                            total_rate,
-                        ]
-
-                    # Add the model, where each model has its own additive components separated
-                    for rate in expected_rates :
-                        base_content.append(rate)
-
-
-                    base_content = numpy.transpose(base_content)
-
-
-                else:
-                    base_content = numpy.transpose(
-                        [Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(), Plot.model()]
-                    )
-                """
-                # get additive components, if there are any
-                comp = []
-                for i in range(1, maxncomp):
-                    try:
-                        comp.append(Plot.addComp(i))
-                    except Exception:
-                        print(
-                            'The error "***XSPEC Error: Requested array does not exist for this plot." can be ignored.'
-                        )
-                        maxncomp = i
-                        break
-                content = numpy.hstack(
-                    (
-                        base_content,
-                        numpy.transpose(comp).reshape((len(base_content), -1)),
-                    )
-                )
-                """
-                yield base_content
-            Plot.device = olddevice
+        return posterior_predictions_plot(
+            self,
+            plottype=plottype,
+            sampler=sampler,
+            n_samples=n_samples,
+        )
 
 
     @property
@@ -604,31 +275,9 @@ class SIXSASolver(object):
 
 
     def plot_ppc(self, sampler, **kwargs):
+        from .analysis.plotting import plot_ppc
+
         return plot_ppc(self, sampler, **kwargs)
-
-    def sample_parameters(
-            self,
-            n_samples: int,
-            sampler_name: str = "prior",
-    ):
-        r"""Sample parameters $\theta$ in the requested space.
-
-        Parameters:
-            n_samples (int): Number of draws to generate.
-            kind (Literal["to_unit_cube", "to_bxa", "to_xspec"], optional):
-                Target space for the returned samples. Defaults to
-                ``"to_xspec"``.
-            sampler (Callable | None): Optional custom sampler that returns
-                unit-cube samples. If ``None``, a ``BoxUniform`` prior is used.
-
-        Returns:
-            torch.Tensor | numpy.ndarray | list[dict]: Samples expressed in the
-                requested space.
-        """
-
-        sampler = self.samplers[sampler_name]
-        theta = sampler.sample((n_samples,))  # In the unit cube space
-        return theta
 
     def run(self, **kwargs):
 
