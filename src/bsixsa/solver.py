@@ -53,7 +53,6 @@ class SIXSASolver(object):
         sampler="nessai"
     ):
 
-        #model = AllModels(1)
         prior, indexes, model_indexes, bounds = build_prior(prior, return_bounds=True)
 
         self.indexes = indexes
@@ -109,24 +108,42 @@ class SIXSASolver(object):
         n_samples: int,
         sampler_name: str = "prior",
     ):
-        r"""Sample parameters $\theta$ in the requested space.
+        r"""Draw parameter samples from one of the registered samplers.
 
         Parameters:
             n_samples (int): Number of draws to generate.
-            kind (Literal["to_unit_cube", "to_bxa", "to_xspec"], optional):
-                Target space for the returned samples. Defaults to
-                ``"to_xspec"``.
-            sampler (Callable | None): Optional custom sampler that returns
-                unit-cube samples. If ``None``, a ``BoxUniform`` prior is used.
+            sampler_name (str, optional): Key of the sampler in
+                ``self.samplers``. Defaults to ``"prior"``.
 
         Returns:
-            torch.Tensor | numpy.ndarray | list[dict]: Samples expressed in the
-                requested space.
+            torch.Tensor | numpy.ndarray: Raw samples returned by the selected
+                sampler.
         """
 
         sampler = self.samplers[sampler_name]
         theta = sampler.sample((n_samples,))  # In the unit cube space
         return theta
+
+    def simulate(self, parameters, return_kind="full_model_counts"):
+        """Fold parameters through XSPEC and stack simulation outputs.
+
+        Parameters:
+            parameters: Array-like batch of parameter vectors.
+            return_kind (str, optional): One of ``"cstat"``,
+                ``"full_model_counts"``, or ``"models_and_components"``.
+
+        Returns:
+            dict[str, numpy.ndarray | dict[str, numpy.ndarray]]: Stacked
+                outputs returned by :func:`bsixsa.xspec.parallel_folding`.
+        """
+
+        return parallel_folding(
+            parameters,
+            self.indexes,
+            self.model_indexes,
+            pool=self.pool,
+            return_kind=return_kind
+        )
 
     def log_prob_fn(self, theta, x_o):
         r"""
@@ -153,7 +170,13 @@ class SIXSASolver(object):
             pool = self.pool
 
         simulation_outputs = parallel_folding(
-            theta, self.indexes, self.model_indexes, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
+            theta,
+            self.indexes,
+            self.model_indexes,
+            desc="Evaluating C_stat - ",
+            progress_bar=progress_bar,
+            pool=pool,
+            return_kind="cstat",
         )
 
         return -0.5 * simulation_outputs["cstat"]
@@ -161,35 +184,6 @@ class SIXSASolver(object):
     def log_prior_fn(self, theta, x_o):
 
         return self.samplers["prior"].log_prob(theta)
-
-    def posterior_predictions_convolved(
-        self,
-        component_names=None,
-        plot_args=None,
-        n_samples=400,
-        sampler=None,
-        plottype="counts",
-    ):
-        from .analysis.plotting import posterior_predictions_convolved
-
-        return posterior_predictions_convolved(
-            self,
-            component_names=component_names,
-            plot_args=plot_args,
-            n_samples=n_samples,
-            sampler=sampler,
-            plottype=plottype,
-        )
-
-    def posterior_predictions_plot(self, plottype, sampler=None, n_samples=None):
-        from .analysis.plotting import posterior_predictions_plot
-
-        return posterior_predictions_plot(
-            self,
-            plottype=plottype,
-            sampler=sampler,
-            n_samples=n_samples,
-        )
 
 
     @property

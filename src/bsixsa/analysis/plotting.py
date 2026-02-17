@@ -1,12 +1,11 @@
+import itertools
 import matplotlib.pyplot as plt
 import numpy as np
 import catppuccin
 from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
 from xspec import Plot, AllData, AllModels
-from tqdm.auto import tqdm
-
-from ..convenience import XSilence
+from ..xspec import SpectrumState
 
 PALETTE = catppuccin.PALETTE.latte
 
@@ -26,13 +25,11 @@ COLOR_CYCLE = [
     ][::-1]
 ]
 
-
 SPECTRUM_COLOR = load_color(PALETTE.identifier, "blue")
 SPECTRUM_DATA_COLOR = load_color(PALETTE.identifier, "overlay2")
 BACKGROUND_DATA_COLOR = load_color(PALETTE.identifier, "text")
-
-Plot.xAxis = "keV"
-
+alpha_median = 0.7
+alpha_envelope = (0.15, 0.25)
 
 def sigma_to_percentile_intervals(sigmas):
     intervals = []
@@ -66,231 +63,35 @@ def poisson_error_bars(observed_counts, sigma=1):
     return y_observed, y_observed_low, y_observed_high
 
 
-def posterior_predictions_plot(solver, plottype, sampler=None, n_samples=None):
-    """Yield XSPEC plot arrays for posterior predictive visualisations."""
-    from ..solver import set_parameters
-
-    parameters = solver.sample_parameters(sampler_name=sampler, n_samples=n_samples)
-
-    with XSilence():
-        olddevice = Plot.device
-        Plot.device = "/null"
-
-        Plot(plottype)
-
-        for row in tqdm(parameters, disable=None):
-            set_parameters(row, solver.indexes, solver.model_indexes)
-
-            sources_models = AllModels.sources
-
-            if plottype == "model":
-                base_content = np.transpose([Plot.x(), Plot.xErr(), Plot.model()])
-            elif Plot.background:
-                e = np.mean(np.asarray(AllData(1).energies), axis=1)
-                e_widths = np.diff(np.asarray(AllData(1).energies), axis=1).flatten()
-
-                expected_rates = []
-
-                add_comps_counter = 1
-                for source, model_name in zip(
-                    sources_models.keys(), sources_models.values()
-                ):
-                    Plot("counts", "model " + model_name)
-                    model = AllModels(1, model_name)
-
-                    nb_of_add_components = model.expression.count("+")
-                    if nb_of_add_components >= 1:
-                        for i in range(
-                            add_comps_counter,
-                            add_comps_counter + nb_of_add_components,
-                        ):
-                            expected_rates.append(Plot.addComp(i))
-                        add_comps_counter += nb_of_add_components
-                    else:
-                        expected_rates.append(
-                            np.asarray(model.folded(1))
-                            * AllData(1).exposure
-                            / e_widths
-                        )
-
-                total_rate = np.sum(np.asarray(expected_rates), axis=0)
-
-                data = (
-                    np.asarray(AllData(1).values) * AllData(1).exposure / e_widths
-                )
-                data_err = np.sqrt(data / e_widths)
-
-                base_content = [
-                    e,
-                    e_widths / 2,
-                    data,
-                    data_err,
-                    Plot.backgroundVals(),
-                    np.zeros_like(Plot.backgroundVals()),
-                    total_rate,
-                ]
-
-                for rate in expected_rates:
-                    base_content.append(rate)
-
-                base_content = np.transpose(base_content)
-            else:
-                base_content = np.transpose(
-                    [Plot.x(), Plot.xErr(), Plot.y(), Plot.yErr(), Plot.model()]
-                )
-
-            yield base_content
-
-        Plot.device = olddevice
-
-
-def posterior_predictions_convolved(
-    solver,
-    component_names=None,
-    plot_args=None,
-    n_samples=400,
-    sampler=None,
-    plottype="counts",
-):
-    """Generate convolved posterior predictive bands for plotting."""
-    data = [None]
-    models = []
-
-    Plot.background = True
-    Plot.add = True
-
-    for content in posterior_predictions_plot(
-        solver, plottype=plottype, sampler=sampler, n_samples=n_samples
-    ):
-        ndata_columns = 6 if Plot.background else 4
-        ncomponents = content.shape[1] - ndata_columns
-        if data[0] is None:
-            data[0] = content[:, 0:ndata_columns]
-        model_contributions = []
-        for component in range(ncomponents):
-            y = content[:, ndata_columns + component]
-            model_contributions.append(y)
-        models.append(model_contributions)
-
-    if Plot.background:
-        results = dict(
-            list(
-                zip(
-                    "bins,width,data,error,background,backgrounderr".split(","),
-                    data[0].transpose(),
-                )
-            )
-        )
-    else:
-        results = dict(list(zip("bins,width,data,error".split(","), data[0].transpose())))
-
-    results["models"] = np.array(models)
-    return results
-
-
-def plot_ppc(
-    solver,
-    sampler,
-    component_names=None,
-    x_lim=None,
-    y_lim=None,
-    figsize=(12, 6),
-    plot_background=False,
-    legend=True,
-    n_samples=100,
-):
-    r"""Plot posterior predictive spectra with residuals.
+def plot_poisson_error_bars(center, edges, data, denominator, ax, color):
+    r"""Plot observed counts with Gamma-prior credible error bars.
 
     Parameters:
-        solver: Fitted solver instance exposing
-            ``posterior_predictions_convolved`` and background attributes.
-        sampler: Sampler used to draw posterior samples. Currently unused but
-            retained for interface parity with notebook code.
-        component_names (list[str]): Ordered component identifiers to plot. The
-            first entry is interpreted as the total spectrum contribution.
-        x_lim (tuple[float, float], optional): Energy bounds in keV for the
-            upper panel x-axis.
-        y_lim (tuple[float, float], optional): Flux limits for the upper panel
-            y-axis.
-        figsize (tuple[float, float], optional): Matplotlib figure size in
-            inches. Defaults to ``(12, 6)``.
-        plot_background (bool, optional): If ``True`` and the solver provides a
-            background component, draw its predictive envelope. Defaults to
-            ``False``.
-        legend (bool, optional): Whether to display the component legend on the
-            spectrum panel. Defaults to ``True``.
-        n_samples (int, optional): Number of posterior predictive samples to
-            request from ``solver.posterior_predictions_convolved``. Defaults to
-            ``100``.
+        center (numpy.ndarray): Bin centers.
+        edges (numpy.ndarray): Lower/upper bin edges with shape ``(2, n_bins)``.
+        data (numpy.ndarray): Observed counts per bin.
+        denominator (numpy.ndarray | float): Divisor applied to convert counts
+            to plotting units.
+        ax (matplotlib.axes.Axes): Target axis.
+        color: The data color.
 
     Returns:
-        matplotlib.figure.Figure: Figure containing the predictive spectrum and
-        residual panels.
+        matplotlib.container.ErrorbarContainer: Error-bar artist handle.
     """
-    if component_names is None:
-        raise ValueError("component_names must be specified")
-
-    data = posterior_predictions_convolved(
-        solver,
-        component_names=component_names,
-        n_samples=n_samples,
-        plottype="counts",
-        sampler=sampler,
-    )
-
-    plt.close("all")
-
-    if data.get("background") is not None:
-        count_data = (data["data"] + data["background"]) * data["width"] * 2
-    else:
-        count_data = (data["data"]) * data["width"] * 2
-
-    alpha_median = 0.7
-    alpha_envelope = (0.15, 0.25)
-
-    models = data["models"]
-    n_components = models.shape[1]
-
-    low_energy, high_energy = data["bins"] - data["width"], data["bins"] + data["width"]
-    bin_edges = np.append(low_energy, high_energy[-1])
-
-    denominators = []
-    sources_models = AllModels.sources
-    nsources = len(sources_models)
-
-    try :
-
-        AllData(1).multiresponse[0]
-        for k in range(nsources):
-            try :
-                AllData(1).multiresponse[k].arf
-                denominators.append(data["width"] * 2 * AllData(1).exposure)
-            except :
-                denominators.append(data["width"] * 2 * AllData(1).exposure)
-
-    except:
-        denominators.append(data["width"] * 2 * AllData(1).exposure)
-
-    fig, axs = plt.subplots(
-        nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
-    )
-
     y_observed, y_observed_low, y_observed_high = poisson_error_bars(
-        count_data, sigma=1
-    )
-    y_observed, y_observed_low, y_observed_high = (
-        y_observed / denominators[0],
-        y_observed_low / denominators[0],
-        y_observed_high / denominators[0],
+        data, sigma=1
     )
 
-    error_bar = axs[0].errorbar(
-        np.sqrt(bin_edges[:-1] * bin_edges[1:]),
+    y_observed, y_observed_low, y_observed_high = (
+        y_observed / denominator,
+        y_observed_low / denominator,
+        y_observed_high / denominator,
+    )
+
+    error_bar = ax.errorbar(
+        center,
         y_observed,
-        xerr=np.abs(
-            np.stack([bin_edges[:-1], bin_edges[1:]])
-            - np.sqrt(bin_edges[:-1] * bin_edges[1:])
-        ),
+        xerr=np.abs(edges - center[None, :]),
         yerr=[
             np.maximum(y_observed - y_observed_low, 0),
             np.maximum(y_observed_high - y_observed, 0),
@@ -302,117 +103,189 @@ def plot_ppc(
         zorder=10,
     )
 
-    legend_list = [error_bar]
+    return error_bar
 
-    linestyles = ["solid"] + ["dashdot"] * (n_components - 1)
 
-    for i, (color, component_name, linestyle) in enumerate(
-        zip(COLOR_CYCLE, component_names, linestyles)
+def plot_median_and_bands(
+    edges,
+    data,
+    denominator,
+    ax,
+    color,
+    alpha_envelope=(0.15, 0.25),
+    **kwargs,
+):
+    """Plot median, 68%, and 95% predictive bands for sampled spectra.
+
+    Parameters:
+        edges (numpy.ndarray): Bin edges passed to ``matplotlib.axes.Axes.stairs``.
+        data (numpy.ndarray): Sampled spectra with shape
+            ``(n_samples, n_bins)``.
+        denominator (numpy.ndarray | float): Divisor applied to ``data`` before
+            plotting.
+        ax (matplotlib.axes.Axes): Target axis.
+        color: Base color for the median line and envelopes.
+        alpha_envelope (tuple[float, float], optional): Alpha values for the
+            95% and 68% filled bands, respectively.
+        **kwargs: Extra keyword arguments forwarded to the filled stairs and
+            legend proxy patch.
+
+    Returns:
+        tuple[matplotlib.patches.StepPatch, matplotlib.patches.Polygon]:
+            Handles for the median line and envelope proxy used in the legend.
+    """
+    data = data / denominator
+
+    median = ax.stairs(
+        np.median(data, axis=0),
+        edges=edges,
+        color=color,
+        alpha=alpha_median,
+        zorder=100,
+        linestyle="solid",
+    )
+
+    low_band, high_band = np.percentile(data, [16, 84], axis=0)
+
+    ax.stairs(
+        high_band,
+        edges=edges,
+        baseline=low_band,
+        fill=True,
+        alpha=alpha_envelope[1],
+        color=color,
+        zorder=80,
+        **kwargs
+    )
+
+    low_band, high_band = np.percentile(data, [2.5, 97.5], axis=0)
+
+    ax.stairs(
+        high_band,
+        edges=edges,
+        baseline=low_band,
+        fill=True,
+        alpha=alpha_envelope[0],
+        color=color,
+        zorder=60,
+        **kwargs
+    )
+
+    # The legend cannot handle fill_between, so we pass a fill to get a fancy icon
+    (envelope,) = ax.fill(
+        np.nan, np.nan, alpha=alpha_envelope[-1], facecolor=color, **kwargs
+    )
+
+    return median, envelope
+
+
+def plot_ppc(
+    solver,
+    sampler,
+    x_lim=None,
+    y_lim=None,
+    figsize=(12, 6),
+    plot_background=False,
+    plot_models=True,
+    plot_components=True,
+    legend=True,
+    n_samples=100,
+):
+    r"""Plot posterior predictive spectra with residuals.
+
+    Parameters:
+        solver: Solver instance exposing ``samplers`` and ``simulate``.
+        sampler (str): Name of the sampler stored in ``solver.samplers``.
+        x_lim (tuple[float, float], optional): Energy bounds in keV for the
+            upper panel x-axis.
+        y_lim (tuple[float, float], optional): Flux limits for the upper panel
+            y-axis.
+        figsize (tuple[float, float], optional): Matplotlib figure size in
+            inches. Defaults to ``(12, 6)``.
+        plot_background (bool, optional): Reserved for background overlays.
+            This currently has no effect unless the simulated payload contains a
+            ``background`` entry.
+        plot_models (bool, optional): If ``True``, draw one predictive band per
+            source model (in addition to the total model).
+        plot_components (bool, optional): If ``True``, draw additive-component
+            predictive bands for each source model.
+        legend (bool, optional): Whether to display the legend on the spectrum
+            panel. Defaults to ``True``.
+        n_samples (int, optional): Number of parameter draws used to build the
+            predictive bands. Defaults to ``100``.
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing spectrum and residual
+            panels.
+    """
+
+    # TODO : check for background
+    # TODO : let the user chose the components to plot
+
+    Plot.xAxis = "keV"
+    state = SpectrumState(1)
+    parameters = solver.samplers[sampler].sample((n_samples,))
+    data = solver.simulate(parameters, return_kind="models_and_components")
+
+    bin_edges = state.bin_edges
+    bin_center = state.bin_center
+    bin_edges_1d = state.bin_edges_1d
+    bin_width = state.bin_width
+    denominator = bin_width
+
+    legend_names = []
+    legend_list = []
+
+    fig, axs = plt.subplots(
+        nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
+    )
+
+    ### OBSERVED SPECTRUM
+    error_bar = plot_poisson_error_bars(bin_center, bin_edges, state.observed_counts, denominator, axs[0], SPECTRUM_DATA_COLOR)
+    legend_list.append(error_bar)
+    legend_names.append("Observed Spectrum")
+
+    ### TOTAL MODEL
+    total_model = np.random.poisson(data["total_model_counts"])
+    median, envelope = plot_median_and_bands(bin_edges_1d, total_model, denominator, axs[0], color=SPECTRUM_COLOR)
+    legend_list.append((median, envelope))
+    legend_names.append("Total model")
+
+    ### INDIVIDUAL MODELS
+    colors = iter(COLOR_CYCLE[1:])
+
+    for i, (model_name, model_counts) in enumerate(
+        data["model_counts"].items()
     ):
-        local_component = np.random.poisson(models[:, i] * data["width"] * 2).astype(
-            float
-        )
 
-        if plot_background and data.get("background") is not None and (i == 0):
-            background = (
-                np.random.negative_binomial(
-                    np.repeat(solver._background[None, :], len(models), axis=0) + 1,
-                    1 / 2,
-                )
-                * solver._backratio
-            )
+        ### TOTAL MODEL COUNTS
+        if plot_models and (len(data["model_counts"]) > 1):
 
-            local_component += background
+            local_model = np.random.poisson(model_counts)
+            median, envelope = plot_median_and_bands(bin_edges_1d, local_model, denominator, axs[0], color=next(colors))
+            legend_list.append((median, envelope))
+            legend_names.append(model_name)
 
-        if i< nsources :
+        ### ADDITIVE COMPONENTS
+        if plot_components:
 
-            local_component = local_component / denominators[i]
-        else :
-            local_component = local_component / denominators[0]
+            hatches = itertools.cycle(['//', r'\\', '||', '--', '++', 'xx', 'oo', 'OO', '..', '**'])
 
-        median = axs[0].stairs(
-            np.median(local_component, axis=0),
-            edges=bin_edges,
-            color=color,
-            alpha=alpha_median,
-            zorder=100,
-            linestyle=linestyle,
-        )
+            for component_name, component_counts in data["component_counts"].items():
+                if component_name.startswith(model_name + "_"):
 
-        low_band, high_band = np.percentile(local_component, [16, 84], axis=0)
-        axs[0].stairs(
-            high_band,
-            edges=bin_edges,
-            baseline=low_band,
-            fill=True,
-            alpha=alpha_envelope[1],
-            color=color,
-            zorder=80,
-        )
+                    local_model = np.random.poisson(component_counts)
+                    median, envelope = plot_median_and_bands(
+                        bin_edges_1d,
+                        local_model, denominator, axs[0], next(colors),
+                        alpha_envelope=(0.05, 0.1),
+                        hatch=next(hatches),
+                        hatch_linewidth=1,
+                        edgecolor=(1/3, 1/3, 1/3, 1), #
+                    )
 
-        low_band, high_band = np.percentile(local_component, [2.5, 97.5], axis=0)
-        axs[0].stairs(
-            high_band,
-            edges=bin_edges,
-            baseline=low_band,
-            fill=True,
-            alpha=alpha_envelope[0],
-            color=color,
-            zorder=60,
-        )
-
-        # The legend cannot handle fill_between, so we pass a fill to get a fancy icon
-        (envelope,) = axs[0].fill(
-            np.nan, np.nan, alpha=alpha_envelope[-1], facecolor=color
-        )
-
-        legend_list.append((median, envelope))
-
-    if plot_background and data.get("background") is not None:
-        background = data["background"] * data["width"] * 2 / solver._backratio
-
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = poisson_error_bars(
-            background, sigma=1
-        )
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
-            y_observed_bkg * solver._backratio,
-            y_observed_low_bkg * solver._backratio,
-            y_observed_high_bkg * solver._backratio,
-        )
-        y_observed_bkg, y_observed_low_bkg, y_observed_high_bkg = (
-            y_observed_bkg / denominators[0],
-            y_observed_low_bkg / denominators[0],
-            y_observed_high_bkg / denominators[0],
-        )
-
-        background_envelope = (
-            np.random.poisson(np.repeat(solver._background[None, :], 1000, axis=0))
-            * solver._backratio
-        )
-
-        background_envelope = background_envelope / denominators[0]
-
-        median = axs[0].stairs(
-            np.median(background_envelope, axis=0),
-            edges=bin_edges,
-            color=BACKGROUND_DATA_COLOR,
-            alpha=alpha_median,
-            zorder=100,
-            linestyle="dotted",
-        )
-        low_band, high_band = np.percentile(background_envelope, [16, 84], axis=0)
-        envelope = axs[0].stairs(
-            high_band,
-            edges=bin_edges,
-            baseline=low_band,
-            fill=True,
-            alpha=alpha_envelope[1],
-            color=BACKGROUND_DATA_COLOR,
-            zorder=80,
-        )
-        legend_list.append((median, envelope))
-
-    total = np.random.poisson(models[:, 0] * data["width"] * 2).astype(float)
+                    legend_list.append((median, envelope))
+                    legend_names.append(component_name.lstrip("_")) # We remove the extra "_" if the model name is ""
 
     if plot_background and data.get("background") is not None:
         background = (
@@ -424,41 +297,16 @@ def plot_ppc(
 
         total += background
 
-    total = total / denominators[0]
+    total_model = total_model / denominator
+    y_observed = state.observed_counts / denominator
 
-    divider = np.percentile(total, 84, axis=0) - np.percentile(total, 16, axis=0)
-    residuals = (total - y_observed) / np.where(divider > 0, divider, 1.0)
+    divider = np.percentile(total_model, 84, axis=0) - np.percentile(total_model, 16, axis=0)
+    residuals = (total_model - y_observed) / np.where(divider > 0, divider, 1.0)
 
-    axs[1].stairs(
-        np.median(residuals, axis=0),
-        edges=bin_edges,
-        color=SPECTRUM_COLOR,
-        label="Total",
-        alpha=alpha_median,
-        zorder=100,
-    )
-    axs[1].stairs(
-        np.percentile(residuals, 84, axis=0),
-        edges=bin_edges,
-        baseline=np.percentile(residuals, 16, axis=0),
-        fill=True,
-        alpha=alpha_envelope[1],
-        color=SPECTRUM_COLOR,
-        zorder=80,
-    )
-    axs[1].stairs(
-        np.percentile(residuals, 97.5, axis=0),
-        edges=bin_edges,
-        baseline=np.percentile(residuals, 2.5, axis=0),
-        fill=True,
-        alpha=alpha_envelope[0],
-        color=SPECTRUM_COLOR,
-        zorder=60,
-    )
+    plot_median_and_bands(bin_edges_1d, residuals, np.ones_like(state.observed_counts), axs[1], color=SPECTRUM_COLOR)
 
     if x_lim is None:
-        energies = AllData(1).energies
-        x_lim = (np.min(energies), np.max(energies))
+        x_lim = (np.min(state.bin_edges_1d), np.max(state.bin_edges_1d))
 
     axs[0].set_xlim(*x_lim)
 
@@ -466,12 +314,6 @@ def plot_ppc(
         axs[0].set_ylim(*y_lim)
 
     residual_lim = 3.2  # max(np.max(np.abs(residuals))*1.05, 3.2)
-
-    legend_names = (
-        ["Data"]
-        + component_names
-        + (["Background"] if data.get("background") is not None else [])
-    )
 
     axs[1].set_ylim(-residual_lim, residual_lim)
     axs[1].axhline(0, color="black", linestyle="--", alpha=0.5)

@@ -5,7 +5,7 @@ import numpy as np
 import re
 from tqdm.auto import tqdm
 from contextlib import contextmanager, nullcontext
-from .convenience import XSilence
+from .convenience import XSilence, iter_components
 
 
 class SpectrumState:
@@ -41,7 +41,7 @@ class SpectrumState:
     @property
     def bin_edges_1d(self) -> np.ndarray:
 
-        return np.append(self.bin_edges[0], self.bin_edges[1][:-1])
+        return np.append(self.bin_edges[0], self.bin_edges[1][-1])
 
     @property
     def bin_width(self) -> np.ndarray:
@@ -51,9 +51,9 @@ class SpectrumState:
     def bin_center(self, log=True) -> np.ndarray:
 
         if log:
-            return np.sqrt(np.prod(self.bin_width, axis=0).squeeze())
+            return np.sqrt(np.prod(self.bin_edges, axis=0).squeeze())
         else:
-            return np.mean(self.bin_width, axis=0).squeeze()
+            return np.mean(self.bin_edges, axis=0).squeeze()
 
     @property
     def component_counts(self) -> dict[str, np.ndarray]:
@@ -66,13 +66,13 @@ class SpectrumState:
 
         for model_name in xspec.AllModels.sources.values():
             model = xspec.AllModels(1, model_name)
-
             n_add_components = sum(1 for _ in iter_components(model, additive_only=True))
 
+            # There should be strictly more than one component for XSPEC to register their values
             if n_add_components > 1:
                 for i, component in enumerate(iter_components(model, additive_only=True)):
                     component_counts[f"{model_name}_{component.name}"] = np.asarray(
-                        xspec.Plot.addComp(total_add_idx)) * self.bin_width
+                        xspec.Plot.addComp(total_add_idx))
                     total_add_idx += 1
 
         return component_counts
@@ -191,15 +191,54 @@ def local_xcm_path(params, indexes, model_indexes, base_xcm_path, *, tmp_dir=Non
             pass
 
 
+def _stack_folding_outputs(outputs):
+    if not outputs:
+        return {}
+
+    stacked = {}
+    for key, value in outputs[0].items():
+        if isinstance(value, dict):
+            nested = {}
+            for nested_key in value:
+                nested[nested_key] = np.stack(
+                    [out[key][nested_key] for out in outputs]
+                )
+            stacked[key] = nested
+        else:
+            stacked[key] = np.stack([out[key] for out in outputs])
+
+    return stacked
+
+
 def parallel_folding(
-    params, indexes, model_indexes, apply_stat=True, desc="", progress_bar=True, pool=None, return_model=False
+    params,
+    indexes,
+    model_indexes,
+    desc="",
+    progress_bar=True,
+    pool=None,
+    return_kind="cstat",
 ):
-    """Perform simulation in parallel with XSPEC.
+    """Evaluate folded XSPEC outputs for a batch of parameter vectors.
+
+    Parameters:
+        params: Parameter vectors to evaluate.
+        indexes: XSPEC parameter indices associated with ``params``.
+        model_indexes: XSPEC model names associated with ``indexes``.
+        desc (str, optional): Prefix for the progress-bar label.
+        progress_bar (bool, optional): Whether to display a tqdm progress bar.
+        pool (pathos.multiprocessing.Pool | None, optional): Optional process
+            pool for parallel evaluation.
+        return_kind (str, optional): One of ``"cstat"``,
+            ``"full_model_counts"``, or ``"models_and_components"``.
 
     Returns:
-        dict[str, torch.Tensor]: Dictionary containing the stacked spectra under
-            the ``spectra`` key and the corresponding Cash statistics under
-            ``cstat``.
+        dict[str, numpy.ndarray | dict[str, numpy.ndarray]]: Stacked outputs
+            across all rows in ``params``. The ``"cstat"`` key is always
+            present. ``"total_model_counts"`` is included for
+            ``"full_model_counts"`` and ``"models_and_components"``.
+            ``"model_counts"`` and ``"component_counts"`` are included only for
+            ``"models_and_components"``.
     """
 
     with tempfile.TemporaryDirectory(prefix="parallel_folding_") as tmp_dir:
@@ -220,7 +259,12 @@ def parallel_folding(
 
             in_pool = pool is not None
 
-            kwargs = dict(model_file=model_file, apply_stat=apply_stat, tmp_dir=tmp_dir, in_pool=in_pool, return_model=return_model)
+            kwargs = dict(
+                model_file=model_file,
+                tmp_dir=tmp_dir,
+                in_pool=in_pool,
+                return_kind=return_kind,
+            )
 
             if not in_pool:
 
@@ -243,25 +287,19 @@ def parallel_folding(
 
                 outputs = [result.get() for result in results]
 
-        return_dict = {
-            "spectra": None,
-            "cstat": None,
-        }
-
-        if return_model:
-            return_dict["spectra"] = np.vstack([spectra for spectra, _ in outputs])
-            return_dict["cstat"] = np.vstack([stat for _, stat in outputs]).squeeze()
-
-        else:
-            return_dict["cstat"] = np.vstack([stat for stat in outputs]).squeeze()
-
-        return return_dict
+        return _stack_folding_outputs(outputs)
 
 
 def folded_model_from_parameters(
         params, indexes, model_indexes,
-        *, model_file, apply_stat, tmp_dir, in_pool, return_model=False
+        *, model_file, tmp_dir, in_pool, return_kind
 ):
+
+    if return_kind not in {"cstat", "full_model_counts", "models_and_components"}:
+        raise ValueError(
+            "return_kind must be one of 'cstat', 'full_model_counts', or "
+            "'models_and_components'."
+        )
 
     with XSilence():
         with local_xcm_path(params, indexes, model_indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
@@ -271,22 +309,19 @@ def folded_model_from_parameters(
         #xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
         cstat = float(xspec.Fit.statistic)
 
-        if return_model:
+        result = {"cstat": cstat}
+
+        if return_kind == "full_model_counts":
             s = SpectrumState(1)
-            count_list = []
-            for n in range(1, xspec.AllData.nSpectra + 1):
-                count_list.append((s.total_model_counts))
+            result["total_model_counts"] = s.total_model_counts
 
-            if apply_stat:
-                spectra = np.random.poisson(np.hstack(count_list))
-
-            else:
-                spectra = np.hstack(count_list)
+        elif return_kind == "models_and_components":
+            s = SpectrumState(1)
+            result["model_counts"] = s.model_counts
+            result["component_counts"] = s.component_counts
+            result["total_model_counts"] = s.total_model_counts
 
         if in_pool:
             xspec.AllModels.clear()  # VERY IMPORTANT : speedup of ~4 for unknown reasons
 
-        if return_model:
-            return spectra, cstat
-        else:
-            return cstat
+        return result
