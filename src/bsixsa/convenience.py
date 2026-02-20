@@ -112,7 +112,7 @@ def iter_thawn_parameters() -> Iterator[XspecParameter]:
     """
 
     for xspec_parameter in iter_all_parameters():
-        if not xspec_parameter.parameter.frozen:
+        if not (xspec_parameter.parameter.frozen or bool(xspec_parameter.parameter.link)):
             yield xspec_parameter
 
 

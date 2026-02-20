@@ -3,6 +3,7 @@ from .abc import Sampler
 from nautilus import Prior, Sampler as NestedSampler
 from ..convenience import iter_thawn_parameters
 import typing
+import pandas as pd
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
@@ -26,8 +27,20 @@ class NautilusSampler(Sampler):
         self.sampler = NestedSampler(prior, likelihood, n_live=n_live_points, vectorized=True, pass_dict=False)
 
     def run(self):
+        from ..solver import FitResults
+        from ..convenience import catchtime
 
-        self.sampler.run(verbose=True)
+        with catchtime("Running nested sampler", print_time=False) as run_time:
+            self.sampler.run(verbose=True, discard_exploration=True)
+
+        self.solver.fit_result = FitResults(
+            time=float(run_time()),
+            posterior_samples=pd.DataFrame.from_dict(self.sampler.posterior(equal_weight=True)[0]),
+            n_likelihood_evaluations=self.sampler.n_like,
+            log_Z=float(self.sampler.log_z),
+            log_Z_err=float(1/np.sqrt(self.sampler.n_eff))
+        )
+
         return self.sampler
 
     def sample(self, shape):

@@ -305,8 +305,6 @@ def folded_model_from_parameters(
         with local_xcm_path(params, indexes, model_indexes, model_file, tmp_dir=tmp_dir) as local_xcm:
             xspec.Xset.restore(local_xcm)
 
-        #xspec.Fit.statMethod = "cstat" # <- we force cstat, sorry
-        #xspec.Fit.bayes = "off" # <- we handle the prior logprob on our own
         cstat = float(xspec.Fit.statistic)
 
         result = {"cstat": cstat}

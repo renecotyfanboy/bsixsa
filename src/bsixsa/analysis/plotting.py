@@ -221,6 +221,8 @@ def plot_ppc(
 
     # TODO : check for background
     # TODO : let the user chose the components to plot
+    # TODO : add ARF division when relevant
+    # TODO : rebinning / grouping
 
     Plot.xAxis = "keV"
     state = SpectrumState(1)
@@ -287,6 +289,7 @@ def plot_ppc(
                     legend_list.append((median, envelope))
                     legend_names.append(component_name.lstrip("_")) # We remove the extra "_" if the model name is ""
 
+    """
     if plot_background and data.get("background") is not None:
         background = (
             np.random.negative_binomial(
@@ -294,8 +297,9 @@ def plot_ppc(
             )
             * solver._backratio
         )
-
+    
         total += background
+    """
 
     total_model = total_model / denominator
     y_observed = state.observed_counts / denominator

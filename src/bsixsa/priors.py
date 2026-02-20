@@ -111,8 +111,8 @@ def build_prior(define_prior, return_bounds=False):
             case {par.model.name: {par.component.name: {par.parameter.name: prior}}}:
                 pass
 
-        if prior is None and not par.parameter.frozen:
-            raise ValueError(f"No prior for {par.name}. Either pass a prior or freeze explicitly.")
+        if prior is None and not (par.parameter.frozen or bool(par.parameter.link)):
+            raise ValueError(f"No prior or link for {par.name}. Either pass a prior or freeze explicitly.")
 
         if prior is not None:
 
