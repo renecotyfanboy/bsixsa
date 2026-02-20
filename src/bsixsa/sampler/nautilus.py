@@ -3,6 +3,7 @@ from .abc import Sampler
 from nautilus import Prior, Sampler as NestedSampler
 from ..convenience import iter_thawn_parameters
 import typing
+import os
 import pandas as pd
 
 if typing.TYPE_CHECKING:
@@ -24,7 +25,14 @@ class NautilusSampler(Sampler):
         def likelihood(x):
             return solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
 
-        self.sampler = NestedSampler(prior, likelihood, n_live=n_live_points, vectorized=True, pass_dict=False)
+        self.sampler = NestedSampler(
+            prior, likelihood,
+            n_live=n_live_points,
+            vectorized=True,
+            pass_dict=False,
+            n_networks = os.cpu_count(),
+            pool=(None, os.cpu_count())
+        )
 
     def run(self):
         from ..solver import FitResults
