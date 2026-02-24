@@ -1,5 +1,6 @@
 import torch
 import typing
+import numpy as np
 from .abc import Sampler
 import warnings
 import pandas as pd
@@ -29,6 +30,24 @@ class ModelFromSolver(NessaiModel):
 
         return new_array
 
+    def from_unit_hypercube(self, x):
+        """
+        Map from the unit hypercube to the physical parameter space.
+        """
+        x = x.copy()
+        for name, dist in zip(self.names, self.solver.prior.dists):
+            x[name] = dist.ppf(x[name])
+        return x
+
+    def to_unit_hypercube(self, x):
+        """
+        Map from the physical parameter space to the unit hypercube.
+        """
+        x = x.copy()
+        for name, dist in zip(self.names, self.solver.prior.dists):
+            x[name] = np.clip(dist.cdf(x[name]), 0.0, 1.0)
+        return x
+
     def log_prior(self, theta):
         """
         Returns log of prior given a live point assuming uniform
@@ -57,6 +76,8 @@ class NessaiSampler(Sampler):
 
         self.model = ModelFromSolver(self.solver)
         self.n_live_points = n_live_points
+        kwargs.setdefault("importance_nested_sampler", True)
+        kwargs.setdefault("min_samples", min(500, n_live_points))
         self.sampler = FlowSampler(
             self.model,
             nlive=n_live_points,
@@ -81,6 +102,21 @@ class NessaiSampler(Sampler):
         return self.sampler
 
     def sample(self, shape):
+        n = int(shape[0])
 
-        samples = draw_posterior_samples(self.sampler.nested_samples, nlive=self.n_live_points, n=int(shape[0]), method="importance_sampling")
-        return self.model.to_array(samples)
+        if getattr(self.sampler, "nested_samples", None) is not None:
+
+            samples = draw_posterior_samples(
+                self.sampler.nested_samples,
+                nlive=self.n_live_points,
+                n=n,
+                method="importance_sampling",
+            )
+            return self.model.to_array(samples)
+
+        posterior = self.model.to_array(self.sampler.posterior_samples)
+        if posterior.shape[0] >= n:
+            return posterior[:n]
+
+        idx = np.random.default_rng().choice(posterior.shape[0], size=n, replace=True)
+        return posterior[idx]

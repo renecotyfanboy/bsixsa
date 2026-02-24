@@ -215,7 +215,6 @@ class SIXSASolver(object):
                 importance weights.
         """
 
-
         sampler_kwargs = {}
 
         samples = self.samplers[sampler].sample(
