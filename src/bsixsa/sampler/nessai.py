@@ -34,19 +34,23 @@ class ModelFromSolver(NessaiModel):
         """
         Map from the unit hypercube to the physical parameter space.
         """
-        x = x.copy()
-        for name, dist in zip(self.names, self.solver.prior.dists):
-            x[name] = dist.ppf(x[name])
-        return x
+
+        x_out = x.copy()
+        params = self.solver.prior.from_unit_cube(self.to_array(x))
+        for idx, name in enumerate(self.names):
+            x_out[name] = params[:, idx]
+        return x_out
 
     def to_unit_hypercube(self, x):
         """
         Map from the physical parameter space to the unit hypercube.
         """
-        x = x.copy()
-        for name, dist in zip(self.names, self.solver.prior.dists):
-            x[name] = np.clip(dist.cdf(x[name]), 0.0, 1.0)
-        return x
+
+        x_out = x.copy()
+        cube = self.solver.prior.to_unit_cube(self.to_array(x))
+        for idx, name in enumerate(self.names):
+            x_out[name] = cube[:, idx]
+        return x_out
 
     def log_prior(self, theta):
         """

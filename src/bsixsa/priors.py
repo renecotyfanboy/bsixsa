@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+from collections import defaultdict
 import numpy as np
 import re
 from .convenience import XSilence
@@ -30,27 +31,35 @@ class MultipleIndependent:
     def sample(self, size=1, random_state=None):
         rng = np.random.default_rng(random_state)
         cols = [dist.rvs(size=size, random_state=rng) for dist in self.dists]
-        x = np.stack(cols, axis=-1)  # shape: size + (ndim,)
+        x = np.stack(cols, axis=-1)
         return x
+
+    def from_unit_cube(self, cube):
+        cube = np.asarray(cube, dtype=float)
+        params = np.empty_like(cube, dtype=float)
+        for j, dist in enumerate(self.dists):
+            params[..., j] = dist.ppf(cube[..., j])
+        return params
+
+    def to_unit_cube(self, x):
+        x = np.asarray(x, dtype=float)
+        cube = np.empty_like(x, dtype=float)
+        for j, dist in enumerate(self.dists):
+            cube[..., j] = dist.cdf(x[..., j])
+        return cube
 
     def log_prob(self, x):
         x = np.asarray(x)
         x2 = np.atleast_2d(x)
-        if x2.shape[-1] != self.ndim:
-            raise ValueError(f"Expected last dim = {self.ndim}, got {x2.shape[-1]}")
-
         lp = np.zeros(x2.shape[0], dtype=float)
+
         for j, dist in enumerate(self.dists):
-            if hasattr(dist, "logpdf"):
-                lp += dist.logpdf(x2[:, j])
-            else:
-                lp += dist.logpmf(x2[:, j])
+            lp += dist.logpdf(x2[:, j])
 
         return lp[0] if x.ndim == 1 else lp
 
 
 def build_prior(define_prior, return_bounds=False):
-    # TODO : rewrite with defaultdict to avoid weird getters
     model_list = [AllModels(1, modName=name) for name in AllModels.sources.values()]
 
     is_single_model_prior = all(len(definition) == 3 for definition in define_prior)
@@ -71,7 +80,7 @@ def build_prior(define_prior, return_bounds=False):
         define_prior = [(model_name,) + prior_setting for prior_setting in define_prior]
 
     # We turn the list of prior settings in a nested dictionary indexed by model/components/parameter names
-    define_prior_dict = {}
+    define_prior_dict = defaultdict(lambda: defaultdict(dict))
 
     for model_name, component_name, parameter_name, distribution in define_prior:
 
@@ -88,13 +97,11 @@ def build_prior(define_prior, return_bounds=False):
                 else:
                     raise ValueError(f"Component '{component_name}' or '{split_name}' not in {model.componentNames}")
 
-        # Wacky way to build nested dictionaries if they don't exist
-        define_prior_dict[model_name] = define_prior_dict.get(model_name, {})
-        define_prior_dict[model_name][component_name] = define_prior_dict[model_name].get(component_name, {})
+        # Nested defaultdicts handle intermediate dictionary creation
         define_prior_dict[model_name][component_name][parameter_name] = distribution
 
     # Now we build the necessary blocks for inference
-    parameter_to_set = {} # Will contain {model : {par_index:prior}}
+    parameter_to_set = defaultdict(dict)  # Will contain {model : {par_index:prior}}
     list_of_prior = []
     model_index = []
     parameters_index = []
@@ -117,7 +124,6 @@ def build_prior(define_prior, return_bounds=False):
         if prior is not None:
 
             low, high = prior.support()
-            parameter_to_set[par.model] = parameter_to_set.get(par.model, {})
             parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},0.1,{low},{low},{high},{high}"
 
             list_of_prior.append(prior)
