@@ -1,214 +1,25 @@
 """
 WIP BACKUP CODE
 """
-
-class ImportanceSamplingPosteriorUnweighted(ImportanceSamplingPosterior):
-    # noinspection PyMethodOverriding
-    def sample(
-        self,
-        sample_shape: Shape = torch.Size(),
-        weighted: bool = False,
-        oversampling_factor: int = 10,
-        show_progress_bars: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if len(sample_shape) != 1:
-            raise ValueError("Sampling shape must have 1 dimension")
-
-        if weighted:
-            oversampling_factor = 1
-
-        samples, log_weight = super().sample(
-            (sample_shape[0] * oversampling_factor,),
-            method="importance",
-            show_progress_bars=show_progress_bars,
-        )
-
-        finite_weight = torch.isfinite(log_weight)
-        samples = samples[finite_weight]
-        log_weight = log_weight[finite_weight]
-
-        max_log_weight = torch.max(log_weight)
-        stable_log_weight = log_weight - max_log_weight
-        weight = torch.exp(stable_log_weight)
-
-        if weighted:
-            return samples, weight
-
-        cdf = torch.cumsum(weight, dim=0)
-        cdf = cdf / cdf[-1]
-        n_samples = int(sample_shape[0])
-        u0 = torch.rand(1) / n_samples
-        positions = u0 + torch.arange(n_samples, dtype=torch.float32) / n_samples
-        idx = torch.searchsorted(cdf, positions, right=True)
-        return samples.index_select(0, idx).to(torch.float32)
+import os
+from torch import nn
+import torch
+import sbi
+import numpy as np
+import xspec
+from ..abc import Sampler
 
 
-class SIXSASolver(object):
-    allowed_stats = ["cstat", "pstat"]
+class SIXSASampler(Sampler):
 
-    def __init__(
-            self,
-            prior,
-            model,
-            outputfiles_basename="chains/",
-            use_background=False,
-            device="cpu",
-            overwrite=False,
-            n_jobs=os.cpu_count(),
-    ):
+    def __init__(self, *, solver: 'SIXSASolver', **kwargs):
+        super().__init__(solver=solver)
 
-        self.epoch_trained = []
-        self.training_loss = []
-        self.validation_loss = []
-        self.embedding = None
-        self.embedding_net = nn.Identity()
-        self.device = device
-        self.samplers = dict()
-        self.inference = None
-        self.embedding_list = []
-        self.current_round = 0
-        self.pool = multiprocessing.Pool(processes=n_jobs)
+    def run(self):
+        pass
 
-        prior, indexes, bounds = build_prior(model, prior, return_bounds=True)
-
-        self.indexes = indexes
-        self.prior = prior
-        self.bounds = bounds
-
-        build_prior(prior)
-
-        normalized_output_dir = os.path.normpath(outputfiles_basename)
-
-        if not os.path.exists(normalized_output_dir):
-            os.makedirs(normalized_output_dir)
-
-        else:
-            if not os.path.isdir(normalized_output_dir):
-                raise ValueError(
-                    f"Output path '{outputfiles_basename}' exists and is not a directory."
-                )
-
-            existing_entries = os.listdir(normalized_output_dir)
-            if existing_entries:
-                if not overwrite:
-                    raise FileExistsError(
-                        f"Output directory '{normalized_output_dir}' is not empty. "
-                        "Pass overwrite=True to clear it."
-                    )
-
-                for entry in existing_entries:
-                    entry_path = os.path.join(normalized_output_dir, entry)
-                    if os.path.isdir(entry_path) and not os.path.islink(entry_path):
-                        shutil.rmtree(entry_path)
-                    else:
-                        os.remove(entry_path)
-
-        if not normalized_output_dir.endswith(os.sep):
-            normalized_output_dir = normalized_output_dir + os.sep
-
-        outputfiles_basename = normalized_output_dir
-
-        self.density_estimator_build_fun = posterior_nn(
-            model="maf",
-            # hidden_features=100,
-            # num_transforms=10,
-        )
-
-        if self.background_to_compute:
-            self._background = (
-                    np.asarray(xspec.AllData(1).background.values)
-                    * xspec.AllData(1).background.exposure
-            ).astype(int)
-            self._backratio = np.asarray(
-                xspec.AllData(1).exposure / xspec.AllData(1).background.exposure
-            )
-
-        self.samplers["prior"] = prior
-        self.outputfiles_basename = outputfiles_basename
-
-    def set_best_fit(self):
-        """Set current XSPEC parameters to the maximum a posteriori sample."""
-        # TODO : Update this function
-
-        raise NotImplementedError()
-
-        x0 = self.posterior_unit_cube[
-            :, self.posterior_sampler.log_prob(self.posterior_unit_cube.T).argmax()
-        ]
-        result = minimize(
-            lambda p: -self.posterior_sampler.log_prob(p, track_gradients=True),
-            x0,
-            method="newton-exact",
-        )
-        best_fit = result.x
-        params = self.prior_function(best_fit.numpy())
-        set_parameters(transformations=self.transformations, values=params)
-
-    @property
-    def num_parameters(self):
-        return len(self.transformations)
-
-    def sample_parameters(
-            self,
-            n_samples: int,
-            sampler_name: str = "prior",
-    ):
-        r"""Sample parameters $\theta$ in the requested space.
-
-        Parameters:
-            n_samples (int): Number of draws to generate.
-            kind (Literal["to_unit_cube", "to_bxa", "to_xspec"], optional):
-                Target space for the returned samples. Defaults to
-                ``"to_xspec"``.
-            sampler (Callable | None): Optional custom sampler that returns
-                unit-cube samples. If ``None``, a ``BoxUniform`` prior is used.
-
-        Returns:
-            torch.Tensor | numpy.ndarray | list[dict]: Samples expressed in the
-                requested space.
-        """
-
-        sampler = self.samplers[sampler_name]
-        theta = sampler.sample((n_samples,))  # In the unit cube space
-        return theta
-
-    def log_prob_fn(self, theta, x_o):
-        r"""
-        Return the log-posterior probability, defined as $\mathcal{LL} = -\frac{1}{2} \texttt{Cstat}$. Include the log-likelihood and any prior term defined in `xspec`.
-
-        !!! note "On `x_o` parameter"
-            `x_o` is a dummy parameter used for compatibility with `sbi` as the true spectrum is directly extracted from
-            `xspec`. `sbi` require this parameter as in normal workflow, this function can be conditioned on any `x_o`.
-
-        Parameters:
-            theta (torch.Tensor): Array of samples on the unit cube
-            x_o (torch.Tensor): Observed value, pass `None` if needed
-
-        """
-
-        return self.log_likelihood_fn(theta, x_o) + self.log_prior_fn(theta, x_o)
-
-    def log_likelihood_fn(self, theta, x_o, progress_bar=True, no_pool=False):
-
-        if no_pool:
-            pool = None
-
-        else:
-            pool = self.pool
-
-        simulation_outputs = parallel_folding(
-            theta, self.indexes, desc="Evaluating C_stat - ", progress_bar=progress_bar, pool=pool
-        )
-
-        return -0.5 * simulation_outputs["cstat"]
-
-    def log_prior_fn(self, theta, x_o):
-
-        return self.samplers["prior"].log_prob(theta)
-
-    @property
-    def available_samplers(self) -> list[str]:
-        return list(self.samplers.keys())
+    def sampler(self, shape):
+        pass
 
     @property
     def observed_spectrum(self):
@@ -220,57 +31,6 @@ class SIXSASolver(object):
                 * xspec.AllData(1).exposure
         )
 
-    def build_exact_sampler(self, sampler, x_o):
-        """
-        Build an exact sampler using a given proposal sampler and the associated observation.
-        """
-
-        return ImportanceSamplingPosteriorUnweighted(
-            potential_fn=self.log_prob_fn, proposal=sampler, method="sir"
-        ).set_default_x(x_o)
-
-    def post_process(self, device="cpu"):
-        embedding = self.embedding_list[-1]
-
-        if isinstance(embedding, TorchModuleEmbedding):
-            x_o = (
-                embedding(
-                    torch.from_numpy(
-                        self.observed_spectrum.astype(np.float32)[None, :]
-                    ).to(embedding.device)
-                )
-                .to(device)
-                .squeeze()
-            )
-
-        else:
-            x_o = torch.from_numpy(np.squeeze(embedding(self.observed_spectrum))).to(
-                device
-            )
-
-        sampler = self.build_exact_sampler(list(self.samplers.values())[-1], x_o)
-
-        self.samplers["exact_sampler"] = sampler
-
-        return sampler
-
-    def load_chain_in_xspec(self, n_samples, sampler_name: str = "exact_sampler"):
-
-        posterior, _, c_stat = self.simulate(
-            n_samples,
-            sampler=sampler_name, desc="Computing posterior statistic - "
-        )
-
-        chainfilename = "%schain.fits" % self.outputfiles_basename
-
-        store_chain(
-            chainfilename, posterior, self.indexes, self.parameter_names, c_stat
-        )
-
-        xspec.AllChains.clear()
-        xspec.AllChains += chainfilename
-
-        warnings.warn("Cstat in chain does not account for prior logprob")
 
     def run(
             self,
@@ -282,32 +42,7 @@ class SIXSASolver(object):
             n_samples_xspec: int = 1000,
             device="cpu",
     ):
-        """Run sequential simulation-based inference for the configured model.
 
-        Parameters:
-            num_simulations_per_round (list[int]): Number of simulations per
-                inference round.
-            embedding (Embedding | list[Embedding] | None): Embedding module or
-                per-round list of embeddings applied to simulated spectra.
-            npe_kwargs (dict | None): Keyword arguments forwarded to the NPE
-                constructor.
-            training_kwargs (dict | list[dict] | None): Per-round training
-                arguments for the density estimator.
-            plot_embedding_coverage (bool, optional): Enable diagnostic plots of
-                embedding coverage. Defaults to ``True``.
-            device (str, optional): Torch device identifier. Defaults to
-                ``"cpu"``.
-
-        Returns:
-            ImportanceSamplingPosterior: Final importance-sampling posterior
-                enriched with SIR corrections.
-        """
-
-        if Fit.statMethod.lower() not in SIXSASolver.allowed_stats:
-            raise RuntimeError(
-                "ERROR: not using cstat or pstat! set Fit.statMethod to cash before analysing (currently: %s)!"
-                % Fit.statMethod
-            )
 
         if training_kwargs is None:
             # TODO: Better handling for the default training parameters. The user should be able to provide a subset
