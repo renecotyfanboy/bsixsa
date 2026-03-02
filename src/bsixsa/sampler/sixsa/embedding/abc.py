@@ -8,8 +8,19 @@ class Embedding(ABC):
     trainable: bool = False
     device: torch.device = torch.device("cpu")
 
+    def __init__(self):
+        self._is_fitted = not self.trainable
+
+    @property
+    def is_fitted(self) -> bool:
+        return getattr(self, "_is_fitted", not self.trainable)
+
+    def fit(self, spectra, **kwargs):
+        self._is_fitted = True
+        return self
+
     @abstractmethod
-    def __call__(self, spectra):
+    def transform(self, spectra):
         """Compress spectra into the embedding space.
 
         Parameters:
@@ -20,6 +31,13 @@ class Embedding(ABC):
             (numpy.ndarray): Embedded representation for each spectrum.
         """
         pass
+
+    def fit_transform(self, spectra, **kwargs):
+        self.fit(spectra, **kwargs)
+        return self.transform(spectra)
+
+    def __call__(self, spectra):
+        return self.transform(spectra)
 
     @property
     @abstractmethod
@@ -49,6 +67,8 @@ class Embedding(ABC):
         Returns:
             (matplotlib.figure.Figure): Figure containing the plot.
         """
+        x_train = torch.as_tensor(x_train)
+        x_o = torch.as_tensor(x_o)
 
         cols = int(np.ceil(np.sqrt(len(self.names))))
         rows = int(np.ceil(len(self.names) / cols))
@@ -70,9 +90,7 @@ class Embedding(ABC):
             )
             axes[i].set_title(feature_name)
 
-        plt.suptitle(
-            f"Summary stats" + (f"- Round {round_number}" if round_number else "")
-        )
+        plt.suptitle("Summary stats" + (f" - Round {round_number}" if round_number else ""))
         plt.tight_layout()
 
         if save_to_path:
@@ -91,19 +109,32 @@ class MultipleEmbedding(Embedding):
     """
 
     def __init__(self, embeddings: list[Embedding]):
+        super().__init__()
         self.embeddings = embeddings
 
     @property
     def names(self) -> list[str]:
         return [name for embedding in self.embeddings for name in embedding.names]
 
-    def __call__(self, spectra):
+    @property
+    def is_fitted(self) -> bool:
+        return all(embedding.is_fitted for embedding in self.embeddings)
+
+    def fit(self, spectra, **kwargs):
+        for embedding in self.embeddings:
+            embedding.fit(spectra, **kwargs)
+        return self
+
+    def transform(self, spectra):
         reduced_spectra_list = []
 
         if spectra.ndim == 1:
             spectra = spectra[None, :]
 
         for embedding in self.embeddings:
-            reduced_spectra_list.append(embedding(spectra))
+            transformed = embedding.transform(spectra)
+            if isinstance(transformed, torch.Tensor):
+                transformed = transformed.detach().cpu().numpy()
+            reduced_spectra_list.append(np.asarray(transformed))
 
         return np.hstack(reduced_spectra_list)

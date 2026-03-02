@@ -32,24 +32,25 @@ class GlobalSummaryEmbedding(Embedding):
     """
 
     def __init__(self, config: GlobalSummaryConfig = GlobalSummaryConfig()):
+        super().__init__()
         self.stats = config.stats
 
     @property
     def names(self) -> list[str]:
         return list(self.stats.keys())
 
-    def __call__(self, data):
+    def transform(self, data):
         data_transformed_list = []
 
+        data = torch.as_tensor(data, dtype=torch.float32)
         if data.ndim == 1:
-            data = data[np.newaxis, :]  # (1, M)
-
-        data = torch.as_tensor(data)
+            data = data.unsqueeze(0)
 
         for func in self.stats.values():
             data_transformed_list.append(func(data))
 
-        return np.stack(data_transformed_list, axis=-1)
+        stacked = torch.stack(data_transformed_list, dim=-1)
+        return stacked.detach().cpu().numpy()
 
 
 def local_sum(bin_data, data, bin_summary):
@@ -71,6 +72,7 @@ def local_sum(bin_data, data, bin_summary):
 
 class LocalSummaryEmbedding(Embedding, ABC):
     def __init__(self, energy_grid: np.ndarray = np.linspace(0.5, 8.0, 21)):
+        super().__init__()
         if not (xspec.AllData.nSpectra > 0):
             raise RuntimeError(
                 "There is no xspec data loaded. Please load your data before instanciating."
@@ -91,10 +93,12 @@ class LocalSumEmbedding(LocalSummaryEmbedding):
 
         return names
 
-    def __call__(self, data):
-        data = torch.as_tensor(data)
-
-        return local_sum(self.energy_bins_data, data, self.energy_bins_summary)
+    def transform(self, data):
+        data = torch.as_tensor(data, dtype=torch.float32)
+        if data.ndim == 1:
+            data = data.unsqueeze(0)
+        counts = local_sum(self.energy_bins_data, data, self.energy_bins_summary)
+        return counts.detach().cpu().numpy()
 
 
 class LocalSumWithExtra(LocalSummaryEmbedding):
@@ -149,8 +153,10 @@ class LocalSumWithExtra(LocalSummaryEmbedding):
 
         return names
 
-    def __call__(self, data):
-        data = torch.as_tensor(data)
+    def transform(self, data):
+        data = torch.as_tensor(data, dtype=torch.float32)
+        if data.ndim == 1:
+            data = data.unsqueeze(0)
         embedded_data = []
 
         epsilon = 1
@@ -167,7 +173,7 @@ class LocalSumWithExtra(LocalSummaryEmbedding):
             )
             embedded_data.append(differential_ratios)
 
-        return np.hstack(embedded_data)
+        return torch.hstack(embedded_data).detach().cpu().numpy()
 
 
 class WeightedEnergyEmbedding(LocalSummaryEmbedding):
@@ -190,8 +196,16 @@ class WeightedEnergyEmbedding(LocalSummaryEmbedding):
 
         return names
 
-    def __call__(self, data):
-        energy_low_observation, energy_high_observation = self.energy_bins_data
+    def transform(self, data):
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        energy_low_observation = self.energy_bins_data[0].detach().cpu().numpy()
+        energy_high_observation = self.energy_bins_data[1].detach().cpu().numpy()
         data_transformed_list = []
 
         for i, (e_low_summary, e_high_summary) in enumerate(
