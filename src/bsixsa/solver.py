@@ -103,6 +103,15 @@ class SIXSASolver(object):
     def num_parameters(self):
         return len(self.indexes)
 
+    @property
+    def observed_spectrum(self):
+        """
+        Return the observed spectrum read from `xspec`
+        """
+        rate = np.asarray(xspec.AllData(1).values, dtype=np.float32)
+        exposure = xspec.AllData(1).exposure
+        return rate * exposure
+
     def sample_parameters(
         self,
         n_samples: int,
@@ -145,7 +154,7 @@ class SIXSASolver(object):
             return_kind=return_kind
         )
 
-    def log_prob_fn(self, theta, x_o):
+    def log_prob_fn(self, theta, x_o, from_unit_cube=False):
         r"""
         Return the log-posterior probability, defined as $\mathcal{LL} = -\frac{1}{2} \texttt{Cstat}$. Include the log-likelihood and any prior term defined in `xspec`.
 
@@ -159,7 +168,13 @@ class SIXSASolver(object):
 
         """
 
-        return self.log_likelihood_fn(theta, x_o) + self.log_prior_fn(theta, x_o)
+        if not from_unit_cube:
+
+            return self.log_likelihood_fn(theta, x_o) + self.log_prior_fn(theta, x_o)
+
+        else:
+            theta = self.prior.from_unit_cube(theta)
+            return self.log_likelihood_fn(theta, x_o)
 
     def log_likelihood_fn(self, theta, x_o, progress_bar=True, no_pool=False):
 
@@ -272,7 +287,7 @@ class SIXSASolver(object):
 
         return plot_ppc(self, sampler, **kwargs)
 
-    def run(self, **kwargs):
+    def run(self, *args, **kwargs):
 
 
         # TODO : check for a way to distinguish sampler & samplers
@@ -288,10 +303,18 @@ class SIXSASolver(object):
             from .sampler.ultranest import UltranestSampler
             self.sampler = UltranestSampler(solver=self, **kwargs)
 
+        elif self.sampler_kind == "sixsa":
+            from .sampler.sixsa import SIXSASampler
+            self.sampler = SIXSASampler(solver=self)
+
+            return self.sampler.run(*args, **kwargs)
+
         else:
             raise NotImplementedError()
 
-        self.posterior_samples = self.sampler.run()
-        self.samplers["posterior"] = self.sampler
+        if not self.sampler_kind == "sixsa":
 
-        return self.sampler.sampler
+            self.posterior_samples = self.sampler.run()
+            self.samplers["posterior"] = self.sampler
+
+            return self.sampler.sampler
