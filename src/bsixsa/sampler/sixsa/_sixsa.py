@@ -11,6 +11,7 @@ from joblib import Parallel, delayed
 from sbi.inference import EnsemblePosterior, NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform, RestrictedPrior, get_density_thresholder
+from sbi.neural_nets.embedding_nets import LRUEmbedding, FCEmbedding
 
 from ..abc import Sampler
 from .embedding import IdentityEmbedding
@@ -18,6 +19,51 @@ from .embedding.abc import Embedding
 
 if TYPE_CHECKING:
     from ...solver import SIXSASolver
+
+
+class FCEmbeddingDB(torch.nn.Module):
+    def __init__(
+            self,
+            input_dim: int,
+            output_dim: int = 20,
+            num_hiddens=[50]
+            #dropout_rate: float = 0.01,
+    ):
+        """Fully-connected multi-layer neural network to be used as embedding network.
+
+        Args:
+            input_dim: Dimensionality of input that will be passed to the embedding net.
+            output_dim: Dimensionality of the output.
+            num_layers: Number of layers of the embedding network. (Minimum of 2).
+            num_hiddens: Number of hidden units in each layer of the embedding network.
+        """
+        super().__init__()
+        layers = []
+        num_layers = len(num_hiddens)
+        # first and last layer is defined by the input and output dimension.
+        # therefor the "number of hidden layers" is num_layers-2
+        prev = input_dim
+        for i in range(num_layers):
+            layers.append(torch.nn.Linear(prev, num_hiddens[i]))
+            layers.append(torch.nn.LayerNorm(num_hiddens[i]))
+            layers.append(torch.nn.GELU())
+            #layers.append(nn.Dropout(dropout_rate))
+            prev = num_hiddens[i]
+
+        layers.append(torch.nn.Linear(prev, output_dim))
+
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Network forward pass.
+
+        Args:
+            x: Input tensor (batch_size, num_features)
+
+        Returns:
+            Network output (batch_size, num_features).
+        """
+        return self.net(x)
 
 
 def patch_sample_no_pbar(posterior):
@@ -50,6 +96,7 @@ def training_job(
     theta,
     x,
     *,
+    embedding,
     round_number,
     output_dir,
     proposal=None,
@@ -59,9 +106,13 @@ def training_job(
     current_artifacts_dir = os.path.join(current_round_dir, "artifacts")
     os.makedirs(current_artifacts_dir, exist_ok=True)
 
-    if round_number == 1:
+    # Treat the spectra
+    x = torch.as_tensor(np.random.poisson(x).astype(np.float32))
+
+    if (round_number == 1) or training_kwargs.get("retrain_from_scratch", False):
+        embedding_net = FCEmbeddingDB(x.shape[1], 16)
         prior_sbi = BoxUniform(torch.zeros(theta.shape[-1]), torch.ones(theta.shape[-1]))
-        build_fun = posterior_nn(model="maf")
+        build_fun = posterior_nn(model="maf", embedding_net=embedding_net, prior=prior_sbi)
         inference = NPE(prior=prior_sbi, density_estimator=build_fun, device="cpu")
     else:
         previous_round_dir = os.path.join(output_dir, f"round_{round_number - 1}")
@@ -85,7 +136,7 @@ def training_job(
 
         density_estimator = inference.append_simulations(
             torch.from_numpy(theta.copy()),
-            torch.from_numpy(x.copy()),
+            x,
             proposal=proposal,
         ).train(**training_kwargs)
 
@@ -116,7 +167,7 @@ class SIXSASampler(Sampler):
     def __init__(self, *, solver: "SIXSASolver", **kwargs):
         super().__init__(solver=solver)
         self.proposals = []
-        self.n_nets = max(1, os.cpu_count() or 1)
+        self.n_nets = 8 #max(1, os.cpu_count() or 1)
         self.prior = BoxUniform(
             low=torch.zeros(solver.prior.ndim),
             high=torch.ones(solver.prior.ndim),
@@ -154,11 +205,6 @@ class SIXSASampler(Sampler):
             metrics_path=os.path.join(round_path, "embedding_training.pdf"),
         )
 
-        embedded_spectra = embedding.transform(noisy_spectra)
-        if isinstance(embedded_spectra, torch.Tensor):
-            embedded_spectra = embedded_spectra.detach().cpu().numpy()
-        embedded_spectra = np.atleast_2d(np.asarray(embedded_spectra, dtype=np.float32))
-
         embedded_observation = embedding.transform(self.solver.observed_spectrum)
         if isinstance(embedded_observation, torch.Tensor):
             embedded_observation = embedded_observation.detach().cpu().numpy()
@@ -170,7 +216,8 @@ class SIXSASampler(Sampler):
             delayed(training_job)(
                 i,
                 parameters_unit_cube_np,
-                embedded_spectra,
+                spectra,
+                embedding=None,
                 round_number=round_number,
                 output_dir=self.solver.outputfiles_basename,
                 proposal=proposal,
@@ -185,7 +232,7 @@ class SIXSASampler(Sampler):
 
         embedded_observation = np.atleast_1d(embedded_observation.astype(np.float32))
 
-        ensemble.set_default_x(torch.from_numpy(embedded_observation))
+        ensemble.set_default_x(torch.from_numpy(self.solver.observed_spectrum))
         return ensemble
 
     def run(

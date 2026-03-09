@@ -16,6 +16,33 @@ def cstat_loss(y_true, y_pred, eps=1e-6):
     return cstat.mean()
 
 
+def _pairwise_squared_distances(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    x_norm = torch.sum(x * x, dim=1, keepdim=True)
+    y_norm = torch.sum(y * y, dim=1).unsqueeze(0)
+    return (x_norm + y_norm - 2.0 * (x @ y.T)).clamp_min(0.0)
+
+
+def mmd_loss(
+    z_sampled: torch.Tensor,
+    z_prior: torch.Tensor,
+    bandwidths: tuple[float, ...] = (0.1, 0.2, 0.5, 1.0, 2.0),
+) -> torch.Tensor:
+    dist_xx = _pairwise_squared_distances(z_sampled, z_sampled)
+    dist_yy = _pairwise_squared_distances(z_prior, z_prior)
+    dist_xy = _pairwise_squared_distances(z_sampled, z_prior)
+
+    xx = 0.0
+    yy = 0.0
+    xy = 0.0
+    for bandwidth in bandwidths:
+        gamma = 1.0 / (2.0 * bandwidth * bandwidth)
+        xx = xx + torch.exp(-gamma * dist_xx)
+        yy = yy + torch.exp(-gamma * dist_yy)
+        xy = xy + torch.exp(-gamma * dist_xy)
+
+    return (xx.mean() + yy.mean() - 2.0 * xy.mean()).clamp_min(0.0)
+
+
 class LogTransform(nn.Module):
     def __init__(self):
         super().__init__()
@@ -46,6 +73,53 @@ class StandardScaler(nn.Module):
 
     def inverse(self, x: torch.Tensor):
         return (x * (self.scale_ + self.eps)) + self.mean_
+
+
+class MMDVAEEncoderPipeline(nn.Module):
+    """Full MMD-VAE encoder pipeline, suitable as an external embedding net."""
+
+    def __init__(
+        self,
+        transform: nn.Module,
+        scaler: nn.Module,
+        backbone: nn.Module,
+        mean_head: nn.Module,
+        log_var_head: nn.Module,
+        *,
+        log_var_min: float = -30.0,
+        log_var_max: float = 20.0,
+    ):
+        super().__init__()
+        self.transform = transform
+        self.scaler = scaler
+        self.backbone = backbone
+        self.mean_head = mean_head
+        self.log_var_head = log_var_head
+        self.log_var_min = float(log_var_min)
+        self.log_var_max = float(log_var_max)
+
+    @staticmethod
+    def reparameterize(mean, log_var):
+        std = torch.exp(0.5 * log_var)
+        return mean + std * torch.randn_like(std)
+
+    def encode_stats(self, x):
+        x = self.transform.forward(x)
+        x = self.scaler.forward(x)
+        x = self.backbone(x)
+        mean = self.mean_head(x)
+        log_var = self.log_var_head(x).clamp(
+            min=self.log_var_min, max=self.log_var_max
+        )
+        return mean, log_var
+
+    def sample(self, x):
+        mean, log_var = self.encode_stats(x)
+        return self.reparameterize(mean, log_var)
+
+    def forward(self, x):
+        mean, _ = self.encode_stats(x)
+        return mean
 
 
 class MlpMapper(nn.Module):
@@ -194,6 +268,132 @@ class Autoencoder(nn.Module):
         return loss, {
             "loss": loss,
             "reconstruction": loss,
+        }
+
+
+class MMDVariationalAutoencoder(nn.Module):
+    def __init__(
+        self,
+        n_bins,
+        latent_dim=32,
+        hidden_dims: list[int] | None = None,
+        mmd_weight: float = 10.0,
+    ):
+        super(MMDVariationalAutoencoder, self).__init__()
+
+        transform = LogTransform()
+        scaler = StandardScaler()
+
+        if hidden_dims is None:
+            raise ValueError("hidden_dims cannot be None")
+
+        self.hidden_dims = list(hidden_dims)
+        self.mmd_weight = float(mmd_weight)
+
+        encoder_layers: list[nn.Module] = []
+        prev_dim = n_bins
+        for hidden_dim in self.hidden_dims:
+            encoder_layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.GELU(),
+                ]
+            )
+            prev_dim = hidden_dim
+        encoder_backbone = nn.Sequential(*encoder_layers)
+        encoder_mean = nn.Linear(prev_dim, latent_dim)
+        encoder_log_var = nn.Linear(prev_dim, latent_dim)
+        self.encoder_module = MMDVAEEncoderPipeline(
+            transform=transform,
+            scaler=scaler,
+            backbone=encoder_backbone,
+            mean_head=encoder_mean,
+            log_var_head=encoder_log_var,
+        )
+
+        decoder_layers: list[nn.Module] = []
+        prev_dim = latent_dim
+        for hidden_dim in reversed(self.hidden_dims):
+            decoder_layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.GELU(),
+                ]
+            )
+            prev_dim = hidden_dim
+        decoder_layers.append(nn.Linear(prev_dim, n_bins))
+        self.decoder_module = nn.Sequential(*decoder_layers)
+
+        self.latent_dim = latent_dim
+        self.input_dim = n_bins
+
+    @property
+    def transform(self):
+        return self.encoder_module.transform
+
+    @property
+    def scaler(self):
+        return self.encoder_module.scaler
+
+    @property
+    def embedding_network(self) -> nn.Module:
+        """External embedding module, ready to pass where an `nn.Module` is expected."""
+        return self.encoder_module
+
+    @property
+    def encoder_backbone(self):
+        return self.encoder_module.backbone
+
+    @property
+    def encoder_mean(self):
+        return self.encoder_module.mean_head
+
+    @property
+    def encoder_log_var(self):
+        return self.encoder_module.log_var_head
+
+    def _encode_inputs(self, x):
+        return self.encoder_module.encode_stats(x)
+
+    @staticmethod
+    def _reparameterize(mean, log_var):
+        return MMDVAEEncoderPipeline.reparameterize(mean, log_var)
+
+    def encoder(self, x):
+        mean, _ = self._encode_inputs(x)
+        return mean
+
+    def decoder(self, x):
+        x = self.decoder_module(x)
+        x = self.scaler.inverse(x)
+        x = self.transform.inverse(x)
+        return x
+
+    def forward(self, x):
+        mean, log_var = self._encode_inputs(x)
+        z = self._reparameterize(mean, log_var)
+        return self.decoder(z)
+
+    def _forward_with_latent(self, x):
+        mean, log_var = self._encode_inputs(x)
+        z = self._reparameterize(mean, log_var)
+        pred = self.decoder(z)
+        return pred, z, mean, log_var
+
+    def loss(self, batch: torch.Tensor):
+        spectrum, = batch
+        pred, z, _, _ = self._forward_with_latent(spectrum)
+
+        reconstruction = cstat_loss(spectrum, pred)
+        mmd = mmd_loss(z, torch.randn_like(z))
+        loss = reconstruction + self.mmd_weight * mmd
+
+        return loss, {
+            "loss": loss,
+            "reconstruction": reconstruction,
+            "mmd": mmd,
         }
 
 

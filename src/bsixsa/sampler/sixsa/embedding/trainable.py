@@ -5,7 +5,7 @@ from torch.utils.data import TensorDataset
 import numpy as np
 import torch
 import xspec
-from .nn import Autoencoder, ResnetAutoencoder
+from .nn import Autoencoder, MMDVariationalAutoencoder, ResnetAutoencoder
 from .nn.training import training_loop
 
 
@@ -171,3 +171,45 @@ class ResnetEmbedding(TorchModuleEmbedding):
         kwargs.setdefault("max_epochs", 1_000)
         kwargs.setdefault("prefix", "Autoencoder | ")
         return super().fit(data, **kwargs)
+
+
+class MMDVariationalAutoencoderEmbedding(TorchModuleEmbedding):
+    def __init__(
+        self,
+        latent_dim=32,
+        hidden=(2, 4),
+        mmd_weight: float = 10.0,
+        **kwargs,
+    ):
+        self.latent_dim = latent_dim
+        model_kwargs = dict(
+            hidden_dims=[self.input_dim // h for h in hidden],
+            mmd_weight=mmd_weight,
+        )
+        super().__init__(**(model_kwargs | kwargs))
+
+    @property
+    def embedding_dim(self):
+        return self.latent_dim
+
+    def build_model(self, **kwargs):
+        return MMDVariationalAutoencoder(self.input_dim, self.latent_dim, **kwargs)
+
+    def fit(self, data, **kwargs):
+        kwargs.setdefault("max_epochs", 1_000)
+        kwargs.setdefault("prefix", "MMD-VAE | ")
+        return super().fit(data, **kwargs)
+
+    def transform(self, spectra):
+        if self.auto_fit_on_transform and not self.is_fitted:
+            self.fit(spectra)
+
+        if not self.is_fitted:
+            raise RuntimeError(
+                "Embedding is not fitted. Call `fit` before `transform`."
+            )
+
+        spectra_tensor = _as_tensor_2d(spectra).to(self.device)
+        with torch.no_grad():
+            embedded = self.model.encoder_module.sample(spectra_tensor)
+        return embedded.detach().cpu().numpy()
