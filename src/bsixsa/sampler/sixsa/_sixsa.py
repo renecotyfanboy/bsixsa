@@ -11,7 +11,6 @@ from joblib import Parallel, delayed
 from sbi.inference import EnsemblePosterior, NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform, RestrictedPrior, get_density_thresholder
-from sbi.neural_nets.embedding_nets import LRUEmbedding, FCEmbedding
 
 from ..abc import Sampler
 from .embedding import IdentityEmbedding
@@ -21,12 +20,12 @@ if TYPE_CHECKING:
     from ...solver import SIXSASolver
 
 
-class FCEmbeddingDB(torch.nn.Module):
+class FCEmbedding(torch.nn.Module):
     def __init__(
             self,
             input_dim: int,
-            output_dim: int = 20,
-            num_hiddens=[50]
+            output_dim: int = 32,
+            num_hiddens=[256]
             #dropout_rate: float = 0.01,
     ):
         """Fully-connected multi-layer neural network to be used as embedding network.
@@ -110,7 +109,7 @@ def training_job(
     x = torch.as_tensor(np.random.poisson(x).astype(np.float32))
 
     if (round_number == 1) or training_kwargs.get("retrain_from_scratch", False):
-        embedding_net = FCEmbeddingDB(x.shape[1], 16)
+        embedding_net = FCEmbedding(x.shape[1], 16)
         prior_sbi = BoxUniform(torch.zeros(theta.shape[-1]), torch.ones(theta.shape[-1]))
         build_fun = posterior_nn(model="maf", embedding_net=embedding_net, prior=prior_sbi)
         inference = NPE(prior=prior_sbi, density_estimator=build_fun, device="cpu")

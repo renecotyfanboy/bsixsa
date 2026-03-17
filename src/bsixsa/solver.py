@@ -133,7 +133,7 @@ class SIXSASolver(object):
         theta = sampler.sample((n_samples,))  # In the unit cube space
         return theta
 
-    def simulate(self, parameters, return_kind="full_model_counts"):
+    def simulate(self, parameters, return_kind="full_model_counts", progress_bar=True):
         """Fold parameters through XSPEC and stack simulation outputs.
 
         Parameters:
@@ -151,7 +151,8 @@ class SIXSASolver(object):
             self.indexes,
             self.model_indexes,
             pool=self.pool,
-            return_kind=return_kind
+            return_kind=return_kind,
+            progress_bar=progress_bar
         )
 
     def log_prob_fn(self, theta, x_o, from_unit_cube=False):
@@ -308,6 +309,19 @@ class SIXSASolver(object):
             self.sampler = SIXSASampler(solver=self)
 
             return self.sampler.run(*args, **kwargs)
+
+        elif self.sampler_kind == "levenberg_marquardt":
+            from .sampler.levenberg_marquart import LevenbergMarquardtSampler
+            self.sampler = LevenbergMarquardtSampler(solver=self)
+            self.sampler.run(*args, **kwargs)
+            self.samplers["posterior"] = self.sampler
+
+            n_samples = kwargs.get("n_posterior_samples", 10_000)
+            self.posterior_samples = self.build_dataframe(
+                sampler="posterior", num_samples=n_samples
+            )
+
+            return self.sampler.result
 
         else:
             raise NotImplementedError()
