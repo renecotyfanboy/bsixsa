@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "arviz<1.0.0",
+    "astropy>=7.2.0",
     "catppuccin>=2.4.1",
     "chainconsumer>=1.1.3",
     "cmasher>=1.9.2",
@@ -20,7 +22,6 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
-    "ultranest>=4.4.0",
 ]
 
 [[tool.uv.index]]
