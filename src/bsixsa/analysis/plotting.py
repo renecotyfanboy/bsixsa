@@ -180,7 +180,7 @@ def plot_median_and_bands(
     return median, envelope
 
 
-def plot_ppc(
+def plot_predictive_coverage(
     solver,
     distribution="posterior",
     x_lim=None,

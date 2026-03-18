@@ -345,10 +345,10 @@ class SIXSASolver(object):
 
         return idata
 
-    def plot_ppc(self, distribution="posterior", **kwargs):
-        from .analysis.plotting import plot_ppc
+    def plot_predictive_coverage(self, distribution="posterior", **kwargs):
+        from .analysis.plotting import plot_predictive_coverage
 
-        return plot_ppc(self, distribution=distribution, **kwargs)
+        return plot_predictive_coverage(self, distribution=distribution, **kwargs)
 
     def run(self, *args, **kwargs) -> FitResults:
         from .backend import get_backend_class

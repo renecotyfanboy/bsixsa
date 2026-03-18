@@ -87,7 +87,7 @@ solver = SIXSASolver(
 ```
 
 ``` python title="Prior predictive check"
-solver.plot_ppc("prior");
+solver.plot_predictive_coverage("prior");
 ```
 
 ``` python title="Run the solver"
@@ -95,5 +95,5 @@ sampler = solver.run(n_live_points=2_000)
 ```
 
 ``` python title="Posterior predictive check"
-solver.plot_ppc("posterior");
+solver.plot_predictive_coverage("posterior");
 ```
