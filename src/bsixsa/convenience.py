@@ -12,17 +12,14 @@ from time import perf_counter
 
 @contextmanager
 def catchtime(desc="Task", print_time=True) -> Callable[[], float]:
-    """
-    Context manager to measure time taken by a task.
+    """Context manager to measure time taken by a task.
 
-    Parameters
-    ----------
-        desc (str): Description of the task.
-        print_time (bool): Whether to print the time taken by the task.
+    Args:
+        desc: Description of the task.
+        print_time: Whether to print the time taken by the task.
 
     Returns:
-    -------
-        Callable[[], float]: Function to get the time taken by the task.
+        Callable that returns the time taken by the task in seconds.
     """
 
     t1 = t2 = perf_counter()
@@ -45,9 +42,8 @@ class XspecParameter:
 def iter_components(model: Model, additive_only: bool = False) -> Iterator[Component]:
     """Iterate over components of a given xspec model.
 
-    Parameters
-    ----------
-        additive_only (bool): If ``True``, yield only additive components as
+    Args:
+        additive_only: If ``True``, yield only additive components as
             identified by the presence of a ``norm`` parameter.
     """
 

@@ -6,6 +6,7 @@ from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
 from xspec import Plot, AllData, AllModels
 from ..xspec import SpectrumState
+from ..backend.abc import Backend
 
 PALETTE = catppuccin.PALETTE.latte
 
@@ -181,7 +182,7 @@ def plot_median_and_bands(
 
 def plot_ppc(
     solver,
-    sampler,
+    distribution="posterior",
     x_lim=None,
     y_lim=None,
     figsize=(12, 6),
@@ -194,8 +195,10 @@ def plot_ppc(
     r"""Plot posterior predictive spectra with residuals.
 
     Parameters:
-        solver: Solver instance exposing ``samplers`` and ``simulate``.
-        sampler (str): Name of the sampler stored in ``solver.samplers``.
+        solver: Solver instance exposing ``distributions`` and ``simulate``.
+        distribution (str, optional): Name of the distribution to sample from,
+            looked up in ``solver.distributions``. Common values are
+            ``"prior"`` and ``"posterior"``. Defaults to ``"posterior"``.
         x_lim (tuple[float, float], optional): Energy bounds in keV for the
             upper panel x-axis.
         y_lim (tuple[float, float], optional): Flux limits for the upper panel
@@ -226,7 +229,15 @@ def plot_ppc(
 
     Plot.xAxis = "keV"
     state = SpectrumState(1)
-    parameters = solver.samplers[sampler].sample((n_samples,))
+
+    dist = solver.distributions[distribution]
+    if isinstance(dist, Backend):
+        parameters = dist.sample(n_samples)
+    else:
+        parameters = dist.sample((n_samples,))
+    if hasattr(parameters, "numpy"):
+        parameters = parameters.numpy()
+
     data = solver.simulate(parameters, return_kind="models_and_components")
 
     bin_edges = state.bin_edges

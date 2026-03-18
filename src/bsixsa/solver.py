@@ -24,11 +24,40 @@ class FitResults:
     log_Z_err: float
 
 
+def _validate_finite(parameters, parameter_names):
+    """Raise ``ValueError`` if *parameters* contains NaN or Inf values."""
+    bad_mask = ~np.isfinite(parameters)
+    if bad_mask.any():
+        bad_params = set()
+        for col_idx in np.where(bad_mask.any(axis=0))[0]:
+            name = parameter_names[col_idx] if col_idx < len(parameter_names) else f"index {col_idx}"
+            bad_rows = np.where(bad_mask[:, col_idx])[0]
+            bad_params.add(f"{name} (samples {bad_rows.tolist()})")
+        raise ValueError(
+            f"Non-finite parameter values detected before simulation: "
+            f"{', '.join(sorted(bad_params))}"
+        )
+
+
+def _split_kwargs(cls, kwargs):
+    """Separate constructor kwargs from run kwargs by inspecting __init__."""
+    import inspect
+    init_params = inspect.signature(cls.__init__).parameters
+    init_kwargs = {}
+    run_kwargs = {}
+    for key, value in kwargs.items():
+        if key in init_params:
+            init_kwargs[key] = value
+        else:
+            run_kwargs[key] = value
+    return init_kwargs, run_kwargs
+
+
 def set_parameters(values, indexes, model_indexes):
     """Update the active XSPEC parameters using transformed values.
 
-    Parameters:
-        values (Sequence[float]): Parameter values in the physical space
+    Args:
+        values: Parameter values in the physical space.
     """
     parameter_to_set = {}  # Will contain {model : {par_index:prior}}
     for value, index, model_name in zip(values, indexes, model_indexes):
@@ -50,7 +79,7 @@ class SIXSASolver(object):
         outputfiles_basename="./sixsa",
         overwrite=False,
         n_jobs=os.cpu_count(),
-        sampler="nessai"
+        backend="nessai"
     ):
 
         prior, indexes, model_indexes, bounds = build_prior(prior, return_bounds=True)
@@ -60,12 +89,13 @@ class SIXSASolver(object):
         sources_models = AllModels.sources
         self.nb_models = len(sources_models)
         self.prior = prior
-        self.samplers = {"prior": prior}
+        self.distributions = {"prior": prior}
         self.bounds = bounds
         self.pool = multiprocessing.Pool(processes=n_jobs)
         self.posterior_samples = None
-        self.sampler_kind:str = sampler
-        self.sampler = None
+        self.backend_name: str = backend
+        self.backend = None
+        self.fit_result: FitResults | None = None
 
         normalized_output_dir = os.path.normpath(outputfiles_basename)
 
@@ -115,36 +145,40 @@ class SIXSASolver(object):
     def sample_parameters(
         self,
         n_samples: int,
-        sampler_name: str = "prior",
+        distribution_name: str = "prior",
     ):
-        r"""Draw parameter samples from one of the registered samplers.
+        r"""Draw parameter samples from one of the registered distributions.
 
-        Parameters:
-            n_samples (int): Number of draws to generate.
-            sampler_name (str, optional): Key of the sampler in
-                ``self.samplers``. Defaults to ``"prior"``.
+        Args:
+            n_samples: Number of draws to generate.
+            distribution_name: Key of the distribution in
+                ``self.distributions``. Defaults to ``"prior"``.
 
         Returns:
-            torch.Tensor | numpy.ndarray: Raw samples returned by the selected
-                sampler.
+            Raw samples returned by the selected distribution.
         """
 
-        sampler = self.samplers[sampler_name]
-        theta = sampler.sample((n_samples,))  # In the unit cube space
+        distribution = self.distributions[distribution_name]
+        theta = distribution.sample((n_samples,))  # In the unit cube space
         return theta
 
     def simulate(self, parameters, return_kind="full_model_counts", progress_bar=True):
         """Fold parameters through XSPEC and stack simulation outputs.
 
-        Parameters:
+        Args:
             parameters: Array-like batch of parameter vectors.
-            return_kind (str, optional): One of ``"cstat"``,
-                ``"full_model_counts"``, or ``"models_and_components"``.
+            return_kind: One of ``"cstat"``, ``"full_model_counts"``, or
+                ``"models_and_components"``.
 
         Returns:
-            dict[str, numpy.ndarray | dict[str, numpy.ndarray]]: Stacked
-                outputs returned by :func:`bsixsa.xspec.parallel_folding`.
+            Stacked outputs returned by ``parallel_folding``.
+
+        Raises:
+            ValueError: If any parameter values are NaN or Inf.
         """
+
+        parameters = np.asarray(parameters)
+        _validate_finite(parameters, self.parameter_names)
 
         return parallel_folding(
             parameters,
@@ -163,10 +197,9 @@ class SIXSASolver(object):
             `x_o` is a dummy parameter used for compatibility with `sbi` as the true spectrum is directly extracted from
             `xspec`. `sbi` require this parameter as in normal workflow, this function can be conditioned on any `x_o`.
 
-        Parameters:
-            theta (torch.Tensor): Array of samples on the unit cube
-            x_o (torch.Tensor): Observed value, pass `None` if needed
-
+        Args:
+            theta: Array of samples on the unit cube.
+            x_o: Observed value, pass ``None`` if needed.
         """
 
         if not from_unit_cube:
@@ -199,7 +232,7 @@ class SIXSASolver(object):
 
     def log_prior_fn(self, theta, x_o):
 
-        return self.samplers["prior"].log_prob(theta)
+        return self.distributions["prior"].log_prob(theta)
 
 
     @property
@@ -207,35 +240,44 @@ class SIXSASolver(object):
         """Return unique parameter names aligned with XSPEC ordering.
 
         Returns:
-            (list[str]): Parameter names augmented with component identifiers to
-                avoid duplicates.
+            Parameter names augmented with component identifiers to avoid
+            duplicates.
         """
 
         from .convenience import iter_thawn_parameters
         return [parameter.name for parameter in iter_thawn_parameters()]
 
 
+    def _sample_from(self, distribution: str, n: int) -> np.ndarray:
+        """Draw samples from a named distribution or backend."""
+        from .backend.abc import Backend
+
+        dist = self.distributions[distribution]
+        if isinstance(dist, Backend):
+            return dist.sample(n)
+        else:
+            samples = dist.sample((n,))
+            if hasattr(samples, "numpy"):
+                samples = samples.numpy()
+            return np.asarray(samples)
+
     def build_dataframe(
         self,
-        sampler: str = "exact_sampler",
+        distribution: str = "posterior",
         num_samples=10_000,
     ) -> pd.DataFrame:
-        """Build a posterior sample table from the fitted neural network.
+        """Build a posterior sample table from a named distribution.
 
-        Parameters:
-            num_samples (int, optional): Number of samples to draw from the
-                posterior sampler. Defaults to 10_000.
+        Args:
+            distribution: Key in ``self.distributions`` to sample from.
+                Defaults to ``"posterior"``.
+            num_samples: Number of samples to draw. Defaults to 10_000.
 
         Returns:
-            pandas.DataFrame: Table with parameter samples and corresponding
-                importance weights.
+            Table with parameter samples.
         """
 
-        sampler_kwargs = {}
-
-        samples = self.samplers[sampler].sample(
-            (num_samples,), **sampler_kwargs
-        )
+        samples = self._sample_from(distribution, num_samples)
 
         dict_of_params = {
             name: parameters for name, parameters in zip(self.parameter_names, samples.T)
@@ -243,92 +285,81 @@ class SIXSASolver(object):
 
         return pd.DataFrame.from_dict(dict_of_params)
 
+    def build_inference_data(
+        self,
+        distribution: str = "posterior",
+        num_samples: int = 10_000,
+        include_prior: bool = True,
+        include_observed: bool = True,
+    ) -> az.InferenceData:
+        """Build an ArviZ InferenceData object from the fitted model.
 
-    def get_xspec_best_fit(self):
-        """Run an XSPEC fit and return best-fit parameters with covariance.
+        Mirrors ``build_dataframe`` but returns a richer container that
+        is understood by the ArviZ ecosystem (diagnostics, plotting, I/O).
+
+        Args:
+            distribution: Key in ``self.distributions`` to sample posterior
+                draws from. Defaults to ``"posterior"``.
+            num_samples: Number of posterior draws. Defaults to 10_000.
+            include_prior: If ``True``, draw prior samples and attach them as
+                the *prior* group. Defaults to ``True``.
+            include_observed: If ``True``, attach the observed spectrum as the
+                *observed_data* group. Requires an active XSPEC session.
+                Defaults to ``True``.
 
         Returns:
-            (tuple[numpy.ndarray, numpy.ndarray]): Flattened parameter vector and
-                covariance matrix estimated by XSPEC.
+            Inference data with *posterior* (and optionally *prior*,
+            *observed_data*) groups.
         """
 
-        with XSilence():
-            xspec.Fit.perform()
+        samples = self._sample_from(distribution, num_samples)
 
-        def build_covariance_matrix_np(covar_elements):
-            covar_elements = np.asarray(covar_elements, dtype=float)
+        posterior_dict = {
+            name: samples[:, i][np.newaxis, :]
+            for i, name in enumerate(self.parameter_names)
+        }
 
-            M = len(covar_elements)
-            N = int((np.sqrt(1 + 8 * M) - 1) // 2)
+        kwargs: dict = {"posterior": posterior_dict}
 
-            cov_matrix = np.zeros((N, N), dtype=float)
-            i, j = np.tril_indices(N)
-            cov_matrix[i, j] = covar_elements
-            cov_matrix[j, i] = covar_elements
+        if include_prior:
+            prior_samples = self.distributions["prior"].sample((num_samples,))
+            if hasattr(prior_samples, "numpy"):
+                prior_samples = prior_samples.numpy()
+            prior_samples = np.asarray(prior_samples)
 
-            return cov_matrix
+            prior_dict = {
+                name: prior_samples[:, i][np.newaxis, :]
+                for i, name in enumerate(self.parameter_names)
+            }
+            kwargs["prior"] = prior_dict
 
-        sources_models = xspec.AllModels.sources
-        best_fit_parameters = []
-        for source, model_name in zip(sources_models.keys(), sources_models.values()):
+        if include_observed:
+            obs = self.observed_spectrum
+            kwargs["observed_data"] = {"spectrum": obs}
 
-            xspec_model = xspec.AllModels(1,model_name)
+        idata = az.from_dict(**kwargs)
 
+        if self.fit_result is not None:
+            idata.attrs["log_Z"] = self.fit_result.log_Z
+            idata.attrs["log_Z_err"] = self.fit_result.log_Z_err
 
-            best_fit_parameters.extend(
-                [xspec_model(i + 1).values[0] for i in range(xspec_model.nParameters)]
-            )
-        covariance = build_covariance_matrix_np(xspec.Fit.covariance)
-        best_fit_parameters = np.asarray(best_fit_parameters)
-        return best_fit_parameters.ravel(), covariance
+        return idata
 
-
-    def plot_ppc(self, sampler, **kwargs):
+    def plot_ppc(self, distribution="posterior", **kwargs):
         from .analysis.plotting import plot_ppc
 
-        return plot_ppc(self, sampler, **kwargs)
+        return plot_ppc(self, distribution=distribution, **kwargs)
 
-    def run(self, *args, **kwargs):
+    def run(self, *args, **kwargs) -> FitResults:
+        from .backend import get_backend_class
 
+        backend_cls = get_backend_class(self.backend_name)
+        init_kwargs, run_kwargs = _split_kwargs(backend_cls, kwargs)
 
-        # TODO : check for a way to distinguish sampler & samplers
-        if self.sampler_kind == "nessai":
-            from .sampler.nessai import NessaiSampler
-            self.sampler = NessaiSampler(solver=self, **kwargs)
+        self.backend = backend_cls(solver=self, **init_kwargs)
 
-        elif self.sampler_kind == "nautilus":
-            from .sampler.nautilus import NautilusSampler
-            self.sampler = NautilusSampler(solver=self, **kwargs)
+        self.fit_result = self.backend.run(*args, **run_kwargs)
+        self.posterior_samples = self.fit_result.posterior_samples
+        self.distributions["posterior"] = self.backend
 
-        elif self.sampler_kind == "ultranest":
-            from .sampler.ultranest import UltranestSampler
-            self.sampler = UltranestSampler(solver=self, **kwargs)
-
-        elif self.sampler_kind == "sixsa":
-            from .sampler.sixsa import SIXSASampler
-            self.sampler = SIXSASampler(solver=self)
-
-            return self.sampler.run(*args, **kwargs)
-
-        elif self.sampler_kind == "levenberg_marquardt":
-            from .sampler.levenberg_marquart import LevenbergMarquardtSampler
-            self.sampler = LevenbergMarquardtSampler(solver=self)
-            self.sampler.run(*args, **kwargs)
-            self.samplers["posterior"] = self.sampler
-
-            n_samples = kwargs.get("n_posterior_samples", 10_000)
-            self.posterior_samples = self.build_dataframe(
-                sampler="posterior", num_samples=n_samples
-            )
-
-            return self.sampler.result
-
-        else:
-            raise NotImplementedError()
-
-        if not self.sampler_kind == "sixsa":
-
-            self.posterior_samples = self.sampler.run()
-            self.samplers["posterior"] = self.sampler
-
-            return self.sampler.sampler
+        return self.fit_result

@@ -82,36 +82,18 @@ solver = SIXSASolver(
     prior,
     outputfiles_basename="result_nessai/",
     overwrite=True,
-    sampler="nessai"
+    backend="nessai"
 )
 ```
 
 ``` python title="Prior predictive check"
-solver.plot_ppc("prior", component_names=["All"]);
+solver.plot_ppc("prior");
 ```
 
 ``` python title="Run the solver"
-sampler = solver.run(
-    n_live_points=2_000,
-    reparameterisations={
-    "log-standardise" : [
-        "vnei_2_norm",
-        "vnei_3_norm",
-        "vnei_2_Tau",
-        "vnei_3_Tau",
-        "vnei_2_Mg",
-        "vnei_2_Si",
-        "vnei_2_S",
-        "vnei_2_Ar",
-        "vnei_2_Ca",
-        "vnei_3_Fe",
-        ]
-    }
+sampler = solver.run(n_live_points=2_000)
 ```
 
 ``` python title="Posterior predictive check"
-solver.plot_ppc(
-    "posterior", 
-    component_names=["Total", "nei_1", "nei_2"],
-);
+solver.plot_ppc("posterior");
 ```

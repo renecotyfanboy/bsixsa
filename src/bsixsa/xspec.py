@@ -221,24 +221,22 @@ def parallel_folding(
 ):
     """Evaluate folded XSPEC outputs for a batch of parameter vectors.
 
-    Parameters:
+    Args:
         params: Parameter vectors to evaluate.
         indexes: XSPEC parameter indices associated with ``params``.
         model_indexes: XSPEC model names associated with ``indexes``.
-        desc (str, optional): Prefix for the progress-bar label.
-        progress_bar (bool, optional): Whether to display a tqdm progress bar.
-        pool (pathos.multiprocessing.Pool | None, optional): Optional process
-            pool for parallel evaluation.
-        return_kind (str, optional): One of ``"cstat"``,
-            ``"full_model_counts"``, or ``"models_and_components"``.
+        desc: Prefix for the progress-bar label.
+        progress_bar: Whether to display a tqdm progress bar.
+        pool: Optional process pool for parallel evaluation.
+        return_kind: One of ``"cstat"``, ``"full_model_counts"``, or
+            ``"models_and_components"``.
 
     Returns:
-        dict[str, numpy.ndarray | dict[str, numpy.ndarray]]: Stacked outputs
-            across all rows in ``params``. The ``"cstat"`` key is always
-            present. ``"total_model_counts"`` is included for
-            ``"full_model_counts"`` and ``"models_and_components"``.
-            ``"model_counts"`` and ``"component_counts"`` are included only for
-            ``"models_and_components"``.
+        Stacked outputs across all rows in ``params``. The ``"cstat"`` key is
+        always present. ``"total_model_counts"`` is included for
+        ``"full_model_counts"`` and ``"models_and_components"``.
+        ``"model_counts"`` and ``"component_counts"`` are included only for
+        ``"models_and_components"``.
     """
 
     with tempfile.TemporaryDirectory(prefix="parallel_folding_") as tmp_dir:

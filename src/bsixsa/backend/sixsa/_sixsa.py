@@ -6,18 +6,20 @@ from typing import TYPE_CHECKING, Optional
 
 import dill
 import numpy as np
+import pandas as pd
 import torch
 from joblib import Parallel, delayed
 from sbi.inference import EnsemblePosterior, NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform, RestrictedPrior, get_density_thresholder
 
-from ..abc import Sampler
+from ..abc import Backend
+from .. import register_backend
 from .embedding import IdentityEmbedding
 from .embedding.abc import Embedding
 
 if TYPE_CHECKING:
-    from ...solver import SIXSASolver
+    from ...solver import FitResults, SIXSASolver
 
 
 class FCEmbedding(torch.nn.Module):
@@ -162,7 +164,11 @@ def training_job(
     return posterior
 
 
-class SIXSASampler(Sampler):
+@register_backend
+class SIXSABackend(Backend):
+
+    name = "sixsa"
+
     def __init__(self, *, solver: "SIXSASolver", **kwargs):
         super().__init__(solver=solver)
         self.proposals = []
@@ -172,9 +178,9 @@ class SIXSASampler(Sampler):
             high=torch.ones(solver.prior.ndim),
         )
 
-    def sample(self, shape):
+    def sample(self, n: int) -> np.ndarray:
         current_sampler = self.proposals[-1] if self.proposals else self.prior
-        return current_sampler.sample(shape)
+        return current_sampler.sample((n,))
 
     def inference_round(
         self,
@@ -236,13 +242,23 @@ class SIXSASampler(Sampler):
 
     def run(
         self,
-        num_simulations_per_round: list[int],
+        num_simulations_per_round: list[int] = None,
         *,
         embedding: Optional[Embedding | list[Embedding]] = None,
         training_kwargs=None,
         plot_embedding_coverage=True,
         device="cpu",
-    ):
+        **kwargs,
+    ) -> 'FitResults':
+        from ...solver import FitResults
+        from ...convenience import catchtime
+
+        if num_simulations_per_round is None:
+            raise TypeError(
+                "SIXSABackend.run() requires `num_simulations_per_round` as "
+                "the first positional argument."
+            )
+
         # kept for API compatibility for now
         _ = plot_embedding_coverage
 
@@ -280,36 +296,55 @@ class SIXSASampler(Sampler):
         else:
             raise TypeError("`embedding` must be an Embedding, list[Embedding], or None.")
 
-        proposal = None
-        self.proposals = []
+        with catchtime("Running SBI inference", print_time=False) as run_time:
+            proposal = None
+            self.proposals = []
 
-        # Multiple round inference loop
-        for round_number, (num_simulations, current_embedding, current_training_kwargs) in enumerate(
-            zip(num_simulations_per_round, embedding_list, training_kwargs_list),
-            start=1,
-        ):
-            proposal = self.inference_round(
-                num_simulations,
-                embedding=current_embedding,
-                proposal=proposal,
-                round_number=round_number,
-                training_kwargs=current_training_kwargs,
-            )
-            self.proposals.append(proposal)
-
-            # We train a restricted proposal if not in the last round
-            if round_number < num_rounds:
-                accept_reject_fn = get_density_thresholder(
-                    proposal,
-                    num_samples_to_estimate_support=100_000,
-                    quantile=1e-4,
+            # Multiple round inference loop
+            for round_number, (num_simulations, current_embedding, current_training_kwargs) in enumerate(
+                zip(num_simulations_per_round, embedding_list, training_kwargs_list),
+                start=1,
+            ):
+                proposal = self.inference_round(
+                    num_simulations,
+                    embedding=current_embedding,
+                    proposal=proposal,
+                    round_number=round_number,
+                    training_kwargs=current_training_kwargs,
                 )
-                proposal = RestrictedPrior(
-                    self.prior,
-                    accept_reject_fn,
-                    posterior=proposal,
-                    sample_with="sir",
-                    device=device,
-                )
+                self.proposals.append(proposal)
 
-        return proposal
+                # We train a restricted proposal if not in the last round
+                if round_number < num_rounds:
+                    accept_reject_fn = get_density_thresholder(
+                        proposal,
+                        num_samples_to_estimate_support=100_000,
+                        quantile=1e-4,
+                    )
+                    proposal = RestrictedPrior(
+                        self.prior,
+                        accept_reject_fn,
+                        posterior=proposal,
+                        sample_with="sir",
+                        device=device,
+                    )
+
+        # Build posterior samples from the final proposal
+        n_posterior = 10_000
+        posterior_unit = self.sample(n_posterior)
+        if hasattr(posterior_unit, "numpy"):
+            posterior_unit = posterior_unit.numpy()
+        posterior_physical = self.solver.prior.from_unit_cube(np.asarray(posterior_unit))
+
+        posterior_dict = {
+            name: posterior_physical[:, i]
+            for i, name in enumerate(self.solver.parameter_names)
+        }
+
+        return FitResults(
+            time=float(run_time()),
+            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            n_likelihood_evaluations=0,
+            log_Z=float("nan"),
+            log_Z_err=float("nan"),
+        )
