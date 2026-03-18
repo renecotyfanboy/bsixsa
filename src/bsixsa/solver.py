@@ -12,6 +12,7 @@ from xspec import AllModels
 from .convenience import XSilence
 from .priors import build_prior
 from .xspec import parallel_folding
+import arviz as az
 import pathos.multiprocessing as multiprocessing  # pathos
 
 
