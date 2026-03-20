@@ -9,7 +9,6 @@ import pandas as pd
 import xspec
 from xspec import AllModels
 
-from .convenience import XSilence
 from .priors import build_prior
 from .xspec import parallel_folding
 import arviz as az
@@ -241,8 +240,7 @@ class SIXSASolver(object):
         """Return unique parameter names aligned with XSPEC ordering.
 
         Returns:
-            Parameter names augmented with component identifiers to avoid
-            duplicates.
+            Parameter names augmented with component identifiers to avoid duplicates.
         """
 
         from .convenience import iter_thawn_parameters

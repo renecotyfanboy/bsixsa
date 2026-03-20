@@ -1,7 +1,7 @@
 from __future__ import print_function
 
 
-from xspec import Xset, Model, Component, Parameter, AllModels, AllData
+from xspec import Xset, Model, Component, Parameter, AllModels
 import re
 from dataclasses import dataclass
 from typing import Iterator

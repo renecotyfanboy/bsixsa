@@ -4,7 +4,7 @@ import numpy as np
 import catppuccin
 from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
-from xspec import Plot, AllData, AllModels
+from xspec import Plot
 from ..xspec import SpectrumState
 from ..backend.abc import Backend
 
@@ -96,7 +96,25 @@ def rebin_edges(bin_edges_1d, bin_ids):
     return bin_edges_1d[np.append(starts, len(bin_ids))]
 
 
-def sigma_to_percentile_intervals(sigmas):
+def sigma_to_percentile_intervals(sigmas:list[float]) -> list[tuple[float, float]]:
+    """
+    Calculate percentile intervals corresponding to given sigma values.
+
+    This function computes the lower and upper percentile bounds for each input
+    sigma (standard deviation) value, assuming a normal distribution. The
+    calculated intervals represent the percentage of data within ±sigma
+    standard deviations of the mean.
+
+    Parameters:
+        sigmas : list[float]
+            A list of standard deviation (sigma) values for which to calculate
+            percentile intervals.
+
+    Returns:
+        list[tuple[float, float]]
+            A list of tuples, where each tuple contains the lower and upper
+            percentile bounds corresponding to a given sigma value.
+    """
     intervals = []
     for sigma in sigmas:
         lower_bound = 100 * norm.cdf(-sigma)
@@ -105,7 +123,7 @@ def sigma_to_percentile_intervals(sigmas):
     return intervals
 
 
-def poisson_error_bars(observed_counts, sigma=1):
+def poisson_error_bars(observed_counts:np.ndarray, sigma=1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     r"""Calculate Gamma-prior credible intervals for observed counts.
 
     Parameters:
@@ -257,8 +275,34 @@ def plot_predictive_coverage(
     n_samples=100,
     min_counts=None,
     grouping=None,
+    residual_kind="pearson",
 ):
     r"""Plot posterior predictive spectra with residuals.
+
+    The lower panel displays residuals between the observed data $D$ and the
+    sampled model predictions $M_i$.  Three formulae are available, selected
+    via the *residual_kind* parameter:
+
+    * **Pearson** (``"pearson"``, default) — per-sample Poisson normalisation,
+      well defined for both prior and posterior predictive checks:
+
+    $$
+    r_i = \frac{D - M_i}{\sqrt{M_i}}
+    $$
+
+    * **Sigma** (``"sigma"``) — normalised by the 68 % ensemble spread; can be
+      misleading when the prior is broad:
+
+    $$
+    r = \frac{M - D}{P_{84} - P_{16}}
+    $$
+
+    * **Raw** (``"raw"``) — un-normalised residuals in data units
+      (counts / keV / s):
+
+    $$
+    r_i = \frac{D - M_i}{\Delta E}
+    $$
 
     Parameters:
         solver: Solver instance exposing ``distributions`` and ``simulate``.
@@ -291,6 +335,9 @@ def plot_predictive_coverage(
         grouping (int, optional): If set, every *grouping* adjacent bins are
             merged into one (the last group may contain fewer bins).  Mutually
             exclusive with *min_counts*.  Defaults to ``None``.
+        residual_kind (str, optional): Formula used for the residual panel.
+            One of ``"pearson"``, ``"sigma"``, or ``"raw"`` (see above).
+            Defaults to ``"pearson"``.
 
     Returns:
         matplotlib.figure.Figure: Figure containing spectrum and residual
@@ -416,11 +463,30 @@ def plot_predictive_coverage(
         total += background
     """
 
-    total_model = total_model / denominator
-    y_observed = observed_counts / denominator
+    total_model_flux = total_model / denominator
+    y_observed_flux = observed_counts / denominator
 
-    divider = np.percentile(total_model, 84, axis=0) - np.percentile(total_model, 16, axis=0)
-    residuals = (total_model - y_observed) / np.where(divider > 0, divider, 1.0)
+    _VALID_RESIDUALS = {"pearson", "sigma", "raw"}
+    if residual_kind not in _VALID_RESIDUALS:
+        raise ValueError(
+            f"residual_kind must be one of {_VALID_RESIDUALS!r}, "
+            f"got {residual_kind!r}"
+        )
+
+    if residual_kind == "pearson":
+        safe_model = np.where(total_model > 0, total_model, 1.0)
+        residuals = (observed_counts - total_model) / np.sqrt(safe_model)
+        residual_label = r"$\frac{D - M}{\sqrt{M}}$"
+    elif residual_kind == "sigma":
+        divider = (
+            np.percentile(total_model_flux, 84, axis=0)
+            - np.percentile(total_model_flux, 16, axis=0)
+        )
+        residuals = (total_model_flux - y_observed_flux) / np.where(divider > 0, divider, 1.0)
+        residual_label = r"$\left[ \sigma \right]$"
+    else:  # raw
+        residuals = (observed_counts - total_model) / denominator
+        residual_label = r"$\frac{\text{Counts}}{\text{keV} \text{s}}$"
 
     plot_median_and_bands(bin_edges_1d, residuals, np.ones_like(observed_counts), axs[1], color=SPECTRUM_COLOR)
 
@@ -432,19 +498,25 @@ def plot_predictive_coverage(
     if y_lim is not None:
         axs[0].set_ylim(*y_lim)
 
-    residual_lim = 3.2  # max(np.max(np.abs(residuals))*1.05, 3.2)
+    low_env, high_env = np.percentile(residuals, [2.5, 97.5], axis=0)
+    residual_extent = max(np.max(np.abs(low_env)), np.max(np.abs(high_env))) * 1.1
+    if residual_kind in ("pearson", "sigma"):
+        residual_lim = max(residual_extent, 3.2)
+    else:
+        residual_lim = residual_extent
 
     axs[1].set_ylim(-residual_lim, residual_lim)
     axs[1].axhline(0, color="black", linestyle="--", alpha=0.5)
-    axs[1].axhline(-3, color="black", linestyle="--", alpha=0.5)
-    axs[1].axhline(3, color="black", linestyle="--", alpha=0.5)
-    axs[1].set_ylabel("Residuals \n" + r"$\left[ \sigma \right]$")
+    if residual_kind in ("pearson", "sigma"):
+        axs[1].axhline(-3, color="black", linestyle="--", alpha=0.5)
+        axs[1].axhline(3, color="black", linestyle="--", alpha=0.5)
+        axs[1].set_yticks([-3, 0, 3])
+    axs[1].set_ylabel("Residuals \n" + residual_label)
     axs[1].set_xlabel("Energy [keV]")
     axs[0].set_ylabel(
         "Observed Spectrum \n"
         + r"[$\frac{\text{Counts}}{\text{keV} \text{s}}$]"
     )
-    axs[1].set_yticks([-3, 0, 3])
 
     if legend:
         axs[0].legend(legend_list, legend_names, loc="upper right")
