@@ -32,6 +32,70 @@ BACKGROUND_DATA_COLOR = load_color(PALETTE.identifier, "text")
 alpha_median = 0.7
 alpha_envelope = (0.15, 0.25)
 
+def adaptive_bin_1d(counts, min_counts):
+    """Assign adjacent bins to groups so that each group has at least
+    *min_counts* total counts.
+
+    Parameters:
+        counts (numpy.ndarray): Observed counts per original bin (1-D).
+        min_counts (int): Minimum summed counts required per grouped bin.
+
+    Returns:
+        numpy.ndarray: Integer group id for every original bin.
+    """
+    bin_ids = np.zeros(len(counts), dtype=int)
+    current_bin = 0
+    running_sum = 0
+
+    for i, c in enumerate(counts):
+        running_sum += c
+        bin_ids[i] = current_bin
+        if running_sum >= min_counts:
+            current_bin += 1
+            running_sum = 0
+
+    # Merge the last under-threshold group into its predecessor
+    if running_sum < min_counts and current_bin > 0:
+        bin_ids[bin_ids == current_bin] = current_bin - 1
+
+    return bin_ids
+
+
+def rebin_counts(data, bin_ids):
+    """Sum counts inside each bin group.
+
+    Parameters:
+        data (numpy.ndarray): Count array — either 1-D ``(n_bins,)`` or 2-D
+            ``(n_samples, n_bins)``.
+        bin_ids (numpy.ndarray): Group id for every original bin (length
+            ``n_bins``).
+
+    Returns:
+        numpy.ndarray: Rebinned array with the last axis reduced to the number
+            of groups.
+    """
+    n_groups = bin_ids.max() + 1
+    if data.ndim == 1:
+        return np.bincount(bin_ids, weights=data, minlength=n_groups)
+    agg = bin_ids[None, :] == np.arange(n_groups)[:, None]  # (n_groups, n_bins)
+    return data @ agg.T  # (n_samples, n_groups)
+
+
+def rebin_edges(bin_edges_1d, bin_ids):
+    """Compute new 1-D bin edges by keeping the outer boundaries of each group.
+
+    Parameters:
+        bin_edges_1d (numpy.ndarray): Original edges of length ``n_bins + 1``.
+        bin_ids (numpy.ndarray): Group id for every original bin (length
+            ``n_bins``).
+
+    Returns:
+        numpy.ndarray: New edges of length ``n_groups + 1``.
+    """
+    starts = np.r_[0, np.flatnonzero(np.diff(bin_ids)) + 1]
+    return bin_edges_1d[np.append(starts, len(bin_ids))]
+
+
 def sigma_to_percentile_intervals(sigmas):
     intervals = []
     for sigma in sigmas:
@@ -191,6 +255,8 @@ def plot_predictive_coverage(
     plot_components=True,
     legend=True,
     n_samples=100,
+    min_counts=None,
+    grouping=None,
 ):
     r"""Plot posterior predictive spectra with residuals.
 
@@ -216,6 +282,15 @@ def plot_predictive_coverage(
             panel. Defaults to ``True``.
         n_samples (int, optional): Number of parameter draws used to build the
             predictive bands. Defaults to ``100``.
+        min_counts (int, optional): If set, adjacent bins are merged until every
+            grouped bin contains at least *min_counts* observed counts.  The
+            same grouping is applied to all plotted quantities (observed
+            spectrum, models, components, and residuals).  ``None`` disables
+            adaptive rebinning.  Defaults to ``None``.  Mutually exclusive with
+            *grouping*.
+        grouping (int, optional): If set, every *grouping* adjacent bins are
+            merged into one (the last group may contain fewer bins).  Mutually
+            exclusive with *min_counts*.  Defaults to ``None``.
 
     Returns:
         matplotlib.figure.Figure: Figure containing spectrum and residual
@@ -225,7 +300,11 @@ def plot_predictive_coverage(
     # TODO : check for background
     # TODO : let the user chose the components to plot
     # TODO : add ARF division when relevant
-    # TODO : rebinning / grouping
+
+    if min_counts is not None and grouping is not None:
+        raise ValueError(
+            "min_counts and grouping are mutually exclusive; use one or the other."
+        )
 
     Plot.xAxis = "keV"
     state = SpectrumState(1)
@@ -240,10 +319,35 @@ def plot_predictive_coverage(
 
     data = solver.simulate(parameters, return_kind="models_and_components")
 
-    bin_edges = state.bin_edges
-    bin_center = state.bin_center
     bin_edges_1d = state.bin_edges_1d
-    bin_width = state.bin_width
+    observed_counts = state.observed_counts
+
+    # Compute bin group ids (if any rebinning is requested)
+    bin_ids = None
+    if min_counts is not None:
+        bin_ids = adaptive_bin_1d(observed_counts, min_counts)
+    elif grouping is not None:
+        n_bins = len(observed_counts)
+        bin_ids = np.arange(n_bins) // grouping
+
+    if bin_ids is not None:
+        bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
+        observed_counts = rebin_counts(observed_counts, bin_ids)
+        data["total_model_counts"] = rebin_counts(
+            data["total_model_counts"], bin_ids
+        )
+        data["model_counts"] = {
+            k: rebin_counts(v, bin_ids)
+            for k, v in data["model_counts"].items()
+        }
+        data["component_counts"] = {
+            k: rebin_counts(v, bin_ids)
+            for k, v in data["component_counts"].items()
+        }
+
+    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
+    bin_width = np.diff(bin_edges, axis=0).squeeze()
+    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
     denominator = bin_width
 
     legend_names = []
@@ -254,7 +358,7 @@ def plot_predictive_coverage(
     )
 
     ### OBSERVED SPECTRUM
-    error_bar = plot_poisson_error_bars(bin_center, bin_edges, state.observed_counts, denominator, axs[0], SPECTRUM_DATA_COLOR)
+    error_bar = plot_poisson_error_bars(bin_center, bin_edges, observed_counts, denominator, axs[0], SPECTRUM_DATA_COLOR)
     legend_list.append(error_bar)
     legend_names.append("Observed Spectrum")
 
@@ -313,15 +417,15 @@ def plot_predictive_coverage(
     """
 
     total_model = total_model / denominator
-    y_observed = state.observed_counts / denominator
+    y_observed = observed_counts / denominator
 
     divider = np.percentile(total_model, 84, axis=0) - np.percentile(total_model, 16, axis=0)
     residuals = (total_model - y_observed) / np.where(divider > 0, divider, 1.0)
 
-    plot_median_and_bands(bin_edges_1d, residuals, np.ones_like(state.observed_counts), axs[1], color=SPECTRUM_COLOR)
+    plot_median_and_bands(bin_edges_1d, residuals, np.ones_like(observed_counts), axs[1], color=SPECTRUM_COLOR)
 
     if x_lim is None:
-        x_lim = (np.min(state.bin_edges_1d), np.max(state.bin_edges_1d))
+        x_lim = (np.min(bin_edges_1d), np.max(bin_edges_1d))
 
     axs[0].set_xlim(*x_lim)
 
