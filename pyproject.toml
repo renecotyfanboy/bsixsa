@@ -15,7 +15,6 @@ dependencies = [
     "cmasher>=1.9.2",
     "dill>=0.3.9",
     "matplotlib>=3.10.1",
-    "mkdocstrings-python>=2.0.3",
     "numpy>=1.26.4",
     "pathos>=0.3.3",
     "sbi>=0.25.0",
@@ -23,10 +22,15 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.5.1",
     "tqdm>=4.67.1",
-    "zensical>=0.0.28",
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+doc = [
+    "mkdocstrings-python>=2.0.3",
+    "zensical>=0.0.28",
+]

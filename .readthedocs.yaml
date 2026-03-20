@@ -15,7 +15,7 @@ build:
      # This is just a quick example to get started.
      # https://docs.readthedocs.io/page/guides/reproducible-builds.html
      install:
-       - pip install zensical
+       - pip install zensical mkdocstrings-python
      build:
        html:
          - zensical build
