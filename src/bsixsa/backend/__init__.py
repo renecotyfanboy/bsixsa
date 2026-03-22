@@ -4,6 +4,29 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .abc import Backend
+    from .cmaes import CMAESBackend
+    from .iminuit import IminuitBackend
+    from .levenberg_marquart import LevenbergMarquardtBackend
+    from .nautilus import NautilusBackend
+    from .nessai import NessaiBackend
+    from .sixsa import SIXSABackend
+    from .tracer import EvaluationTracer
+    from .ultranest import UltranestBackend
+
+__all__ = [
+    "Backend",
+    "CMAESBackend",
+    "EvaluationTracer",
+    "IminuitBackend",
+    "LevenbergMarquardtBackend",
+    "NautilusBackend",
+    "NessaiBackend",
+    "SIXSABackend",
+    "UltranestBackend",
+    "BACKEND_REGISTRY",
+    "get_backend_class",
+    "register_backend",
+]
 
 BACKEND_REGISTRY: dict[str, type[Backend]] = {}
 
@@ -42,6 +65,8 @@ def _lazy_import(name: str) -> None:
         "ultranest": ".ultranest",
         "levenberg_marquardt": ".levenberg_marquart",
         "sixsa": ".sixsa",
+        "cmaes": ".cmaes",
+        "iminuit": ".iminuit",
     }
     if name in _module_map:
         import importlib

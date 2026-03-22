@@ -14,7 +14,7 @@ import pytest
 
 from bsixsa.priors import MultipleIndependent
 from bsixsa.backend.abc import Backend
-from bsixsa.solver import SIXSASolver, FitResults
+from bsixsa.solver import SIXSASolver, FitResults, likelihood_per_bin
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +117,14 @@ class TestBuildInferenceData:
 
     def test_returns_inference_data(self, mock_solver):
         idata = mock_solver.build_inference_data(
-            num_samples=100
+            num_samples=100, include_log_likelihood=False,
         )
         assert isinstance(idata, az.InferenceData)
 
     def test_posterior_group_shape(self, mock_solver):
         n = 200
         idata = mock_solver.build_inference_data(
-            num_samples=n
+            num_samples=n, include_log_likelihood=False,
         )
         assert "posterior" in idata.groups()
         for name in mock_solver._parameter_names:
@@ -133,7 +133,7 @@ class TestBuildInferenceData:
 
     def test_prior_group_included_by_default(self, mock_solver):
         idata = mock_solver.build_inference_data(
-            num_samples=50
+            num_samples=50, include_log_likelihood=False,
         )
         assert "prior" in idata.groups()
         for name in mock_solver._parameter_names:
@@ -142,7 +142,8 @@ class TestBuildInferenceData:
 
     def test_prior_group_excluded(self, mock_solver):
         idata = mock_solver.build_inference_data(
-            num_samples=50, include_prior=False
+            num_samples=50, include_prior=False,
+            include_log_likelihood=False,
         )
         assert "prior" not in idata.groups()
 
@@ -156,7 +157,7 @@ class TestBuildInferenceData:
             ),
         ):
             idata = mock_solver.build_inference_data(
-                num_samples=50
+                num_samples=50, include_log_likelihood=False,
             )
         assert "observed_data" not in idata.groups()
 
@@ -168,7 +169,7 @@ class TestBuildInferenceData:
             new_callable=lambda: property(lambda self: fake_obs),
         ):
             idata = mock_solver.build_inference_data(
-                num_samples=50
+                num_samples=50, include_log_likelihood=False,
             )
         assert "observed_data" in idata.groups()
         np.testing.assert_array_equal(
@@ -177,7 +178,7 @@ class TestBuildInferenceData:
 
     def test_log_evidence_in_attrs(self, mock_solver):
         idata = mock_solver.build_inference_data(
-            num_samples=50
+            num_samples=50, include_log_likelihood=False,
         )
         assert idata.attrs["log_Z"] == pytest.approx(-120.5)
         assert idata.attrs["log_Z_err"] == pytest.approx(0.3)
@@ -185,7 +186,8 @@ class TestBuildInferenceData:
     def test_no_fit_result(self, mock_solver):
         mock_solver.fit_result = None
         idata = mock_solver.build_inference_data(
-            num_samples=50, include_observed=False
+            num_samples=50, include_observed=False,
+            include_log_likelihood=False,
         )
         assert "log_Z" not in idata.attrs
 
@@ -196,9 +198,119 @@ class TestBuildInferenceData:
         idata = mock_solver.build_inference_data(
             num_samples=n, include_prior=False,
             include_observed=False,
+            include_log_likelihood=False,
         )
 
         for name in mock_solver._parameter_names:
             np.testing.assert_array_equal(
                 idata.posterior[name].values.squeeze(), df[name].values
             )
+
+    def test_log_likelihood_group_included(self, mock_solver):
+        """log_likelihood group is present with correct shape."""
+        n = 80
+        n_bins = 50
+        fake_obs = np.random.default_rng(0).poisson(10, size=n_bins).astype(np.float32)
+        fake_model_counts = np.random.default_rng(1).poisson(10, size=(n, n_bins)).astype(np.float64)
+
+        with patch.object(
+            type(mock_solver),
+            "observed_spectrum",
+            new_callable=lambda: property(lambda self: fake_obs),
+        ), patch.object(
+            mock_solver,
+            "simulate",
+            return_value={"total_model_counts": fake_model_counts},
+        ):
+            idata = mock_solver.build_inference_data(
+                num_samples=n,
+                include_prior=False,
+                include_observed=False,
+                include_log_likelihood=True,
+            )
+
+        assert "log_likelihood" in idata.groups()
+        assert "spectrum" in idata.log_likelihood
+        assert idata.log_likelihood["spectrum"].shape == (1, n, n_bins)
+
+    def test_log_likelihood_values_correct(self, mock_solver):
+        """log_likelihood values match manual poisson_deviance computation."""
+        n = 30
+        n_bins = 20
+        rng = np.random.default_rng(99)
+        fake_obs = rng.poisson(5, size=n_bins).astype(np.float64)
+        fake_model = rng.poisson(5, size=(n, n_bins)).astype(np.float64) + 0.1
+
+        expected = likelihood_per_bin(fake_obs, fake_model)
+
+        with patch.object(
+            type(mock_solver),
+            "observed_spectrum",
+            new_callable=lambda: property(lambda self: fake_obs),
+        ), patch.object(
+            mock_solver,
+            "simulate",
+            return_value={"total_model_counts": fake_model},
+        ):
+            idata = mock_solver.build_inference_data(
+                num_samples=n,
+                include_prior=False,
+                include_observed=False,
+                include_log_likelihood=True,
+            )
+
+        np.testing.assert_array_almost_equal(
+            idata.log_likelihood["spectrum"].values.squeeze(), expected
+        )
+
+    def test_log_likelihood_excluded(self, mock_solver):
+        """log_likelihood group absent when disabled."""
+        idata = mock_solver.build_inference_data(
+            num_samples=50, include_log_likelihood=False,
+        )
+        assert "log_likelihood" not in idata.groups()
+
+
+# ---------------------------------------------------------------------------
+# Tests — likelihood_per_bin
+# ---------------------------------------------------------------------------
+
+
+class TestLikelihoodPerBin:
+
+    def test_shape(self):
+        observed = np.array([10.0, 0.0, 5.0])
+        model = np.array([[10.0, 1.0, 5.0], [8.0, 2.0, 7.0]])
+        result = likelihood_per_bin(observed, model)
+        assert result.shape == (2, 3)
+
+    def test_known_values(self):
+        """Check against the Poisson log-likelihood formula y ln µ − µ."""
+        observed = np.array([10.0, 5.0, 3.0])
+        model = np.array([[10.0, 5.0, 3.0]])
+        result = likelihood_per_bin(observed, model)
+        expected = observed * np.log(model) - model
+        np.testing.assert_array_almost_equal(result, expected)
+
+    def test_zero_observed(self):
+        observed = np.array([0.0])
+        model = np.array([[5.0]])
+        result = likelihood_per_bin(observed, model)
+        np.testing.assert_almost_equal(result[0, 0], -5.0)
+
+    def test_1d_model(self):
+        """Works with 1-D model array (single sample)."""
+        observed = np.array([10.0, 0.0, 5.0])
+        model = np.array([10.0, 1.0, 5.0])
+        result = likelihood_per_bin(observed, model)
+        assert result.shape == (3,)
+
+    def test_maximised_at_observed(self):
+        """Log-likelihood is maximised when model equals observed."""
+        rng = np.random.default_rng(7)
+        observed = rng.poisson(10, size=50).astype(np.float64)
+        observed = np.maximum(observed, 1)  # avoid y=0 where max is trivial
+        model = rng.poisson(10, size=(100, 50)).astype(np.float64) + 0.1
+        ll_model = likelihood_per_bin(observed, model)
+        ll_saturated = likelihood_per_bin(observed, observed)
+        assert np.all(ll_model <= ll_saturated + 1e-12)

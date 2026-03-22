@@ -1,3 +1,4 @@
+import os
 import typing
 
 import numpy as np
@@ -23,11 +24,14 @@ class UltranestBackend(Backend):
     def __init__(self, *, solver: 'SIXSASolver', n_live_points: int = 1_000, resume=True, step_sampler=False, **kwargs):
         super().__init__(solver=solver)
 
+        ultranest_output = os.path.join(self.solver.outputfiles_basename, "ultranest_outputs")
+        os.makedirs(ultranest_output, exist_ok=True)
+
         self._reactive_sampler = ultranest.ReactiveNestedSampler(
             [par.name for par in iter_thawn_parameters()],
             self._likelihood,
             transform=lambda cube: self._prior_transform(cube),
-            log_dir=self.solver.outputfiles_basename,
+            log_dir=ultranest_output,
             vectorized=True,
             resume=resume
         )
@@ -49,7 +53,9 @@ class UltranestBackend(Backend):
         return self.solver.prior.from_unit_cube(cube)
 
     def _likelihood(self, x):
-        return self.solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
+        ll = self.solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
+        self.tracer.record(np.atleast_2d(x), -2.0 * np.atleast_1d(ll))
+        return ll
 
     def run(self, **kwargs) -> 'FitResults':
         from ..solver import FitResults

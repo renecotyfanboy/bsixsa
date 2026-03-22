@@ -59,7 +59,7 @@ def covariance_from_jacobian(
     Uses the Gauss-Newton approximation: ``H ≈ J^T J``, then scales the
     inverse by the reduced chi-squared (``2 * cost / dof``).
 
-    Args:
+    Parameters:
         jac: Jacobian at the solution, shape (m, n), as returned by
             ``least_squares``.
         cost: Value of the cost function at the solution (``0.5 * sum(r**2)``).
@@ -85,25 +85,13 @@ def _poisson_deviance_residuals(observed: np.ndarray, model: np.ndarray) -> np.n
     Minimising ``sum(r**2)`` is equivalent to minimising the C-statistic,
     i.e. maximising the Poisson log-likelihood.
 
-    For a bin with observed counts *y* and predicted counts *µ*:
-
-        d_i = 2 (µ − y + y ln(y / µ))
-
     The signed residual is ``sign(y − µ) sqrt(d_i)``.
     """
-    model = np.maximum(model, _EPS)
-    observed = np.asarray(observed, dtype=np.float64)
+    from ..solver import likelihood_per_bin
 
-    deviance = np.empty_like(observed)
-    nonzero = observed > 0
-    deviance[nonzero] = 2.0 * (
-        model[nonzero]
-        - observed[nonzero]
-        + observed[nonzero] * np.log(observed[nonzero] / model[nonzero])
-    )
-    deviance[~nonzero] = 2.0 * model[~nonzero]
-
-    deviance = np.maximum(deviance, 0.0)
+    log_lik = likelihood_per_bin(observed, model)
+    log_lik_saturated = likelihood_per_bin(observed, observed)
+    deviance = np.maximum(-2.0 * (log_lik - log_lik_saturated), 0.0)
     return np.sign(observed - model) * np.sqrt(deviance)
 
 
@@ -154,7 +142,7 @@ class LevenbergMarquardtBackend(Backend):
     def run(self, *, x0_physical: np.ndarray | None = None, init_from_prior: bool = False, **least_squares_kwargs) -> 'FitResults':
         """Run the Levenberg-Marquardt fit.
 
-        Args:
+        Parameters:
             x0_physical: Initial guess in physical parameter space. Defaults to
                 the prior median (0.5 in the unit cube).
             init_from_prior: If ``True``, draw a random sample from the prior
@@ -192,6 +180,7 @@ class LevenbergMarquardtBackend(Backend):
             model_counts = sim["total_model_counts"].ravel().astype(np.float64)
             r = _poisson_deviance_residuals(observed, model_counts)
             callback(physical_params, sim["cstat"])
+            self.tracer.record(physical_params, sim["cstat"])
             return r
 
         defaults = dict(method="lm", verbose=1, jac="3-point")

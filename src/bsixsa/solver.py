@@ -24,6 +24,32 @@ class FitResults:
     log_Z_err: float
 
 
+def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
+    r"""Per-bin Poisson log-likelihood (Cash statistic).
+    For a bin with observed counts $S_i$ and predicted counts $\mathcal{M}_i$:
+
+    $$
+    \log \mathcal{L}_i = S_i \ln(\mathcal{M}_i) − \mathcal{M}_i
+    $$
+
+    where $\mathcal{M}_i > 0$
+
+    Parameters:
+        observed: Observed counts, shape ``(n_bins,)``.
+        model: Predicted model counts, shape ``(n_bins,)`` or
+            ``(n_samples, n_bins)``.
+
+    Returns:
+        Per-bin log-likelihood with the same shape as *model*.
+    """
+
+    model = np.asarray(model, dtype=np.float64)
+    observed = np.asarray(observed, dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(observed > 0, observed * np.log(model) - model, -model)
+
+
 def _validate_finite(parameters, parameter_names):
     """Raise ``ValueError`` if *parameters* contains NaN or Inf values."""
     bad_mask = ~np.isfinite(parameters)
@@ -56,7 +82,7 @@ def _split_kwargs(cls, kwargs):
 def set_parameters(values, indexes, model_indexes):
     """Update the active XSPEC parameters using transformed values.
 
-    Args:
+    Parameters:
         values: Parameter values in the physical space.
     """
     parameter_to_set = {}  # Will contain {model : {par_index:prior}}
@@ -149,7 +175,7 @@ class SIXSASolver(object):
     ):
         r"""Draw parameter samples from one of the registered distributions.
 
-        Args:
+        Parameters:
             n_samples: Number of draws to generate.
             distribution_name: Key of the distribution in
                 ``self.distributions``. Defaults to ``"prior"``.
@@ -165,7 +191,7 @@ class SIXSASolver(object):
     def simulate(self, parameters, return_kind="full_model_counts", progress_bar=True):
         """Fold parameters through XSPEC and stack simulation outputs.
 
-        Args:
+        Parameters:
             parameters: Array-like batch of parameter vectors.
             return_kind: One of ``"cstat"``, ``"full_model_counts"``, or
                 ``"models_and_components"``.
@@ -197,7 +223,7 @@ class SIXSASolver(object):
             `x_o` is a dummy parameter used for compatibility with `sbi` as the true spectrum is directly extracted from
             `xspec`. `sbi` require this parameter as in normal workflow, this function can be conditioned on any `x_o`.
 
-        Args:
+        Parameters:
             theta: Array of samples on the unit cube.
             x_o: Observed value, pass ``None`` if needed.
         """
@@ -267,7 +293,7 @@ class SIXSASolver(object):
     ) -> pd.DataFrame:
         """Build a posterior sample table from a named distribution.
 
-        Args:
+        Parameters:
             distribution: Key in ``self.distributions`` to sample from.
                 Defaults to ``"posterior"``.
             num_samples: Number of samples to draw. Defaults to 10_000.
@@ -290,13 +316,15 @@ class SIXSASolver(object):
         num_samples: int = 10_000,
         include_prior: bool = True,
         include_observed: bool = True,
+        include_log_likelihood: bool = True,
     ) -> az.InferenceData:
         """Build an ArviZ InferenceData object from the fitted model.
 
         Mirrors ``build_dataframe`` but returns a richer container that
-        is understood by the ArviZ ecosystem (diagnostics, plotting, I/O).
+        is understood by the ArviZ ecosystem (diagnostics, plotting, I/O,
+        and model comparison via ``az.compare``).
 
-        Args:
+        Parameters:
             distribution: Key in ``self.distributions`` to sample posterior
                 draws from. Defaults to ``"posterior"``.
             num_samples: Number of posterior draws. Defaults to 10_000.
@@ -305,10 +333,14 @@ class SIXSASolver(object):
             include_observed: If ``True``, attach the observed spectrum as the
                 *observed_data* group. Requires an active XSPEC session.
                 Defaults to ``True``.
+            include_log_likelihood: If ``True``, simulate the posterior
+                samples through the instrument response and compute
+                per-bin Poisson log-likelihoods. Required for
+                ``az.compare``. Defaults to ``True``.
 
         Returns:
             Inference data with *posterior* (and optionally *prior*,
-            *observed_data*) groups.
+            *observed_data*, *log_likelihood*) groups.
         """
 
         samples = self._sample_from(distribution, num_samples)
@@ -319,6 +351,16 @@ class SIXSASolver(object):
         }
 
         kwargs: dict = {"posterior": posterior_dict}
+
+        if include_log_likelihood:
+            sim = self.simulate(
+                samples, return_kind="full_model_counts", progress_bar=True
+            )
+            observed = self.observed_spectrum
+            log_lik = likelihood_per_bin(observed, sim["total_model_counts"])
+            kwargs["log_likelihood"] = {
+                "spectrum": log_lik[np.newaxis, :, :]
+            }
 
         if include_prior:
             prior_samples = self.distributions["prior"].sample((num_samples,))
@@ -336,11 +378,13 @@ class SIXSASolver(object):
             obs = self.observed_spectrum
             kwargs["observed_data"] = {"spectrum": obs}
 
-        idata = az.from_dict(**kwargs)
-
         if self.fit_result is not None:
-            idata.attrs["log_Z"] = self.fit_result.log_Z
-            idata.attrs["log_Z_err"] = self.fit_result.log_Z_err
+            kwargs["attrs"] = {
+                "log_Z": self.fit_result.log_Z,
+                "log_Z_err": self.fit_result.log_Z_err,
+            }
+
+        idata = az.from_dict(**kwargs)
 
         return idata
 
@@ -360,5 +404,8 @@ class SIXSASolver(object):
         self.fit_result = self.backend.run(*args, **run_kwargs)
         self.posterior_samples = self.fit_result.posterior_samples
         self.distributions["posterior"] = self.backend
+
+        self.backend.tracer.plot_progress()
+        self.backend.tracer.save()
 
         return self.fit_result

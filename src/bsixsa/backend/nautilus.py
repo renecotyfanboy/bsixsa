@@ -31,7 +31,9 @@ class NautilusBackend(Backend):
         self.n_live_points = n_live_points
 
         def likelihood(x):
-            return solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
+            ll = solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
+            self.tracer.record(np.atleast_2d(x), -2.0 * np.atleast_1d(ll))
+            return ll
 
         self._nested_sampler = NestedSampler(
             prior, likelihood,

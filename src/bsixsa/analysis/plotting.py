@@ -347,6 +347,8 @@ def plot_predictive_coverage(
     # TODO : check for background
     # TODO : let the user chose the components to plot
     # TODO : add ARF division when relevant
+    # TODO : issue when sometime the components are too high compared to the reference model. Happens when
+    # we charge a new xspec model. What could it be ?
 
     if min_counts is not None and grouping is not None:
         raise ValueError(

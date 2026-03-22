@@ -221,7 +221,7 @@ def parallel_folding(
 ):
     """Evaluate folded XSPEC outputs for a batch of parameter vectors.
 
-    Args:
+    Parameters:
         params: Parameter vectors to evaluate.
         indexes: XSPEC parameter indices associated with ``params``.
         model_indexes: XSPEC model names associated with ``indexes``.

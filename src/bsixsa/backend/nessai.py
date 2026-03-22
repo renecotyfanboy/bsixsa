@@ -1,3 +1,4 @@
+import os
 import typing
 
 import numpy as np
@@ -9,6 +10,7 @@ from nessai.posterior import draw_posterior_samples
 from ..solver import FitResults
 from .abc import Backend
 from . import register_backend
+import warnings
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
@@ -16,8 +18,9 @@ if typing.TYPE_CHECKING:
 
 class ModelFromSolver(NessaiModel):
 
-    def __init__(self, solver):
+    def __init__(self, solver, tracer):
         self.solver = solver
+        self._tracer = tracer
         self.names = solver.parameter_names
         self.bounds = {self.names[idx]: bound for idx, bound in zip(range(len(self.names)), solver.bounds)}
 
@@ -53,7 +56,9 @@ class ModelFromSolver(NessaiModel):
     def log_likelihood(self, theta):
         """Returns log likelihood of given live point."""
         theta = self.to_array(theta)
-        return self.solver.log_likelihood_fn(theta, None, progress_bar=False, no_pool=False)
+        ll = self.solver.log_likelihood_fn(theta, None, progress_bar=False, no_pool=False)
+        self._tracer.record(theta, -2.0 * np.atleast_1d(ll))
+        return ll
 
 
 @register_backend
@@ -64,21 +69,34 @@ class NessaiBackend(Backend):
     def __init__(self, *, solver: 'SIXSASolver', n_live_points: int = 1_000, **kwargs):
         super().__init__(solver=solver)
 
-        self.model = ModelFromSolver(self.solver)
-        self.n_live_points = n_live_points
         kwargs.setdefault("importance_nested_sampler", True)
-        kwargs.setdefault("min_samples", min(500, n_live_points))
+        self.model = ModelFromSolver(self.solver, self.tracer)
+        self.n_live_points = n_live_points
+
+        nessai_output = os.path.join(self.solver.outputfiles_basename, "nessai_outputs")
+        os.makedirs(nessai_output, exist_ok=True)
+
         self._flow_sampler = FlowSampler(
             self.model,
             nlive=n_live_points,
-            output=self.solver.outputfiles_basename,
+            output=nessai_output,
             **kwargs
         )
 
     def run(self, **kwargs) -> 'FitResults':
         from ..solver import FitResults
 
-        self._flow_sampler.run()
+        with warnings.catch_warnings():
+            # Ignore a bunch of warnings that are raised by nessai early
+            warnings.filterwarnings("ignore", message="divide by zero encountered in log")
+            warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+            warnings.filterwarnings("ignore", message="invalid value encountered in scalar subtract")
+            warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
+
+            self._flow_sampler.run(
+                #compute_initial_posterior=True,
+                #redraw_samples=True
+            )
 
         posterior_dict = live_points_to_dict(
             self._flow_sampler.posterior_samples,

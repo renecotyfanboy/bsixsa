@@ -55,6 +55,7 @@ nav = [
     ]},
     { "Reference" = [
         {"Solver" = "reference/solver.md"},
+        {"Backend" = "reference/backend.md"},
         {"Plotter" = "reference/plotter.md"},
     ]},
     { "Doc building" = [
