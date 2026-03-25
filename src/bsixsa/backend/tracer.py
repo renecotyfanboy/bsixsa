@@ -24,6 +24,9 @@ def _agg_backend():
     finally:
         matplotlib.use(prev)
 
+# TODO : skip n first
+# TODO : set individual backend output to on or off along with backend
+
 class EvaluationTracer:
     """Records ``(parameters, cstat)`` for every likelihood evaluation.
 
@@ -243,3 +246,10 @@ class EvaluationTracer:
             plt.close(fig)
 
         return path
+
+
+class DummyTracer(EvaluationTracer):
+    """Dummy tracer that does nothing."""
+
+    def record(self, *args, **kwargs):
+        pass

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .tracer import EvaluationTracer
+from .tracer import EvaluationTracer, DummyTracer
 
 if TYPE_CHECKING:
     from ..solver import FitResults, SIXSASolver
@@ -20,14 +20,23 @@ class Backend(ABC):
 
     name: str  # registry key, e.g. "nessai"
 
-    def __init__(self, *, solver: SIXSASolver, plot_every: int = 50, flush_every: int = 200, **kwargs):
+    def __init__(self, *, solver: SIXSASolver, trace=True, plot_every: int = 50, flush_every: int = 200, **kwargs):
         self.solver = solver
-        self.tracer = EvaluationTracer(
-            output_dir=solver.outputfiles_basename,
-            parameter_names=solver.parameter_names,
-            plot_every=plot_every,
-            flush_every=flush_every,
-        )
+
+        if trace:
+            self.tracer = EvaluationTracer(
+                output_dir=solver.outputfiles_basename,
+                parameter_names=solver.parameter_names,
+                plot_every=plot_every,
+                flush_every=flush_every,
+            )
+        else:
+            self.tracer = DummyTracer(
+                output_dir=solver.outputfiles_basename,
+                parameter_names=solver.parameter_names,
+                plot_every=plot_every,
+                flush_every=flush_every,
+            )
 
     @abstractmethod
     def run(self, **kwargs) -> FitResults:

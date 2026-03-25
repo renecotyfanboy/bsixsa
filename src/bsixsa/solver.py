@@ -105,8 +105,37 @@ class SIXSASolver(object):
         outputfiles_basename="./sixsa",
         overwrite=False,
         n_jobs=os.cpu_count(),
+        trace=True,
         backend="nessai"
     ):
+        r"""Initialise the Bayesian X-ray spectral analysis solver.
+
+        Reads the currently loaded XSPEC model, builds the prior
+        distribution from *prior*, and prepares a multiprocessing pool
+        for parallel likelihood evaluations.
+
+        Parameters:
+            prior: Prior specification forwarded to
+                ``build_prior``.  Accepts the same formats as
+                :func:`~bsixsa.priors.build_prior`.
+            outputfiles_basename: Directory where backend output files
+                (chains, checkpoints, traces) are stored.  Created
+                automatically if it does not exist.
+            overwrite: If ``True``, clear *outputfiles_basename* when it
+                already contains files.  Defaults to ``False``.
+            n_jobs: Number of worker processes for the multiprocessing
+                pool.  Defaults to ``os.cpu_count()``.
+            trace: If ``True``, enable run-time trace logging in the
+                backend.  Defaults to ``True``.
+            backend: Name of the backend to use
+                (e.g. ``"nessai"``).  Defaults to ``"nessai"``.
+        """
+
+        if xspec.AllData.nSpectra < 1:
+            raise ValueError("No spectra loaded in XSPEC")
+
+        if len(xspec.AllModels.sources) < 1:
+            raise ValueError("No model loaded in XSPEC")
 
         prior, indexes, model_indexes, bounds = build_prior(prior, return_bounds=True)
 
@@ -122,6 +151,7 @@ class SIXSASolver(object):
         self.backend_name: str = backend
         self.backend = None
         self.fit_result: FitResults | None = None
+        self.trace = trace
 
         normalized_output_dir = os.path.normpath(outputfiles_basename)
 
@@ -399,7 +429,7 @@ class SIXSASolver(object):
         backend_cls = get_backend_class(self.backend_name)
         init_kwargs, run_kwargs = _split_kwargs(backend_cls, kwargs)
 
-        self.backend = backend_cls(solver=self, **init_kwargs)
+        self.backend = backend_cls(solver=self, trace=self.trace, **init_kwargs)
 
         self.fit_result = self.backend.run(*args, **run_kwargs)
         self.posterior_samples = self.fit_result.posterior_samples
