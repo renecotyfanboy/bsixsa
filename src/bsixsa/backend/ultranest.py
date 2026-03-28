@@ -21,8 +21,8 @@ class UltranestBackend(Backend):
 
     name = "ultranest"
 
-    def __init__(self, *, solver: 'SIXSASolver', n_live_points: int = 1_000, resume=True, step_sampler=False, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: 'SIXSASolver', trace: bool, n_live_points: int = 1_000, resume=True, step_sampler=False, **kwargs):
+        super().__init__(solver=solver, trace=trace)
 
         ultranest_output = os.path.join(self.solver.outputfiles_basename, "ultranest_outputs")
         os.makedirs(ultranest_output, exist_ok=True)

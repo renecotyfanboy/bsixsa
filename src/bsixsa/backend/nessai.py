@@ -66,8 +66,8 @@ class NessaiBackend(Backend):
 
     name = "nessai"
 
-    def __init__(self, *, solver: 'SIXSASolver', n_live_points: int = 1_000, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: 'SIXSASolver', trace: bool, n_live_points: int = 1_000, **kwargs):
+        super().__init__(solver=solver, trace=trace)
 
         kwargs.setdefault("importance_nested_sampler", True)
         self.model = ModelFromSolver(self.solver, self.tracer)

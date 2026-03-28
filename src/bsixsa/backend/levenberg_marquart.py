@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import typing
-from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -14,37 +13,6 @@ from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
-
-
-@dataclass
-class LMTrace:
-    """Accumulates per-iteration diagnostics during a Levenberg-Marquardt run.
-
-    With finite-difference Jacobians, each iteration triggers many residual
-    evaluations at tiny perturbations of the iterate.  Only evaluations at
-    genuinely new iterates are recorded; perturbation calls (distance from
-    the last recorded point below ``jac_eps``) are counted but not stored.
-    """
-
-    params: list[np.ndarray] = field(default_factory=list)
-    costs: list[float] = field(default_factory=list)
-    n_evals: int = 0
-    jac_eps: float = 1e-6
-    _last_recorded: np.ndarray | None = field(default=None, repr=False)
-
-    def __call__(self, params: np.ndarray, residuals: np.ndarray) -> None:
-        """Callback invoked after each residual evaluation."""
-        self.n_evals += 1
-
-        # Skip Jacobian perturbation calls — tiny shifts from last iterate
-        if self._last_recorded is not None:
-            diff = np.max(np.abs(params.ravel() - self._last_recorded))
-            if diff < self.jac_eps:
-                return
-
-        self._last_recorded = params.ravel().copy()
-        self.params.append(params.copy())
-        self.costs.append(float(np.sum(residuals ** 2)))
 
 
 # Tiny floor to avoid log(0) and division by zero in Poisson deviance
@@ -105,13 +73,12 @@ class LevenbergMarquardtBackend(Backend):
 
     name = "levenberg_marquardt"
 
-    def __init__(self, *, solver: SIXSASolver, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: SIXSASolver, trace: bool):
+        super().__init__(solver=solver,  trace=trace)
         self.result = None
         self.best_fit_params = None
         self.best_fit_unconstrained = None
         self.covariance_unconstrained = None
-        self.trace: LMTrace | None = None
 
     def sample(self, n: int) -> np.ndarray:
 
@@ -168,8 +135,6 @@ class LevenbergMarquardtBackend(Backend):
 
         x0_unconstrained = np.asarray(x0_unconstrained, dtype=np.float64).ravel()
 
-        callback = LMTrace()
-
         def residuals(unconstrained_params):
             physical_params = self._unconstrained_to_physical(unconstrained_params)
             sim = self.solver.simulate(
@@ -179,7 +144,6 @@ class LevenbergMarquardtBackend(Backend):
             )
             model_counts = sim["total_model_counts"].ravel().astype(np.float64)
             r = _poisson_deviance_residuals(observed, model_counts)
-            callback(physical_params, sim["cstat"])
             self.tracer.record(physical_params, sim["cstat"])
             return r
 
@@ -192,8 +156,6 @@ class LevenbergMarquardtBackend(Backend):
                 x0_unconstrained,
                 **defaults
             )
-
-        self.trace = callback
 
         self.best_fit_unconstrained = self.result.x.copy()
         self.best_fit_params = self._unconstrained_to_physical(
@@ -215,7 +177,7 @@ class LevenbergMarquardtBackend(Backend):
         return FitResults(
             time=float(run_time()),
             posterior_samples=pd.DataFrame.from_dict(posterior_dict),
-            n_likelihood_evaluations=self.trace.n_evals,
+            n_likelihood_evaluations=self.tracer.n_evals,
             log_Z=float("nan"),
             log_Z_err=float("nan"),
         )

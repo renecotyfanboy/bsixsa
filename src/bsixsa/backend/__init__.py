@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .abc import Backend
     from .cmaes import CMAESBackend
+    from .emcee import EmceeBackend
     from .iminuit import IminuitBackend
     from .levenberg_marquart import LevenbergMarquardtBackend
     from .nautilus import NautilusBackend
@@ -17,6 +18,7 @@ __all__ = [
     "Backend",
     "CMAESBackend",
     "EvaluationTracer",
+    "EmceeBackend",
     "IminuitBackend",
     "LevenbergMarquardtBackend",
     "NautilusBackend",
@@ -67,6 +69,7 @@ def _lazy_import(name: str) -> None:
         "sixsa": ".sixsa",
         "cmaes": ".cmaes",
         "iminuit": ".iminuit",
+        "emcee": ".emcee"
     }
     if name in _module_map:
         import importlib

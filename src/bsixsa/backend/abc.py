@@ -38,6 +38,16 @@ class Backend(ABC):
                 flush_every=flush_every,
             )
 
+    def _cube_to_physical(self, cube: np.ndarray) -> np.ndarray:
+        """Map unit-cube parameters to physical space."""
+        return self.solver.prior.from_unit_cube(np.atleast_2d(cube))
+
+    def _physical_to_cube(self, physical: np.ndarray) -> np.ndarray:
+        """Map physical-space parameters to the unit cube."""
+        return self.solver.prior.to_unit_cube(
+            np.atleast_2d(physical)
+        ).ravel()
+
     @abstractmethod
     def run(self, **kwargs) -> FitResults:
         """Execute the backend and return results."""

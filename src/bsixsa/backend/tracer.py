@@ -35,27 +35,26 @@ class EvaluationTracer:
     *output_dir*.  The trace is flushed to disk incrementally so that
     memory usage stays bounded even for billion-evaluation runs.
 
-    Parameters
-    ----------
-    output_dir:
-        Directory where ``progress.png`` and ``evaluation_trace.npz``
-        are saved.
-    parameter_names:
-        Names of the fitted parameters (used for axis labels).
-    plot_every:
-        Write a new progress PNG after this many :meth:`record` calls.
-        Set to ``0`` to disable periodic plotting.
-    flush_every:
-        Flush accumulated data to the ``.npz`` file after this many
-        :meth:`record` calls and free memory.  Set to ``0`` to keep
-        everything in memory (not recommended for large runs).
+    Parameters:
+        output_dir:
+            Directory where ``progress.png`` and ``evaluation_trace.npz``
+            are saved.
+        parameter_names:
+            Names of the fitted parameters (used for axis labels).
+        plot_every:
+            Write a new progress PNG after this many :meth:`record` calls.
+            Set to ``0`` to disable periodic plotting.
+        flush_every:
+            Flush accumulated data to the ``.npz`` file after this many
+            :meth:`record` calls and free memory.  Set to ``0`` to keep
+            everything in memory (not recommended for large runs).
     """
 
     def __init__(
         self,
         output_dir: str | Path,
         parameter_names: list[str],
-        plot_every: int = 50,
+        plot_every: int = 20_000, # TODO : plot every log-iter
         flush_every: int = 200,
     ) -> None:
         self.output_dir = Path(output_dir)
@@ -77,20 +76,15 @@ class EvaluationTracer:
         if self._trace_path.exists():
             self._trace_path.unlink()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def record(self, params: np.ndarray, cstat: np.ndarray) -> None:
         """Record one or more evaluations.
 
-        Parameters
-        ----------
-        params:
-            Parameter values in *physical* space.  Shape ``(ndim,)`` for a
-            single evaluation or ``(batch, ndim)`` for a batch.
-        cstat:
-            Corresponding C-statistic value(s).  Scalar or ``(batch,)``.
+        Parameters:
+            params:
+                Parameter values in *physical* space.  Shape ``(ndim,)`` for a
+                single evaluation or ``(batch, ndim)`` for a batch.
+            cstat:
+                Corresponding C-statistic value(s).  Scalar or ``(batch,)``.
         """
         params = np.atleast_2d(params)
         cstat = np.atleast_1d(np.asarray(cstat, dtype=np.float64)).ravel()
@@ -107,7 +101,7 @@ class EvaluationTracer:
         if self.flush_every > 0 and self._n_record_calls % self.flush_every == 0:
             self._flush_to_disk()
 
-        if self.plot_every > 0 and self._n_record_calls % self.plot_every == 0:
+        if self.plot_every > 0 and self._n_evals % self.plot_every == 0:
             self.plot_progress()
 
     def _flush_to_disk(self) -> None:
@@ -182,20 +176,15 @@ class EvaluationTracer:
         self._flush_to_disk()
         return self._trace_path
 
-    # ------------------------------------------------------------------
-    # Progress plot
-    # ------------------------------------------------------------------
-
     def plot_progress(self, path: str | Path | None = None) -> Path:
         """Write a progress PNG.
 
         Layout: one row for C-stat vs eval#, one row for C-stat vs
         timestamp, then one row per parameter (value vs timestamp).
 
-        Parameters
-        ----------
-        path:
-            File path.  Defaults to ``{output_dir}/progress.png``.
+        Parameters:
+            path:
+                File path.  Defaults to ``{output_dir}/progress.png``.
         """
         if path is None:
             path = self.output_dir / "progress.png"
@@ -204,6 +193,13 @@ class EvaluationTracer:
         cstats = self.all_cstats
         params = self.all_params
         timestamps = self.all_timestamps
+
+        # Drop entries with non-finite cstat or parameter values (nan / inf)
+        finite_mask = np.isfinite(cstats) & np.all(np.isfinite(params), axis=1)
+        cstats = cstats[finite_mask]
+        params = params[finite_mask]
+        timestamps = timestamps[finite_mask]
+
         n = len(cstats)
         if n == 0:
             return path

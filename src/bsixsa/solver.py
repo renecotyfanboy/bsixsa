@@ -11,6 +11,7 @@ from xspec import AllModels
 
 from .priors import build_prior
 from .xspec import parallel_folding
+from scipy.stats import poisson
 import arviz as az
 import pathos.multiprocessing as multiprocessing  # pathos
 
@@ -46,8 +47,7 @@ def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
     model = np.asarray(model, dtype=np.float64)
     observed = np.asarray(observed, dtype=np.float64)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(observed > 0, observed * np.log(model) - model, -model)
+    return poisson.logpmf(observed, model)
 
 
 def _validate_finite(parameters, parameter_names):

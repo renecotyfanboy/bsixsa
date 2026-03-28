@@ -31,8 +31,8 @@ class IminuitBackend(Backend):
 
     name = "iminuit"
 
-    def __init__(self, *, solver: SIXSASolver, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: SIXSASolver, trace: bool):
+        super().__init__(solver=solver,  trace=trace)
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_unconstrained: np.ndarray | None = None
         self.covariance_unconstrained: np.ndarray | None = None

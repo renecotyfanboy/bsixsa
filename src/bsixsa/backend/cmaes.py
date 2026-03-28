@@ -30,32 +30,13 @@ class CMAESBackend(Backend):
 
     name = "cmaes"
 
-    def __init__(self, *, solver: SIXSASolver, sigma0: float = 0.25, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: SIXSASolver, trace: bool, sigma0: float = 0.25, **kwargs):
+        super().__init__(solver=solver, trace=trace)
         self.sigma0 = sigma0
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_cube: np.ndarray | None = None
         self.covariance_cube: np.ndarray | None = None
         self.es: cma.CMAEvolutionStrategy | None = None
-
-    # ------------------------------------------------------------------
-    # Space transforms
-    # ------------------------------------------------------------------
-
-    def _cube_to_physical(self, cube: np.ndarray) -> np.ndarray:
-        """Map unit-cube parameters to physical space."""
-        return self.solver.prior.from_unit_cube(np.atleast_2d(cube))
-
-    def _physical_to_cube(self, physical: np.ndarray) -> np.ndarray:
-        """Map physical-space parameters to the unit cube."""
-        cube = self.solver.prior.to_unit_cube(
-            np.atleast_2d(physical)
-        ).ravel()
-        return np.clip(cube, _EPS, 1.0 - _EPS)
-
-    # ------------------------------------------------------------------
-    # Objective (vectorised batch evaluation)
-    # ------------------------------------------------------------------
 
     def _evaluate_batch(self, population: list[np.ndarray]) -> list[float]:
         """Evaluate a batch of candidates in unit-cube space.
@@ -74,10 +55,6 @@ class CMAESBackend(Backend):
         cstats = sim["cstat"].ravel()
         self.tracer.record(physical, cstats)
         return cstats.tolist()
-
-    # ------------------------------------------------------------------
-    # Core API
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -138,6 +115,7 @@ class CMAESBackend(Backend):
         # --- extract results ---
         self.best_fit_cube = np.asarray(self.es.result.xbest).ravel()
         self.best_fit_params = self._cube_to_physical(self.es.result.xbest).ravel()
+        #self.es.
         self.covariance_cube = self.es.sigma ** 2 * np.asarray(self.es.sm.C)
 
         # --- posterior samples ---

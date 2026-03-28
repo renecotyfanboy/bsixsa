@@ -20,8 +20,8 @@ class NautilusBackend(Backend):
 
     name = "nautilus"
 
-    def __init__(self, *, solver: 'SIXSASolver', n_live_points: int = 1_000, **kwargs):
-        super().__init__(solver=solver)
+    def __init__(self, *, solver: 'SIXSASolver', trace:bool, n_live_points: int = 1_000):
+        super().__init__(solver=solver,  trace=trace)
 
         prior = Prior()
 
