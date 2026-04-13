@@ -7,7 +7,6 @@ import typing
 import numpy as np
 import pandas as pd
 from iminuit import Minuit
-from scipy.special import expit as sigmoid
 
 from . import register_backend
 from .abc import Backend
@@ -15,9 +14,6 @@ from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
-
-# Tiny floor to avoid log(0) in the logit transform
-_EPS = 1e-25
 
 
 @register_backend
@@ -37,27 +33,6 @@ class IminuitBackend(Backend):
         self.best_fit_unconstrained: np.ndarray | None = None
         self.covariance_unconstrained: np.ndarray | None = None
         self.minuit: Minuit | None = None
-
-    # ------------------------------------------------------------------
-    # Space transforms (same convention as Levenberg-Marquardt)
-    # ------------------------------------------------------------------
-
-    def _unconstrained_to_physical(self, unconstrained: np.ndarray) -> np.ndarray:
-        """Map unconstrained-space parameters to physical space."""
-        unit_cube = sigmoid(np.atleast_2d(unconstrained))
-        return self.solver.prior.from_unit_cube(unit_cube)
-
-    def _physical_to_unconstrained(self, physical: np.ndarray) -> np.ndarray:
-        """Map physical-space parameters to unconstrained space."""
-        unit_cube = self.solver.prior.to_unit_cube(
-            np.atleast_2d(physical)
-        ).ravel()
-        unit_cube = np.clip(unit_cube, _EPS, 1.0 - _EPS)
-        return np.log(unit_cube / (1.0 - unit_cube))
-
-    # ------------------------------------------------------------------
-    # Objective
-    # ------------------------------------------------------------------
 
     def _objective(self, unconstrained_params: np.ndarray) -> float:
         """C-statistic in unconstrained space (to minimise)."""

@@ -50,7 +50,7 @@ class UltranestBackend(Backend):
         self._run_kwargs = {"min_num_live_points": n_live_points}
 
     def _prior_transform(self, cube):
-        return self.solver.prior.from_unit_cube(cube)
+        return self._cube_to_physical(cube)
 
     def _likelihood(self, x):
         ll = self.solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)

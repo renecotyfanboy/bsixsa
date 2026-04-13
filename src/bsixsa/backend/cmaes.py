@@ -115,8 +115,8 @@ class CMAESBackend(Backend):
         # --- extract results ---
         self.best_fit_cube = np.asarray(self.es.result.xbest).ravel()
         self.best_fit_params = self._cube_to_physical(self.es.result.xbest).ravel()
-        #self.es.
-        self.covariance_cube = self.es.sigma ** 2 * np.asarray(self.es.sm.C)
+        D_scaled = self.es.sigma * self.es.sigma_vec.scaling * self.es.sm.D
+        self.covariance_cube = self.es.sm.B @ np.diag(D_scaled ** 2) @ self.es.sm.B.T
 
         # --- posterior samples ---
         n_posterior = 10_000

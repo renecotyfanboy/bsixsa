@@ -262,6 +262,212 @@ def plot_median_and_bands(
     return median, envelope
 
 
+def plot_data(
+    spectrum_index=1,
+    plot_model=True,
+    plot_components=True,
+    show_residuals=True,
+    x_lim=None,
+    y_lim=None,
+    figsize=(12, 6),
+    min_counts=None,
+    grouping=None,
+    legend=True,
+):
+    r"""Plot the observed spectrum and the currently loaded XSPEC model.
+
+    Useful for quick visual inspection during model exploration, without
+    running any inference.  The function reads the current XSPEC state
+    directly via :class:`~bsixsa.xspec.SpectrumState`.
+
+    Parameters:
+        spectrum_index (int, optional): 1-based XSPEC spectrum index.
+            Defaults to ``1``.
+        plot_model (bool, optional): If ``True``, overlay the current total
+            XSPEC model prediction. Defaults to ``True``.
+        plot_components (bool, optional): If ``True`` and *plot_model* is
+            ``True``, also draw each additive component separately (only when
+            more than one component is present). Defaults to ``True``.
+        show_residuals (bool, optional): If ``True``, add a residual panel
+            below the spectrum panel showing Pearson residuals
+            :math:`(D - M) / \sqrt{M}`.  When *plot_model* is ``False`` this
+            panel is automatically suppressed. Defaults to ``True``.
+        x_lim (tuple[float, float], optional): Energy bounds in keV.
+        y_lim (tuple[float, float], optional): Flux limits for the spectrum
+            panel y-axis.
+        figsize (tuple[float, float], optional): Figure size in inches.
+            Defaults to ``(12, 6)``.
+        min_counts (int, optional): Merge adjacent bins until each grouped bin
+            contains at least *min_counts* observed counts.  Mutually exclusive
+            with *grouping*.
+        grouping (int, optional): Merge every *grouping* adjacent bins into
+            one.  Mutually exclusive with *min_counts*.
+        legend (bool, optional): Whether to display the legend. Defaults to
+            ``True``.
+
+    Returns:
+        matplotlib.figure.Figure: Figure with the spectrum (and optionally
+            residual) panel(s).
+    """
+
+    if min_counts is not None and grouping is not None:
+        raise ValueError(
+            "min_counts and grouping are mutually exclusive; use one or the other."
+        )
+
+    Plot.xAxis = "keV"
+    state = SpectrumState(spectrum_index)
+
+    bin_edges_1d = state.bin_edges_1d
+    observed_counts = state.observed_counts
+
+    # Fetch model data once (avoids redundant XSPEC calls)
+    if plot_model:
+        total_model_counts = state.total_model_counts
+        model_counts = state.model_counts
+        component_counts = state.component_counts if plot_components else {}
+    else:
+        total_model_counts = None
+        model_counts = {}
+        component_counts = {}
+
+    # Compute bin group ids (if any rebinning is requested)
+    bin_ids = None
+    if min_counts is not None:
+        bin_ids = adaptive_bin_1d(observed_counts, min_counts)
+    elif grouping is not None:
+        n_bins = len(observed_counts)
+        bin_ids = np.arange(n_bins) // grouping
+
+    if bin_ids is not None:
+        bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
+        observed_counts = rebin_counts(observed_counts, bin_ids)
+        if total_model_counts is not None:
+            total_model_counts = rebin_counts(total_model_counts, bin_ids)
+        model_counts = {k: rebin_counts(v, bin_ids) for k, v in model_counts.items()}
+        component_counts = {k: rebin_counts(v, bin_ids) for k, v in component_counts.items()}
+
+    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
+    bin_width = np.diff(bin_edges, axis=0).squeeze()
+    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
+    denominator = bin_width
+
+    draw_residuals = show_residuals and plot_model
+
+    if draw_residuals:
+        fig, axs = plt.subplots(
+            nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
+        )
+        ax_spec = axs[0]
+        ax_res = axs[1]
+    else:
+        fig, ax_spec = plt.subplots(figsize=figsize)
+        axs = [ax_spec]
+
+    legend_names = []
+    legend_list = []
+
+    # Observed spectrum
+    error_bar = plot_poisson_error_bars(
+        bin_center, bin_edges, observed_counts, denominator, ax_spec, SPECTRUM_DATA_COLOR
+    )
+    legend_list.append(error_bar)
+    legend_names.append("Observed Spectrum")
+
+    if plot_model and total_model_counts is not None:
+        # Total model — single curve (no sampling uncertainty)
+        model_flux = total_model_counts / denominator
+        (line,) = ax_spec.stairs(
+            model_flux,
+            edges=bin_edges_1d,
+            color=SPECTRUM_COLOR,
+            alpha=alpha_median,
+            zorder=100,
+            linestyle="solid",
+        )
+        legend_list.append(line)
+        legend_names.append("Total model")
+
+        # Per-source model curves (only when more than one source)
+        colors = iter(COLOR_CYCLE[1:])
+        for model_name, counts in model_counts.items():
+            if len(model_counts) > 1:
+                color = next(colors)
+                (comp_line,) = ax_spec.stairs(
+                    counts / denominator,
+                    edges=bin_edges_1d,
+                    color=color,
+                    alpha=alpha_median,
+                    zorder=90,
+                    linestyle="dashed",
+                )
+                legend_list.append(comp_line)
+                legend_names.append(model_name)
+
+            # Additive components within this source
+            if plot_components:
+                hatches = itertools.cycle(['//', r'\\', '||', '--', '++', 'xx'])
+                for comp_name, comp_counts in component_counts.items():
+                    if comp_name.startswith(model_name + "_"):
+                        color = next(colors)
+                        (comp_line,) = ax_spec.stairs(
+                            comp_counts / denominator,
+                            edges=bin_edges_1d,
+                            color=color,
+                            alpha=alpha_median,
+                            zorder=80,
+                            linestyle="dotted",
+                        )
+                        ax_spec.stairs(
+                            comp_counts / denominator,
+                            edges=bin_edges_1d,
+                            baseline=0,
+                            fill=True,
+                            alpha=0.08,
+                            color=color,
+                            zorder=60,
+                            hatch=next(hatches),
+                            edgecolor=(1 / 3, 1 / 3, 1 / 3, 1),
+                        )
+                        legend_list.append(comp_line)
+                        legend_names.append(comp_name.lstrip("_"))
+
+        # Residuals panel
+        if draw_residuals:
+            safe_model = np.where(total_model_counts > 0, total_model_counts, 1.0)
+            residuals = (observed_counts - total_model_counts) / np.sqrt(safe_model)
+            ax_res.stairs(residuals, edges=bin_edges_1d, color=SPECTRUM_COLOR, alpha=alpha_median)
+            residual_extent = max(np.max(np.abs(residuals)) * 1.1, 3.2)
+            ax_res.set_ylim(-residual_extent, residual_extent)
+            ax_res.axhline(0, color="black", linestyle="--", alpha=0.5)
+            ax_res.axhline(-3, color="black", linestyle="--", alpha=0.5)
+            ax_res.axhline(3, color="black", linestyle="--", alpha=0.5)
+            ax_res.set_yticks([-3, 0, 3])
+            ax_res.set_ylabel("Residuals\n" + r"$\frac{D - M}{\sqrt{M}}$")
+            ax_res.set_xlabel("Energy [keV]")
+
+    if x_lim is None:
+        x_lim = (np.min(bin_edges_1d), np.max(bin_edges_1d))
+    axs[0].set_xlim(*x_lim)
+
+    if y_lim is not None:
+        ax_spec.set_ylim(*y_lim)
+
+    ax_spec.set_ylabel(
+        "Observed Spectrum\n" + r"[$\frac{\text{Counts}}{\text{keV} \cdot \text{s}}$]"
+    )
+    if not draw_residuals:
+        ax_spec.set_xlabel("Energy [keV]")
+
+    if legend:
+        ax_spec.legend(legend_list, legend_names, loc="upper right")
+
+    ax_spec.loglog()
+    fig.align_ylabels()
+
+    return fig
+
+
 def plot_predictive_coverage(
     solver,
     distribution="posterior",

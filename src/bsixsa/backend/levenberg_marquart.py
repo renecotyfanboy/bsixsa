@@ -4,7 +4,6 @@ import typing
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit as sigmoid
 from scipy.optimize import least_squares
 
 from .abc import Backend
@@ -13,10 +12,6 @@ from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
     from ..solver import SIXSASolver
-
-
-# Tiny floor to avoid log(0) and division by zero in Poisson deviance
-_EPS = 1e-25
 
 
 def covariance_from_jacobian(
@@ -92,19 +87,6 @@ class LevenbergMarquardtBackend(Backend):
             samples_unconstrained = np.tile(self.best_fit_unconstrained, (n, 1))
 
         return self._unconstrained_to_physical(samples_unconstrained)
-
-    def _unconstrained_to_physical(self, unconstrained: np.ndarray) -> np.ndarray:
-        """Map unconstrained-space parameters back to physical space (sigmoid then inverse cdf)."""
-        unit_cube = sigmoid(np.atleast_2d(unconstrained))
-        return self.solver.prior.from_unit_cube(unit_cube)
-
-    def _physical_to_unconstrained(self, physical: np.ndarray) -> np.ndarray:
-        """Map physical-space parameters to unconstrained space (logit than cdf)."""
-        unit_cube = self.solver.prior.to_unit_cube(
-            np.atleast_2d(physical)
-        ).ravel()
-        unit_cube = np.clip(unit_cube, _EPS, 1.0 - _EPS)
-        return np.log(unit_cube / (1.0 - unit_cube))
 
     def run(self, *, x0_physical: np.ndarray | None = None, init_from_prior: bool = False, **least_squares_kwargs) -> 'FitResults':
         """Run the Levenberg-Marquardt fit.
