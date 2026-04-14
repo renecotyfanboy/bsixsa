@@ -52,8 +52,6 @@ def iter_components(model: Model, additive_only: bool = False) -> Iterator[Compo
         if additive_only and "norm" not in component.parameterNames:
             continue
         yield component
-
-
 def iter_parameters(component: Component) -> Iterator[Parameter]:
     """Iterate over all parameters of a given xspec model component."""
 

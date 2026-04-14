@@ -1,11 +1,25 @@
 import os
-import xspec
+import sys
+from unittest.mock import MagicMock
+
 import numpy as np
+import pytest
 from pytest import fixture
+
+try:
+    import xspec
+except ModuleNotFoundError:  # pragma: no cover - depends on local HEASoft install
+    xspec = MagicMock()
+    sys.modules["xspec"] = xspec
+    XSPEC_AVAILABLE = False
+else:
+    XSPEC_AVAILABLE = True
 
 
 @fixture
 def xspec_config():
+    if not XSPEC_AVAILABLE:
+        pytest.skip("xspec is not available in this environment")
     xspec.AllData.clear()
     xspec.AllModels.clear()
     xspec.Xset.chatter = 0

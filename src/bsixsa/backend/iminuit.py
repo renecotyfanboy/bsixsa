@@ -10,6 +10,7 @@ from iminuit import Minuit
 
 from . import register_backend
 from .abc import Backend
+from .config import IminuitConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -26,9 +27,21 @@ class IminuitBackend(Backend):
     """
 
     name = "iminuit"
+    config_cls = IminuitConfig
 
-    def __init__(self, *, solver: SIXSASolver, trace: bool):
-        super().__init__(solver=solver,  trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: SIXSASolver,
+        config: IminuitConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_unconstrained: np.ndarray | None = None
         self.covariance_unconstrained: np.ndarray | None = None
@@ -50,30 +63,16 @@ class IminuitBackend(Backend):
     # Core API
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        *,
-        x0_physical: np.ndarray | None = None,
-        init_from_prior: bool = False,
-        run_hesse: bool = True,
-        **migrad_kwargs,
-    ) -> FitResults:
+    def run(self) -> FitResults:
         """Run MIGRAD optimisation.
-
-        Parameters:
-            x0_physical: Initial guess in physical parameter space.
-                Defaults to the prior median (0.5 in the unit cube).
-            init_from_prior: If ``True``, draw a random sample from the
-                prior and use it as the starting point (overrides
-                ``x0_physical``).
-            run_hesse: If ``True`` (default), run HESSE after MIGRAD to
-                refine the covariance estimate.
-            **migrad_kwargs: Extra keyword arguments forwarded to
-                :meth:`Minuit.migrad` (e.g. ``ncall``, ``iterate``).
         """
         from ..convenience import catchtime
 
         n_params = self.solver.num_parameters
+        x0_physical = self.config.x0_physical
+        init_from_prior = self.config.init_from_prior
+        run_hesse = self.config.run_hesse
+        migrad_kwargs = self.config.engine_kwargs.copy()
 
         # --- starting point ---
         if init_from_prior:

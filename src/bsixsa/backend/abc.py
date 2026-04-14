@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import numpy as np
+from pydantic import BaseModel
 from scipy.special import expit as sigmoid
 
 from .tracer import EvaluationTracer, DummyTracer
@@ -20,8 +21,17 @@ class Backend(ABC):
     """
 
     name: str  # registry key, e.g. "nessai"
+    config_cls: type[BaseModel] | None = None
 
-    def __init__(self, *, solver: SIXSASolver, trace=True, plot_every: int = 50, flush_every: int = 200, **kwargs):
+    def __init__(
+        self,
+        *,
+        solver: SIXSASolver,
+        trace=True,
+        plot_every: int = 50,
+        plot_step_percent: int = 10,
+        **kwargs,
+    ):
         self.solver = solver
 
         if trace:
@@ -29,14 +39,14 @@ class Backend(ABC):
                 output_dir=solver.outputfiles_basename,
                 parameter_names=solver.parameter_names,
                 plot_every=plot_every,
-                flush_every=flush_every,
+                plot_step_percent=plot_step_percent,
             )
         else:
             self.tracer = DummyTracer(
                 output_dir=solver.outputfiles_basename,
                 parameter_names=solver.parameter_names,
                 plot_every=plot_every,
-                flush_every=flush_every,
+                plot_step_percent=plot_step_percent,
             )
 
     def _cube_to_physical(self, cube: np.ndarray) -> np.ndarray:

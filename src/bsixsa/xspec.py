@@ -219,24 +219,20 @@ def parallel_folding(
     pool=None,
     return_kind="cstat",
 ):
-    """Evaluate folded XSPEC outputs for a batch of parameter vectors.
+    """Evaluate folded `xspec` outputs for a batch of parameter vectors.
 
     Parameters:
         params: Parameter vectors to evaluate.
-        indexes: XSPEC parameter indices associated with ``params``.
-        model_indexes: XSPEC model names associated with ``indexes``.
+        indexes: `xspec` parameter indices associated with `params`.
+        model_indexes: `xspec` model names associated with `indexes`.
         desc: Prefix for the progress-bar label.
         progress_bar: Whether to display a tqdm progress bar.
         pool: Optional process pool for parallel evaluation.
-        return_kind: One of ``"cstat"``, ``"full_model_counts"``, or
-            ``"models_and_components"``.
+        return_kind: One of `"cstat"`, `"full_model_counts"`, or
+            `"models_and_components"`.
 
     Returns:
-        Stacked outputs across all rows in ``params``. The ``"cstat"`` key is
-        always present. ``"total_model_counts"`` is included for
-        ``"full_model_counts"`` and ``"models_and_components"``.
-        ``"model_counts"`` and ``"component_counts"`` are included only for
-        ``"models_and_components"``.
+        Stacked outputs across all rows in `params`. The `"cstat"` key is always present. `"total_model_counts"` is included for `"full_model_counts"` and `"models_and_components"`. `"model_counts"` and `"component_counts"` are included only for `"models_and_components"`.
     """
 
     with tempfile.TemporaryDirectory(prefix="parallel_folding_") as tmp_dir:

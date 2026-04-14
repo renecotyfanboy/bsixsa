@@ -29,9 +29,22 @@ class CMAESBackend(Backend):
     """
 
     name = "cmaes"
-
-    def __init__(self, *, solver: SIXSASolver, trace: bool, sigma0: float = 0.25, **kwargs):
-        super().__init__(solver=solver, trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: SIXSASolver,
+        trace: bool,
+        plot_every: int = 50,
+        plot_step_percent: int = 10,
+        sigma0: float = 0.25,
+        **kwargs,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=trace,
+            plot_every=plot_every,
+            plot_step_percent=plot_step_percent,
+        )
         self.sigma0 = sigma0
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_cube: np.ndarray | None = None

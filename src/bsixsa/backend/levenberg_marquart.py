@@ -8,6 +8,7 @@ from scipy.optimize import least_squares
 
 from .abc import Backend
 from . import register_backend
+from .config import LevenbergMarquardtConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -67,9 +68,21 @@ class LevenbergMarquardtBackend(Backend):
     """
 
     name = "levenberg_marquardt"
+    config_cls = LevenbergMarquardtConfig
 
-    def __init__(self, *, solver: SIXSASolver, trace: bool):
-        super().__init__(solver=solver,  trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: SIXSASolver,
+        config: LevenbergMarquardtConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
         self.result = None
         self.best_fit_params = None
         self.best_fit_unconstrained = None
@@ -88,22 +101,16 @@ class LevenbergMarquardtBackend(Backend):
 
         return self._unconstrained_to_physical(samples_unconstrained)
 
-    def run(self, *, x0_physical: np.ndarray | None = None, init_from_prior: bool = False, **least_squares_kwargs) -> 'FitResults':
+    def run(self) -> 'FitResults':
         """Run the Levenberg-Marquardt fit.
-
-        Parameters:
-            x0_physical: Initial guess in physical parameter space. Defaults to
-                the prior median (0.5 in the unit cube).
-            init_from_prior: If ``True``, draw a random sample from the prior
-                and use it as the starting point (overrides ``x0_physical``).
-            **least_squares_kwargs: Extra keyword arguments forwarded to
-                ``scipy.optimize.least_squares`` (e.g. ``ftol``, ``xtol``,
-                ``max_nfev``).
         """
         from ..convenience import catchtime
 
         n_params = self.solver.num_parameters
         observed = self.solver.observed_spectrum.astype(np.float64)
+        x0_physical = self.config.x0_physical
+        init_from_prior = self.config.init_from_prior
+        least_squares_kwargs = self.config.engine_kwargs.copy()
 
         if init_from_prior:
             x0_physical = self.solver.prior.sample(size=1).ravel()

@@ -5,6 +5,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .abc import Backend
     from .cmaes import CMAESBackend
+    from .config import (
+        EmceeConfig,
+        IminuitConfig,
+        LevenbergMarquardtConfig,
+        NautilusConfig,
+        NessaiConfig,
+        TraceConfig,
+        UltranestConfig,
+    )
     from .emcee import EmceeBackend
     from .iminuit import IminuitBackend
     from .levenberg_marquart import LevenbergMarquardtBackend
@@ -19,16 +28,33 @@ __all__ = [
     "CMAESBackend",
     "EvaluationTracer",
     "EmceeBackend",
+    "EmceeConfig",
     "IminuitBackend",
+    "IminuitConfig",
     "LevenbergMarquardtBackend",
+    "LevenbergMarquardtConfig",
     "NautilusBackend",
+    "NautilusConfig",
     "NessaiBackend",
+    "NessaiConfig",
     "SIXSABackend",
+    "TraceConfig",
     "UltranestBackend",
+    "UltranestConfig",
     "BACKEND_REGISTRY",
     "get_backend_class",
     "register_backend",
 ]
+
+from .config import (
+    EmceeConfig,
+    IminuitConfig,
+    LevenbergMarquardtConfig,
+    NautilusConfig,
+    NessaiConfig,
+    TraceConfig,
+    UltranestConfig,
+)
 
 BACKEND_REGISTRY: dict[str, type[Backend]] = {}
 

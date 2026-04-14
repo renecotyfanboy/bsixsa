@@ -4,7 +4,6 @@ from collections import defaultdict
 import numpy as np
 import re
 from .convenience import XSilence
-from scipy.stats import loguniform, norm
 from xspec import AllModels
 from .convenience import iter_all_parameters
 
@@ -16,17 +15,63 @@ __all__ = [
 ]
 
 def uniform(low, high):
-    """
-    Simple wrapper around scipy.stats.uniform that returns a left-right defined distribution.
+    """Create a uniform prior on a finite interval.
+
+    Parameters:
+        low:
+            Lower bound of the interval.
+        high:
+            Upper bound of the interval.
+
+    Returns:
+        A SciPy ``uniform`` distribution defined on ``[low, high]``.
     """
     from scipy.stats import uniform
     return uniform(low, high-low)
+
+def loguniform(low, high):
+    """Create a log-uniform prior on a positive interval.
+
+    Parameters:
+        low:
+            Strictly positive lower bound.
+        high:
+            Upper bound.
+
+    Returns:
+        A SciPy ``loguniform`` distribution defined on ``[low, high]``.
+    """
+    from scipy.stats import loguniform
+    return loguniform(low, high)
+
+def norm(loc, scale, low, high):
+    """Create a truncated Gaussian prior.
+
+    Parameters:
+        loc:
+            Mean of the underlying Gaussian distribution.
+        scale:
+            Standard deviation of the underlying Gaussian distribution.
+        low:
+            Lower truncation bound, expressed in SciPy ``truncnorm``
+            coordinates.
+        high:
+            Upper truncation bound, expressed in SciPy ``truncnorm``
+            coordinates.
+
+    Returns:
+        A SciPy ``truncnorm`` distribution with the requested location,
+        scale, and truncation limits.
+    """
+    from scipy.stats import truncnorm
+    return truncnorm(low, high, loc=loc, scale=scale)
 
 
 class MultipleIndependent:
     def __init__(self, dists):
         self.dists = list(dists)
         self.ndim = len(self.dists)
+        self.bounds = [dist.support() for dist in self.dists]
 
     def sample(self, size=1, random_state=None):
         rng = np.random.default_rng(random_state)
@@ -59,7 +104,34 @@ class MultipleIndependent:
         return lp[0] if x.ndim == 1 else lp
 
 
-def build_prior(define_prior, return_bounds=False):
+def build_prior(define_prior):
+    """Build the joint prior from a list of XSPEC prior specifications.
+
+    For a **single-model** fit, each item must be a 3-tuple:
+
+    `(component_name, parameter_name, distribution)`
+
+    For a **multi-model** fit, each item must be a 4-tuple:
+
+    `(model_name, component_name, parameter_name, distribution)`
+
+    `distribution` can be and must behave like a SciPy continuous
+    distribution and provide at least `support()`, `ppf()`,
+    `cdf()`, `rvs()`, and `logpdf()`.
+    Component and parameter names must match the names exposed by `xspec`.
+    Repeated components can be addressed with suffixed names such as `powerlaw_3`.
+
+    Parameters:
+        define_prior:
+            Sequence describing one prior per free XSPEC parameter.
+
+    Returns:
+        `(prior, parameters_index, model_index)`
+
+        `prior` is a [`MultipleIndependent`][bsixsa.priors.MultipleIndependent]
+        distribution over all unfrozen, unlinked fitted parameters. Its
+        per-parameter support bounds are available on `prior.bounds`.
+    """
     model_list = [AllModels(1, modName=name) for name in AllModels.sources.values()]
 
     is_single_model_prior = all(len(definition) == 3 for definition in define_prior)
@@ -105,9 +177,6 @@ def build_prior(define_prior, return_bounds=False):
     list_of_prior = []
     model_index = []
     parameters_index = []
-    model_names = []
-    bounds = []
-
     for par in iter_all_parameters():
 
         prior = None
@@ -127,8 +196,6 @@ def build_prior(define_prior, return_bounds=False):
             parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},0.1,{low},{low},{high},{high}"
 
             list_of_prior.append(prior)
-            model_names.append(par.model.name)
-            bounds.append((low, high))
             parameters_index.append(par.parameter.index)
             model_index.append(par.model.name)
 
@@ -139,11 +206,4 @@ def build_prior(define_prior, return_bounds=False):
         AllModels.setPars(*parameter_to_set)
 
     prior = MultipleIndependent(list_of_prior)
-
-    if not return_bounds:
-
-        return prior, parameters_index, model_index
-
-    else:
-
-        return prior, parameters_index, model_index, bounds
+    return prior, parameters_index, model_index

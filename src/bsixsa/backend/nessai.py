@@ -10,6 +10,7 @@ from nessai.posterior import draw_posterior_samples
 from ..solver import FitResults
 from .abc import Backend
 from . import register_backend
+from .config import NessaiConfig
 import warnings
 
 if typing.TYPE_CHECKING:
@@ -22,7 +23,10 @@ class ModelFromSolver(NessaiModel):
         self.solver = solver
         self._tracer = tracer
         self.names = solver.parameter_names
-        self.bounds = {self.names[idx]: bound for idx, bound in zip(range(len(self.names)), solver.bounds)}
+        self.bounds = {
+            self.names[idx]: bound
+            for idx, bound in enumerate(solver.prior.bounds)
+        }
 
     def to_array(self, x):
         new_array = live_points_to_array(x, names=self.names, copy=True)
@@ -65,22 +69,35 @@ class ModelFromSolver(NessaiModel):
 class NessaiBackend(Backend):
 
     name = "nessai"
+    config_cls = NessaiConfig
 
-    def __init__(self, *, solver: 'SIXSASolver', trace: bool, n_live_points: int = 1_000, **kwargs):
-        super().__init__(solver=solver, trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: 'SIXSASolver',
+        config: NessaiConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
 
-        kwargs.setdefault("importance_nested_sampler", True)
+        flow_kwargs = self.config.engine_kwargs.copy()
+        flow_kwargs.setdefault("importance_nested_sampler", True)
         self.model = ModelFromSolver(self.solver, self.tracer)
-        self.n_live_points = n_live_points
+        self.n_live_points = self.config.num_live_points
 
         nessai_output = os.path.join(self.solver.outputfiles_basename, "nessai_outputs")
         os.makedirs(nessai_output, exist_ok=True)
 
         self._flow_sampler = FlowSampler(
             self.model,
-            nlive=n_live_points,
+            nlive=self.config.num_live_points,
             output=nessai_output,
-            **kwargs
+            **flow_kwargs
         )
 
     def run(self, **kwargs) -> 'FitResults':

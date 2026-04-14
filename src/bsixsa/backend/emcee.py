@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import register_backend
 from .abc import Backend
+from .config import EmceeConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -20,9 +21,21 @@ if typing.TYPE_CHECKING:
 class EmceeBackend(Backend):
 
     name = "emcee"
+    config_cls = EmceeConfig
 
-    def __init__(self, *, solver: SIXSASolver, trace: bool):
-        super().__init__(solver=solver,  trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: SIXSASolver,
+        config: EmceeConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
 
 
     def log_prob(self, parameters):
@@ -41,15 +54,16 @@ class EmceeBackend(Backend):
 
         return log_prob
 
-    def run(
-        self,
-        num_warmup=100, num_samples=10000, num_walkers=32,
-        x0_physical: np.ndarray | None = None,
-        init_from_prior: bool = False,
-        init_spread = 1e-3
-    ) -> FitResults:
+    def run(self) -> FitResults:
 
         from ..convenience import catchtime
+
+        num_warmup = self.config.num_warmup
+        num_samples = self.config.num_samples
+        num_walkers = self.config.num_walkers
+        x0_physical = self.config.x0_physical
+        init_from_prior = self.config.init_from_prior
+        init_spread = self.config.init_spread
 
         self.sampler = emcee.EnsembleSampler(
             num_walkers,

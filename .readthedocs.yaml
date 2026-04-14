@@ -12,10 +12,10 @@ build:
 
   jobs:
      # We recommend using a requirements file for reproducible builds.
-     # This is just a quick example to get started.
-     # https://docs.readthedocs.io/page/guides/reproducible-builds.html
-     install:
-       - pip install zensical mkdocstrings-python
+      # This is just a quick example to get started.
+      # https://docs.readthedocs.io/page/guides/reproducible-builds.html
+      install:
+        - pip install zensical mkdocstrings-python griffe-pydantic
      build:
        html:
          - zensical build

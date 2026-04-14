@@ -36,9 +36,9 @@ def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
     where $\mathcal{M}_i > 0$
 
     Parameters:
-        observed: Observed counts, shape ``(n_bins,)``.
-        model: Predicted model counts, shape ``(n_bins,)`` or
-            ``(n_samples, n_bins)``.
+        observed: Observed counts, shape `(n_bins,)`.
+        model: Predicted model counts, shape `(n_bins,)` or
+            `(n_samples, n_bins)`.
 
     Returns:
         Per-bin log-likelihood with the same shape as *model*.
@@ -51,7 +51,7 @@ def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
 
 
 def _validate_finite(parameters, parameter_names):
-    """Raise ``ValueError`` if *parameters* contains NaN or Inf values."""
+    """Raise `ValueError` if *parameters* contains NaN or Inf values."""
     bad_mask = ~np.isfinite(parameters)
     if bad_mask.any():
         bad_params = set()
@@ -68,6 +68,7 @@ def _validate_finite(parameters, parameter_names):
 def _split_kwargs(cls, kwargs):
     """Separate constructor kwargs from run kwargs by inspecting __init__."""
     import inspect
+
     init_params = inspect.signature(cls.__init__).parameters
     init_kwargs = {}
     run_kwargs = {}
@@ -79,8 +80,40 @@ def _split_kwargs(cls, kwargs):
     return init_kwargs, run_kwargs
 
 
+def _prepare_output_directory(outputfiles_basename: str, *, overwrite: bool) -> str:
+    normalized_output_dir = os.path.normpath(outputfiles_basename)
+
+    if not os.path.exists(normalized_output_dir):
+        os.makedirs(normalized_output_dir)
+    else:
+        if not os.path.isdir(normalized_output_dir):
+            raise ValueError(
+                f"Output path '{outputfiles_basename}' exists and is not a directory."
+            )
+
+        existing_entries = os.listdir(normalized_output_dir)
+        if existing_entries:
+            if not overwrite:
+                raise FileExistsError(
+                    f"Output directory '{normalized_output_dir}' is not empty. "
+                    "Pass overwrite=True to clear it."
+                )
+
+            for entry in existing_entries:
+                entry_path = os.path.join(normalized_output_dir, entry)
+                if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+                    shutil.rmtree(entry_path)
+                else:
+                    os.remove(entry_path)
+
+    if not normalized_output_dir.endswith(os.sep):
+        normalized_output_dir = normalized_output_dir + os.sep
+
+    return normalized_output_dir
+
+
 def set_parameters(values, indexes, model_indexes):
-    """Update the active XSPEC parameters using transformed values.
+    """Update the active `xspec` parameters using transformed values.
 
     Parameters:
         values: Parameter values in the physical space.
@@ -110,25 +143,25 @@ class SIXSASolver(object):
     ):
         r"""Initialise the Bayesian X-ray spectral analysis solver.
 
-        Reads the currently loaded XSPEC model, builds the prior
+        Reads the currently loaded `xspec` model, builds the prior
         distribution from *prior*, and prepares a multiprocessing pool
         for parallel likelihood evaluations.
 
         Parameters:
             prior: Prior specification forwarded to
-                ``build_prior``.  Accepts the same formats as
-                :func:`~bsixsa.priors.build_prior`.
+                [`build_prior`][bsixsa.priors.build_prior].  Accepts the same formats as
+                [`build_prior`][bsixsa.priors.build_prior].
             outputfiles_basename: Directory where backend output files
                 (chains, checkpoints, traces) are stored.  Created
                 automatically if it does not exist.
-            overwrite: If ``True``, clear *outputfiles_basename* when it
-                already contains files.  Defaults to ``False``.
+            overwrite: If `True`, clear *outputfiles_basename* when it
+                already contains files.  Defaults to `False`.
             n_jobs: Number of worker processes for the multiprocessing
-                pool.  Defaults to ``os.cpu_count()``.
-            trace: If ``True``, enable run-time trace logging in the
-                backend.  Defaults to ``True``.
+                pool.  Defaults to [`cpu_count()`][os.cpu_count].
+            trace: If `True`, enable run-time trace logging in the
+                backend.  Defaults to `True`.
             backend: Name of the backend to use
-                (e.g. ``"nessai"``).  Defaults to ``"nessai"``.
+                (e.g. `"nessai"`).  Defaults to `"nessai"`.
         """
 
         if xspec.AllData.nSpectra < 1:
@@ -137,7 +170,12 @@ class SIXSASolver(object):
         if len(xspec.AllModels.sources) < 1:
             raise ValueError("No model loaded in XSPEC")
 
-        prior, indexes, model_indexes, bounds = build_prior(prior, return_bounds=True)
+        self.outputfiles_basename = _prepare_output_directory(
+            outputfiles_basename,
+            overwrite=overwrite,
+        )
+
+        prior, indexes, model_indexes = build_prior(prior)
 
         self.indexes = indexes
         self.model_indexes = model_indexes
@@ -145,45 +183,12 @@ class SIXSASolver(object):
         self.nb_models = len(sources_models)
         self.prior = prior
         self.distributions = {"prior": prior}
-        self.bounds = bounds
         self.pool = multiprocessing.Pool(processes=n_jobs)
         self.posterior_samples = None
         self.backend_name: str = backend
         self.backend = None
         self.fit_result: FitResults | None = None
         self.trace = trace
-
-        normalized_output_dir = os.path.normpath(outputfiles_basename)
-
-        if not os.path.exists(normalized_output_dir):
-            os.makedirs(normalized_output_dir)
-
-        else:
-            if not os.path.isdir(normalized_output_dir):
-                raise ValueError(
-                    f"Output path '{outputfiles_basename}' exists and is not a directory."
-                )
-
-            existing_entries = os.listdir(normalized_output_dir)
-            if existing_entries:
-                if not overwrite:
-                    raise FileExistsError(
-                        f"Output directory '{normalized_output_dir}' is not empty. "
-                        "Pass overwrite=True to clear it."
-                    )
-
-                for entry in existing_entries:
-                    entry_path = os.path.join(normalized_output_dir, entry)
-                    if os.path.isdir(entry_path) and not os.path.islink(entry_path):
-                        shutil.rmtree(entry_path)
-                    else:
-                        os.remove(entry_path)
-
-        if not normalized_output_dir.endswith(os.sep):
-            normalized_output_dir = normalized_output_dir + os.sep
-
-        outputfiles_basename = normalized_output_dir
-        self.outputfiles_basename = outputfiles_basename
 
     @property
     def num_parameters(self):
@@ -208,7 +213,7 @@ class SIXSASolver(object):
         Parameters:
             n_samples: Number of draws to generate.
             distribution_name: Key of the distribution in
-                ``self.distributions``. Defaults to ``"prior"``.
+                `self.distributions`. Defaults to `"prior"`.
 
         Returns:
             Raw samples returned by the selected distribution.
@@ -219,15 +224,15 @@ class SIXSASolver(object):
         return theta
 
     def simulate(self, parameters, return_kind="full_model_counts", progress_bar=True):
-        """Fold parameters through XSPEC and stack simulation outputs.
+        """Fold parameters through `xspec` and stack simulation outputs.
 
         Parameters:
             parameters: Array-like batch of parameter vectors.
-            return_kind: One of ``"cstat"``, ``"full_model_counts"``, or
-                ``"models_and_components"``.
+            return_kind: One of `"cstat"`, `"full_model_counts"`, or
+                `"models_and_components"`.
 
         Returns:
-            Stacked outputs returned by ``parallel_folding``.
+            Stacked outputs returned by [`parallel_folding`][bsixsa.xspec.parallel_folding].
 
         Raises:
             ValueError: If any parameter values are NaN or Inf.
@@ -423,15 +428,64 @@ class SIXSASolver(object):
 
         return plot_predictive_coverage(self, distribution=distribution, **kwargs)
 
-    def run(self, *args, **kwargs) -> FitResults:
+    def run(self, *args, config=None, **kwargs) -> FitResults:
         from .backend import get_backend_class
+        from .backend.config import EmceeConfig
 
-        backend_cls = get_backend_class(self.backend_name)
-        init_kwargs, run_kwargs = _split_kwargs(backend_cls, kwargs)
+        if config is not None and not hasattr(config, "backend_name"):
+            raise TypeError("`config` must define a backend_name.")
 
-        self.backend = backend_cls(solver=self, trace=self.trace, **init_kwargs)
+        selected_backend_name = config.backend_name if config is not None else self.backend_name
+        backend_cls = get_backend_class(selected_backend_name)
 
-        self.fit_result = self.backend.run(*args, **run_kwargs)
+        if config is not None and (args or kwargs):
+            raise TypeError(
+                "Pass backend options via `config=...`; legacy `solver.run(...)` "
+                "kwargs are no longer supported."
+            )
+
+        if config is None:
+            if backend_cls.config_cls is not None:
+                raise TypeError(
+                    f"Backend '{self.backend_name}' requires an explicit `config=...` object."
+                )
+            init_kwargs, run_kwargs = _split_kwargs(backend_cls, kwargs)
+            self.backend = backend_cls(solver=self, trace=self.trace, **init_kwargs)
+            self.fit_result = self.backend.run(*args, **run_kwargs)
+            self.posterior_samples = self.fit_result.posterior_samples
+            self.distributions["posterior"] = self.backend
+            self.backend.tracer.plot_progress()
+            self.backend.tracer.save()
+            return self.fit_result
+        else:
+            backend_config = config
+            self.backend_name = backend_config.backend_name
+
+        expected_config_cls = backend_cls.config_cls
+        if expected_config_cls is None:
+            raise TypeError(f"Backend '{backend_cls.name}' does not accept a `config` object.")
+        if expected_config_cls is not None and not isinstance(backend_config, expected_config_cls):
+            raise TypeError(
+                f"`config` must be an instance of {expected_config_cls.__name__} for backend "
+                f"'{backend_cls.name}'."
+            )
+
+        if hasattr(backend_config, "x0_physical") and backend_config.x0_physical is not None:
+            if backend_config.x0_physical.size != self.num_parameters:
+                raise ValueError(
+                    "`x0_physical` must have one value per free parameter "
+                    f"({self.num_parameters} expected, got {backend_config.x0_physical.size})."
+                )
+
+        if isinstance(backend_config, EmceeConfig):
+            if backend_config.num_walkers < 2 * self.num_parameters:
+                raise ValueError(
+                    "`num_walkers` must be at least twice the number of free "
+                    f"parameters ({2 * self.num_parameters} minimum)."
+                )
+
+        self.backend = backend_cls(solver=self, config=backend_config)
+        self.fit_result = self.backend.run()
         self.posterior_samples = self.fit_result.posterior_samples
         self.distributions["posterior"] = self.backend
 

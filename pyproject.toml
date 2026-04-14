@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "renecotyfanboy", email = "sdupourque@irap.omp.eu" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "arviz<1.0.0",
     "astropy>=7.2.0",
@@ -15,14 +15,12 @@ dependencies = [
     "cma>=4.0.0",
     "cmasher>=1.9.2",
     "dill>=0.3.9",
-    "iminuit>=2.0.0",
     "matplotlib>=3.10.1",
     "numpy>=1.26.4",
     "pathos>=0.3.3",
-    "sbi>=0.25.0",
+    "pydantic>=2.12.5",
     "scipy>0.16",
     "seaborn>=0.13.2",
-    "torch>=2.5.1",
     "tqdm>=4.67.1",
 ]
 
@@ -33,6 +31,7 @@ explicit = true
 
 [dependency-groups]
 doc = [
+    "griffe-pydantic",
     "mkdocstrings-python>=2.0.3",
     "zensical>=0.0.28",
 ]

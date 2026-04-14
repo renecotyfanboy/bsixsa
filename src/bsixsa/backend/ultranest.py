@@ -10,6 +10,7 @@ import ultranest.calibrator
 from ..convenience import iter_thawn_parameters
 from .abc import Backend
 from . import register_backend
+from .config import UltranestConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -20,9 +21,21 @@ if typing.TYPE_CHECKING:
 class UltranestBackend(Backend):
 
     name = "ultranest"
+    config_cls = UltranestConfig
 
-    def __init__(self, *, solver: 'SIXSASolver', trace: bool, n_live_points: int = 1_000, resume=True, step_sampler=False, **kwargs):
-        super().__init__(solver=solver, trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: 'SIXSASolver',
+        config: UltranestConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
 
         ultranest_output = os.path.join(self.solver.outputfiles_basename, "ultranest_outputs")
         os.makedirs(ultranest_output, exist_ok=True)
@@ -33,10 +46,10 @@ class UltranestBackend(Backend):
             transform=lambda cube: self._prior_transform(cube),
             log_dir=ultranest_output,
             vectorized=True,
-            resume=resume
+            resume=self.config.resume
         )
 
-        if step_sampler:
+        if self.config.use_step_sampler:
             popsize = 100
             nsteps = 50
             self._reactive_sampler.stepsampler = ultranest.popstepsampler.PopulationSimpleSliceSampler(
@@ -47,7 +60,7 @@ class UltranestBackend(Backend):
             )
 
         self._results = None
-        self._run_kwargs = {"min_num_live_points": n_live_points}
+        self._run_kwargs = {"min_num_live_points": self.config.num_live_points}
 
     def _prior_transform(self, cube):
         return self._cube_to_physical(cube)

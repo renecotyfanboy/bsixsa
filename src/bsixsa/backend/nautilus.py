@@ -8,6 +8,7 @@ from nautilus import Prior, Sampler as NestedSampler
 from ..convenience import iter_thawn_parameters
 from .abc import Backend
 from . import register_backend
+from .config import NautilusConfig
 from ..solver import FitResults
 
 
@@ -19,16 +20,28 @@ if typing.TYPE_CHECKING:
 class NautilusBackend(Backend):
 
     name = "nautilus"
+    config_cls = NautilusConfig
 
-    def __init__(self, *, solver: 'SIXSASolver', trace:bool, n_live_points: int = 1_000):
-        super().__init__(solver=solver,  trace=trace)
+    def __init__(
+        self,
+        *,
+        solver: 'SIXSASolver',
+        config: NautilusConfig,
+    ):
+        super().__init__(
+            solver=solver,
+            trace=solver.trace if config.trace is None else config.trace,
+            plot_every=config.plot_every,
+            plot_step_percent=config.plot_step_percent,
+        )
+        self.config = config
 
         prior = Prior()
 
         for par, dist in zip(iter_thawn_parameters(), self.solver.prior.dists):
             prior.add_parameter(par.name, dist)
 
-        self.n_live_points = n_live_points
+        self.n_live_points = config.num_live_points
 
         def likelihood(x):
             ll = solver.log_likelihood_fn(x, None, progress_bar=False, no_pool=False)
@@ -37,9 +50,10 @@ class NautilusBackend(Backend):
 
         self._nested_sampler = NestedSampler(
             prior, likelihood,
-            n_live=n_live_points,
+            n_live=config.num_live_points,
             vectorized=True,
             pass_dict=False,
+            n_batch=1_000,
             n_networks=os.cpu_count(),
             pool=(None, os.cpu_count())
         )

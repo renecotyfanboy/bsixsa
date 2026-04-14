@@ -55,8 +55,11 @@ nav = [
     ]},
     { "Reference" = [
         {"Solver" = "reference/solver.md"},
+        {"Priors" = "reference/priors.md"},
         {"Backend" = "reference/backend.md"},
+        {"Config" = "reference/config.md"},
         {"Plotter" = "reference/plotter.md"},
+        {"xspec" = "reference/xspec.md"},
     ]},
     { "Doc building" = [
         "doc_building/index.md",
@@ -348,6 +351,9 @@ paths = ["src"]
 
 [project.plugins.mkdocstrings.handlers.python.options]
 docstring_style = "google"
+extensions = [
+    { griffe_pydantic = { schema = false } },
+]
 inherited_members = true
 show_source = false
 show_symbol_type_toc = true
