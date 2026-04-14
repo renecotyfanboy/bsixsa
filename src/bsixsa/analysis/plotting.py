@@ -315,7 +315,6 @@ def plot_data(
             "min_counts and grouping are mutually exclusive; use one or the other."
         )
 
-    Plot.xAxis = "keV"
     state = SpectrumState(spectrum_index)
 
     bin_edges_1d = state.bin_edges_1d
@@ -561,7 +560,6 @@ def plot_predictive_coverage(
             "min_counts and grouping are mutually exclusive; use one or the other."
         )
 
-    Plot.xAxis = "keV"
     state = SpectrumState(1)
 
     dist = solver.distributions[distribution]
@@ -667,7 +665,7 @@ def plot_predictive_coverage(
             )
             * solver._backratio
         )
-    
+
         total += background
     """
 

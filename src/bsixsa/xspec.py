@@ -58,6 +58,7 @@ class SpectrumState:
     @property
     def component_counts(self) -> dict[str, np.ndarray]:
 
+        xspec.Plot.device = "/null"
         xspec.Plot.add = True
         xspec.Plot("counts")
 
@@ -66,16 +67,22 @@ class SpectrumState:
 
         for model_name in xspec.AllModels.sources.values():
             model = xspec.AllModels(1, model_name)
-            n_add_components = sum(1 for _ in iter_components(model, additive_only=True))
+            n_add_components = sum(
+                1 for _ in iter_components(model, additive_only=True)
+            )
 
             # There should be strictly more than one component for XSPEC to register their values
             if n_add_components > 1:
-                for i, component in enumerate(iter_components(model, additive_only=True)):
+                for i, component in enumerate(
+                        iter_components(model, additive_only=True)
+                ):
                     component_counts[f"{model_name}_{component.name}"] = np.asarray(
-                        xspec.Plot.addComp(total_add_idx))
+                        xspec.Plot.addComp(total_add_idx)
+                    )
                     total_add_idx += 1
 
         return component_counts
+
 
     @property
     def model_counts(self) -> dict[str, np.ndarray]:
