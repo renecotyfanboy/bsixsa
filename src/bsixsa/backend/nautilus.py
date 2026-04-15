@@ -8,7 +8,7 @@ from nautilus import Prior, Sampler as NestedSampler
 from ..convenience import iter_thawn_parameters
 from .abc import Backend
 from . import register_backend
-from .config import NautilusConfig
+from .config import Nautilus
 from ..solver import FitResults
 
 
@@ -20,21 +20,15 @@ if typing.TYPE_CHECKING:
 class NautilusBackend(Backend):
 
     name = "nautilus"
-    config_cls = NautilusConfig
+    config_cls = Nautilus
 
     def __init__(
         self,
         *,
         solver: 'SIXSASolver',
-        config: NautilusConfig,
+        config: Nautilus,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
 
         prior = Prior()
 
@@ -53,7 +47,7 @@ class NautilusBackend(Backend):
             n_live=config.num_live_points,
             vectorized=True,
             pass_dict=False,
-            n_batch=1_000,
+            n_batch=config.n_batch,
             n_networks=os.cpu_count(),
             pool=(None, os.cpu_count())
         )

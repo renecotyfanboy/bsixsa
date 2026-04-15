@@ -2,10 +2,13 @@ from __future__ import annotations
 
 """Pydantic-backed configuration models for bsixsa backends."""
 
-from typing import Annotated, Any, ClassVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from ..solver import SIXSASolver
 
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
@@ -17,15 +20,16 @@ MODEL_CONFIG = ConfigDict(
 )
 
 
-class TraceConfig(BaseModel):
-    """Shared tracing options for backend config models."""
+class BackendConfig(BaseModel):
+    """Backend config models with shared tracing options."""
 
     model_config = MODEL_CONFIG
 
-    trace: StrictBool | None = Field(
-        default=None,
-        description="Override the solver trace flag. Use None to inherit solver.trace.",
+    trace: StrictBool = Field(
+        default=True,
+        description="Whether to actively trace the run or not.",
     )
+
     plot_every: PositiveInt = Field(
         default=50,
         description=(
@@ -41,19 +45,54 @@ class TraceConfig(BaseModel):
         ),
     )
 
+    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+        """Validate solver-dependent config constraints."""
 
-class NautilusConfig(TraceConfig):
+    def create_tracer(
+        self,
+        *,
+        output_dir: str,
+        parameter_names: list[str],
+    ):
+        from .tracer import DummyTracer, EvaluationTracer
+
+        tracer_cls = EvaluationTracer if self.trace else DummyTracer
+        return tracer_cls(
+            output_dir=output_dir,
+            parameter_names=parameter_names,
+            plot_every=self.plot_every,
+            plot_step_percent=self.plot_step_percent,
+        )
+
+
+def _validate_x0_length_for_solver(
+    x0_physical: np.ndarray | None,
+    solver: "SIXSASolver",
+) -> None:
+    if x0_physical is not None and x0_physical.size != solver.num_parameters:
+        raise ValueError(
+            "`x0_physical` must have one value per free parameter "
+            f"({solver.num_parameters} expected, got {x0_physical.size})."
+        )
+
+
+class Nautilus(BackendConfig):
     """Configuration for :class:`bsixsa.backend.nautilus.NautilusBackend`."""
 
     backend_name: ClassVar[str] = "nautilus"
 
     num_live_points: PositiveInt = Field(
-        default=1_000,
+        default=3_000,
         description="Number of live points used by the nested sampler.",
     )
 
+    n_batch: PositiveInt = Field(
+        default=100,
+        description="Minimal number of likelihood evaluation performed at once.",
+    )
 
-class NessaiConfig(TraceConfig):
+
+class Nessai(BackendConfig):
     """Configuration for :class:`bsixsa.backend.nessai.NessaiBackend`."""
 
     backend_name: ClassVar[str] = "nessai"
@@ -64,7 +103,7 @@ class NessaiConfig(TraceConfig):
     }
 
     num_live_points: PositiveInt = Field(
-        default=1_000,
+        default=3_000,
         description="Number of live points used by the nested sampler.",
     )
     engine_kwargs: dict[str, Any] = Field(
@@ -77,7 +116,7 @@ class NessaiConfig(TraceConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_engine_key_conflicts(self) -> NessaiConfig:
+    def _validate_engine_key_conflicts(self) -> Nessai:
         conflicts = sorted(self._protected_engine_keys.intersection(self.engine_kwargs))
         if conflicts:
             raise ValueError(
@@ -87,7 +126,7 @@ class NessaiConfig(TraceConfig):
         return self
 
 
-class UltranestConfig(TraceConfig):
+class Ultranest(BackendConfig):
     """Configuration for :class:`bsixsa.backend.ultranest.UltranestBackend`."""
 
     backend_name: ClassVar[str] = "ultranest"
@@ -106,7 +145,7 @@ class UltranestConfig(TraceConfig):
     )
 
 
-class IminuitConfig(TraceConfig):
+class Iminuit(BackendConfig):
     """Configuration for :class:`bsixsa.backend.iminuit.IminuitBackend`."""
 
     backend_name: ClassVar[str] = "iminuit"
@@ -147,15 +186,18 @@ class IminuitConfig(TraceConfig):
         return vector
 
     @model_validator(mode="after")
-    def _validate_initialisation_strategy(self) -> IminuitConfig:
+    def _validate_initialisation_strategy(self) -> Iminuit:
         if self.x0_physical is not None and self.init_from_prior:
             raise ValueError(
                 "`x0_physical` and `init_from_prior=True` are mutually exclusive."
             )
         return self
 
+    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+        _validate_x0_length_for_solver(self.x0_physical, solver)
 
-class LevenbergMarquardtConfig(TraceConfig):
+
+class LevenbergMarquardt(BackendConfig):
     """Configuration for Levenberg-Marquardt optimisation."""
 
     backend_name: ClassVar[str] = "levenberg_marquardt"
@@ -192,15 +234,18 @@ class LevenbergMarquardtConfig(TraceConfig):
         return vector
 
     @model_validator(mode="after")
-    def _validate_initialisation_strategy(self) -> LevenbergMarquardtConfig:
+    def _validate_initialisation_strategy(self) -> LevenbergMarquardt:
         if self.x0_physical is not None and self.init_from_prior:
             raise ValueError(
                 "`x0_physical` and `init_from_prior=True` are mutually exclusive."
             )
         return self
 
+    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+        _validate_x0_length_for_solver(self.x0_physical, solver)
 
-class EmceeConfig(TraceConfig):
+
+class Emcee(BackendConfig):
     """Configuration for :class:`bsixsa.backend.emcee.EmceeBackend`."""
 
     backend_name: ClassVar[str] = "emcee"
@@ -252,7 +297,7 @@ class EmceeConfig(TraceConfig):
         return vector
 
     @model_validator(mode="after")
-    def _validate_initialisation_strategy(self) -> EmceeConfig:
+    def _validate_initialisation_strategy(self) -> Emcee:
         if self.x0_physical is not None and self.init_from_prior:
             raise ValueError(
                 "`x0_physical` and `init_from_prior=True` are mutually exclusive."
@@ -262,3 +307,21 @@ class EmceeConfig(TraceConfig):
                 "EmceeConfig requires either `x0_physical` or `init_from_prior=True`."
             )
         return self
+
+    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+        _validate_x0_length_for_solver(self.x0_physical, solver)
+        if self.num_walkers < 2 * solver.num_parameters:
+            raise ValueError(
+                "`num_walkers` must be at least twice the number of free "
+                f"parameters ({2 * solver.num_parameters} minimum)."
+            )
+
+
+Backend = (
+        Nautilus
+        | Nessai
+        | Ultranest
+        | Iminuit
+        | LevenbergMarquardt
+        | Emcee
+)

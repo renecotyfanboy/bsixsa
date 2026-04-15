@@ -7,10 +7,9 @@ import numpy as np
 from pydantic import BaseModel
 from scipy.special import expit as sigmoid
 
-from .tracer import EvaluationTracer, DummyTracer
-
 if TYPE_CHECKING:
     from ..solver import FitResults, SIXSASolver
+    from .config import BackendConfig
 
 
 class Backend(ABC):
@@ -27,27 +26,31 @@ class Backend(ABC):
         self,
         *,
         solver: SIXSASolver,
-        trace=True,
-        plot_every: int = 50,
-        plot_step_percent: int = 10,
+        config: BackendConfig,
         **kwargs,
     ):
-        self.solver = solver
 
-        if trace:
-            self.tracer = EvaluationTracer(
-                output_dir=solver.outputfiles_basename,
-                parameter_names=solver.parameter_names,
-                plot_every=plot_every,
-                plot_step_percent=plot_step_percent,
+        self.validate_config(solver=solver, config=config)
+        self.solver = solver
+        self.config = config
+        self.tracer = config.create_tracer(
+            output_dir=solver.outputfiles_basename,
+            parameter_names=solver.parameter_names,
+        )
+
+    @classmethod
+    def validate_config(cls, *, solver: SIXSASolver, config: BackendConfig) -> None:
+        expected_config_cls = cls.config_cls
+        if expected_config_cls is None:
+            if config is not None:
+                raise TypeError(f"Backend '{cls.name}' does not accept a `config` object.")
+            return
+        if not isinstance(config, expected_config_cls):
+            raise TypeError(
+                f"`config` must be an instance of {expected_config_cls.__name__} for backend "
+                f"'{cls.name}'."
             )
-        else:
-            self.tracer = DummyTracer(
-                output_dir=solver.outputfiles_basename,
-                parameter_names=solver.parameter_names,
-                plot_every=plot_every,
-                plot_step_percent=plot_step_percent,
-            )
+        config.validate_for_solver(solver)
 
     def _cube_to_physical(self, cube: np.ndarray) -> np.ndarray:
         """Map unit-cube parameters to physical space."""

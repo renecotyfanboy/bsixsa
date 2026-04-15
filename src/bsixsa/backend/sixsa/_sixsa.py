@@ -13,8 +13,9 @@ from sbi.inference import EnsemblePosterior, NPE
 from sbi.neural_nets import posterior_nn
 from sbi.utils import BoxUniform, RestrictedPrior, get_density_thresholder
 
-from ..abc import Backend
 from .. import register_backend
+from ..abc import Backend
+from ..config import BackendConfig
 from .embedding import IdentityEmbedding
 from .embedding.abc import Embedding
 
@@ -168,21 +169,16 @@ def training_job(
 class SIXSABackend(Backend):
 
     name = "sixsa"
+    config_cls = BackendConfig
+
     def __init__(
         self,
         *,
         solver: "SIXSASolver",
-        trace: bool = True,
-        plot_every: int = 50,
-        plot_step_percent: int = 10,
+        config: BackendConfig,
         **kwargs,
     ):
-        super().__init__(
-            solver=solver,
-            trace=trace,
-            plot_every=plot_every,
-            plot_step_percent=plot_step_percent,
-        )
+        super().__init__(solver=solver, config=config)
         self.proposals = []
         self.n_nets = 8 #max(1, os.cpu_count() or 1)
         self.prior = BoxUniform(

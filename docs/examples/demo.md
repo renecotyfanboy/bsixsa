@@ -110,17 +110,18 @@ prior = [
 
 ## Solver
 
-Once the priors are ready, instantiate the solver. This object coordinates everything needed to run the inference, and is linked to a given backend.
+Once the priors are ready, instantiate the solver. This object coordinates everything needed to run the inference, and the backend is inferred from the config passed at construction time.
 
 ``` python title="Define the solver"
+from bsixsa import Nautilus
 from bsixsa.solver import SIXSASolver
 
 # Instantiate solver the BXA's way
 solver = SIXSASolver(
     prior,
-    outputfiles_basename="result_nessai/",
+    outputfiles_basename="result/",
     overwrite=True,
-    backend="nessai"
+    backend=Nautilus(num_live_points=2_000),
 )
 ```
 
@@ -138,9 +139,7 @@ Prior predictive coverage for the configured model and priors.
 As the prior predictive check looks reasonable, we run the sampler. 
 
 ``` python title="Run the solver"
-from bsixsa import NessaiConfig
-
-sampler = solver.run(config=NessaiConfig(num_live_points=2_000))
+fit_result = solver.run()
 ```
 
 After sampling, compare posterior predictive spectra with the data. This is the quickest visual check that the fitted model explains the observed counts and residual structure.

@@ -10,7 +10,7 @@ from nessai.posterior import draw_posterior_samples
 from ..solver import FitResults
 from .abc import Backend
 from . import register_backend
-from .config import NessaiConfig
+from .config import Nessai
 import warnings
 
 if typing.TYPE_CHECKING:
@@ -69,21 +69,15 @@ class ModelFromSolver(NessaiModel):
 class NessaiBackend(Backend):
 
     name = "nessai"
-    config_cls = NessaiConfig
+    config_cls = Nessai
 
     def __init__(
         self,
         *,
         solver: 'SIXSASolver',
-        config: NessaiConfig,
+        config: Nessai,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
 
         flow_kwargs = self.config.engine_kwargs.copy()
         flow_kwargs.setdefault("importance_nested_sampler", True)

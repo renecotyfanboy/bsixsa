@@ -16,9 +16,9 @@ build:
       # https://docs.readthedocs.io/page/guides/reproducible-builds.html
       install:
         - pip install zensical mkdocstrings-python griffe-pydantic
-     build:
+      build:
        html:
          - zensical build
-     post_build:
+      post_build:
        - mkdir -p $READTHEDOCS_OUTPUT/html/
        - cp --recursive site/* $READTHEDOCS_OUTPUT/html/

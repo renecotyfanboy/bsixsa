@@ -10,7 +10,7 @@ import ultranest.calibrator
 from ..convenience import iter_thawn_parameters
 from .abc import Backend
 from . import register_backend
-from .config import UltranestConfig
+from .config import Ultranest
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -21,21 +21,15 @@ if typing.TYPE_CHECKING:
 class UltranestBackend(Backend):
 
     name = "ultranest"
-    config_cls = UltranestConfig
+    config_cls = Ultranest
 
     def __init__(
         self,
         *,
         solver: 'SIXSASolver',
-        config: UltranestConfig,
+        config: Ultranest,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
 
         ultranest_output = os.path.join(self.solver.outputfiles_basename, "ultranest_outputs")
         os.makedirs(ultranest_output, exist_ok=True)

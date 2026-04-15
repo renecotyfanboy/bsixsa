@@ -10,7 +10,7 @@ import pandas as pd
 
 from . import register_backend
 from .abc import Backend
-from .config import EmceeConfig
+from .config import Emcee
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -21,21 +21,15 @@ if typing.TYPE_CHECKING:
 class EmceeBackend(Backend):
 
     name = "emcee"
-    config_cls = EmceeConfig
+    config_cls = Emcee
 
     def __init__(
         self,
         *,
         solver: SIXSASolver,
-        config: EmceeConfig,
+        config: Emcee,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
 
 
     def log_prob(self, parameters):

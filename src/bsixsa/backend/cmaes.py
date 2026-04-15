@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import register_backend
 from .abc import Backend
+from .config import BackendConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -29,22 +30,17 @@ class CMAESBackend(Backend):
     """
 
     name = "cmaes"
+    config_cls = BackendConfig
+
     def __init__(
         self,
         *,
         solver: SIXSASolver,
-        trace: bool,
-        plot_every: int = 50,
-        plot_step_percent: int = 10,
+        config: BackendConfig,
         sigma0: float = 0.25,
         **kwargs,
     ):
-        super().__init__(
-            solver=solver,
-            trace=trace,
-            plot_every=plot_every,
-            plot_step_percent=plot_step_percent,
-        )
+        super().__init__(solver=solver, config=config)
         self.sigma0 = sigma0
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_cube: np.ndarray | None = None

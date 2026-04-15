@@ -6,13 +6,13 @@ if TYPE_CHECKING:
     from .abc import Backend
     from .cmaes import CMAESBackend
     from .config import (
-        EmceeConfig,
-        IminuitConfig,
-        LevenbergMarquardtConfig,
-        NautilusConfig,
-        NessaiConfig,
-        TraceConfig,
-        UltranestConfig,
+        Emcee,
+        Iminuit,
+        LevenbergMarquardt,
+        Nautilus,
+        Nessai,
+        BackendConfig,
+        Ultranest,
     )
     from .emcee import EmceeBackend
     from .iminuit import IminuitBackend
@@ -28,32 +28,32 @@ __all__ = [
     "CMAESBackend",
     "EvaluationTracer",
     "EmceeBackend",
-    "EmceeConfig",
+    "Emcee",
     "IminuitBackend",
-    "IminuitConfig",
+    "Iminuit",
     "LevenbergMarquardtBackend",
-    "LevenbergMarquardtConfig",
+    "LevenbergMarquardt",
     "NautilusBackend",
-    "NautilusConfig",
+    "Nautilus",
     "NessaiBackend",
-    "NessaiConfig",
+    "Nessai",
     "SIXSABackend",
-    "TraceConfig",
+    "BackendConfig",
     "UltranestBackend",
-    "UltranestConfig",
+    "Ultranest",
     "BACKEND_REGISTRY",
     "get_backend_class",
     "register_backend",
 ]
 
 from .config import (
-    EmceeConfig,
-    IminuitConfig,
-    LevenbergMarquardtConfig,
-    NautilusConfig,
-    NessaiConfig,
-    TraceConfig,
-    UltranestConfig,
+    Emcee,
+    Iminuit,
+    LevenbergMarquardt,
+    Nautilus,
+    Nessai,
+    BackendConfig,
+    Ultranest,
 )
 
 BACKEND_REGISTRY: dict[str, type[Backend]] = {}

@@ -8,7 +8,7 @@ from scipy.optimize import least_squares
 
 from .abc import Backend
 from . import register_backend
-from .config import LevenbergMarquardtConfig
+from .config import LevenbergMarquardt
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -68,21 +68,15 @@ class LevenbergMarquardtBackend(Backend):
     """
 
     name = "levenberg_marquardt"
-    config_cls = LevenbergMarquardtConfig
+    config_cls = LevenbergMarquardt
 
     def __init__(
         self,
         *,
         solver: SIXSASolver,
-        config: LevenbergMarquardtConfig,
+        config: LevenbergMarquardt,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
         self.result = None
         self.best_fit_params = None
         self.best_fit_unconstrained = None

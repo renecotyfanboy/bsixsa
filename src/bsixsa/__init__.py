@@ -1,24 +1,24 @@
 from __future__ import print_function
 
 from .backend import (
-    EmceeConfig,
-    IminuitConfig,
-    LevenbergMarquardtConfig,
-    NautilusConfig,
-    NessaiConfig,
-    TraceConfig,
-    UltranestConfig,
+    Emcee,
+    Iminuit,
+    LevenbergMarquardt,
+    Nautilus,
+    Nessai,
+    BackendConfig,
+    Ultranest,
 )
 from .solver import FitResults, SIXSASolver
 
 __all__ = [
-    "EmceeConfig",
+    "Emcee",
     "FitResults",
-    "IminuitConfig",
-    "LevenbergMarquardtConfig",
-    "NautilusConfig",
-    "NessaiConfig",
+    "Iminuit",
+    "LevenbergMarquardt",
+    "Nautilus",
+    "Nessai",
     "SIXSASolver",
-    "TraceConfig",
-    "UltranestConfig",
+    "BackendConfig",
+    "Ultranest",
 ]

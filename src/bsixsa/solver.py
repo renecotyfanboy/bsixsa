@@ -81,6 +81,7 @@ def _split_kwargs(cls, kwargs):
 
 
 def _prepare_output_directory(outputfiles_basename: str, *, overwrite: bool) -> str:
+    """Setup the directory for the output of the run."""
     normalized_output_dir = os.path.normpath(outputfiles_basename)
 
     if not os.path.exists(normalized_output_dir):
@@ -138,8 +139,8 @@ class SIXSASolver(object):
         outputfiles_basename="./sixsa",
         overwrite=False,
         n_jobs=os.cpu_count(),
-        trace=True,
-        backend="nessai"
+        *,
+        backend,
     ):
         r"""Initialise the Bayesian X-ray spectral analysis solver.
 
@@ -158,11 +159,11 @@ class SIXSASolver(object):
                 already contains files.  Defaults to `False`.
             n_jobs: Number of worker processes for the multiprocessing
                 pool.  Defaults to [`cpu_count()`][os.cpu_count].
-            trace: If `True`, enable run-time trace logging in the
-                backend.  Defaults to `True`.
-            backend: Name of the backend to use
-                (e.g. `"nessai"`).  Defaults to `"nessai"`.
+            backend: Backend configuration object. The solver infers the
+                backend at construction time from this mandatory config.
         """
+        if not hasattr(backend, "backend_name"):
+            raise TypeError("`config` must define a backend_name.")
 
         if xspec.AllData.nSpectra < 1:
             raise ValueError("No spectra loaded in XSPEC")
@@ -183,12 +184,13 @@ class SIXSASolver(object):
         self.nb_models = len(sources_models)
         self.prior = prior
         self.distributions = {"prior": prior}
-        self.pool = multiprocessing.Pool(processes=n_jobs)
         self.posterior_samples = None
-        self.backend_name: str = backend
+        self.backend_config = backend
+        self.backend_name: str = self.backend_config.backend_name
         self.backend = None
         self.fit_result: FitResults | None = None
-        self.trace = trace
+        self.backend_config.validate_for_solver(self)
+        self.pool = multiprocessing.Pool(processes=n_jobs)
 
     @property
     def num_parameters(self):
@@ -228,8 +230,7 @@ class SIXSASolver(object):
 
         Parameters:
             parameters: Array-like batch of parameter vectors.
-            return_kind: One of `"cstat"`, `"full_model_counts"`, or
-                `"models_and_components"`.
+            return_kind: One of `"cstat"`, `"full_model_counts"`, or `"models_and_components"`.
 
         Returns:
             Stacked outputs returned by [`parallel_folding`][bsixsa.xspec.parallel_folding].
@@ -360,18 +361,18 @@ class SIXSASolver(object):
         and model comparison via ``az.compare``).
 
         Parameters:
-            distribution: Key in ``self.distributions`` to sample posterior
-                draws from. Defaults to ``"posterior"``.
+            distribution: Key in `self.distributions` to sample posterior
+                draws from. Defaults to `"posterior"`.
             num_samples: Number of posterior draws. Defaults to 10_000.
-            include_prior: If ``True``, draw prior samples and attach them as
-                the *prior* group. Defaults to ``True``.
-            include_observed: If ``True``, attach the observed spectrum as the
+            include_prior: If `True`, draw prior samples and attach them as
+                the *prior* group. Defaults to `True`.
+            include_observed: If `True`, attach the observed spectrum as the
                 *observed_data* group. Requires an active XSPEC session.
-                Defaults to ``True``.
-            include_log_likelihood: If ``True``, simulate the posterior
+                Defaults to `True`.
+            include_log_likelihood: If `True`, simulate the posterior
                 samples through the instrument response and compute
                 per-bin Poisson log-likelihoods. Required for
-                ``az.compare``. Defaults to ``True``.
+                `az.compare`. Defaults to `True`.
 
         Returns:
             Inference data with *posterior* (and optionally *prior*,
@@ -428,63 +429,11 @@ class SIXSASolver(object):
 
         return plot_predictive_coverage(self, distribution=distribution, **kwargs)
 
-    def run(self, *args, config=None, **kwargs) -> FitResults:
+    def run(self) -> FitResults:
         from .backend import get_backend_class
-        from .backend.config import EmceeConfig
 
-        if config is not None and not hasattr(config, "backend_name"):
-            raise TypeError("`config` must define a backend_name.")
-
-        selected_backend_name = config.backend_name if config is not None else self.backend_name
-        backend_cls = get_backend_class(selected_backend_name)
-
-        if config is not None and (args or kwargs):
-            raise TypeError(
-                "Pass backend options via `config=...`; legacy `solver.run(...)` "
-                "kwargs are no longer supported."
-            )
-
-        if config is None:
-            if backend_cls.config_cls is not None:
-                raise TypeError(
-                    f"Backend '{self.backend_name}' requires an explicit `config=...` object."
-                )
-            init_kwargs, run_kwargs = _split_kwargs(backend_cls, kwargs)
-            self.backend = backend_cls(solver=self, trace=self.trace, **init_kwargs)
-            self.fit_result = self.backend.run(*args, **run_kwargs)
-            self.posterior_samples = self.fit_result.posterior_samples
-            self.distributions["posterior"] = self.backend
-            self.backend.tracer.plot_progress()
-            self.backend.tracer.save()
-            return self.fit_result
-        else:
-            backend_config = config
-            self.backend_name = backend_config.backend_name
-
-        expected_config_cls = backend_cls.config_cls
-        if expected_config_cls is None:
-            raise TypeError(f"Backend '{backend_cls.name}' does not accept a `config` object.")
-        if expected_config_cls is not None and not isinstance(backend_config, expected_config_cls):
-            raise TypeError(
-                f"`config` must be an instance of {expected_config_cls.__name__} for backend "
-                f"'{backend_cls.name}'."
-            )
-
-        if hasattr(backend_config, "x0_physical") and backend_config.x0_physical is not None:
-            if backend_config.x0_physical.size != self.num_parameters:
-                raise ValueError(
-                    "`x0_physical` must have one value per free parameter "
-                    f"({self.num_parameters} expected, got {backend_config.x0_physical.size})."
-                )
-
-        if isinstance(backend_config, EmceeConfig):
-            if backend_config.num_walkers < 2 * self.num_parameters:
-                raise ValueError(
-                    "`num_walkers` must be at least twice the number of free "
-                    f"parameters ({2 * self.num_parameters} minimum)."
-                )
-
-        self.backend = backend_cls(solver=self, config=backend_config)
+        backend_cls = get_backend_class(self.backend_name)
+        self.backend = backend_cls(solver=self, config=self.backend_config)
         self.fit_result = self.backend.run()
         self.posterior_samples = self.fit_result.posterior_samples
         self.distributions["posterior"] = self.backend

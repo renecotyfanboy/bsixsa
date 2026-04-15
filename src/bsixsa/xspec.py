@@ -199,6 +199,10 @@ def local_xcm_path(params, indexes, model_indexes, base_xcm_path, *, tmp_dir=Non
 
 
 def _stack_folding_outputs(outputs):
+    """
+    Helper function to stack the individual outputs in parallel_folding.
+    """
+
     if not outputs:
         return {}
 
@@ -295,6 +299,9 @@ def folded_model_from_parameters(
         params, indexes, model_indexes,
         *, model_file, tmp_dir, in_pool, return_kind
 ):
+    """
+    Evaluate a folded `xspec` model for a single parameter vector. This is run in parallel in the [`parallel_folding`][bsixsa.xspec.parallel_folding] function.
+    """
 
     if return_kind not in {"cstat", "full_model_counts", "models_and_components"}:
         raise ValueError(

@@ -10,7 +10,7 @@ from iminuit import Minuit
 
 from . import register_backend
 from .abc import Backend
-from .config import IminuitConfig
+from .config import Iminuit
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
@@ -27,21 +27,15 @@ class IminuitBackend(Backend):
     """
 
     name = "iminuit"
-    config_cls = IminuitConfig
+    config_cls = Iminuit
 
     def __init__(
         self,
         *,
         solver: SIXSASolver,
-        config: IminuitConfig,
+        config: Iminuit,
     ):
-        super().__init__(
-            solver=solver,
-            trace=solver.trace if config.trace is None else config.trace,
-            plot_every=config.plot_every,
-            plot_step_percent=config.plot_step_percent,
-        )
-        self.config = config
+        super().__init__(solver=solver, config=config)
         self.best_fit_params: np.ndarray | None = None
         self.best_fit_unconstrained: np.ndarray | None = None
         self.covariance_unconstrained: np.ndarray | None = None
