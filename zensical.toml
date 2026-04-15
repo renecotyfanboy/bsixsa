@@ -52,15 +52,14 @@ nav = [
     ]},
     { "Examples" = [
         {"Simple fit" = "examples/demo.md"},
-        {"NXB / Multiresponse" = "examples/nxb.md"},
+        {"NXB / Multi-response" = "examples/nxb.md"},
     ]},
     { "Reference" = [
         {"Solver" = "reference/solver.md"},
         {"Priors" = "reference/priors.md"},
         {"Backend" = "reference/backend.md"},
-        {"Config" = "reference/config.md"},
         {"Plotter" = "reference/plotter.md"},
-        {"xspec" = "reference/xspec.md"},
+        {"XSPEC" = "reference/xspec.md"},
     ]},
     { "Doc building" = [
         "doc_building/index.md",

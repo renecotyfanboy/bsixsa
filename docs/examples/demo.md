@@ -24,7 +24,7 @@ xspec.Xset.xsect = "vern"
 xspec.Xset.abund = "lpgs"
 ```
 
-Next, let's load the source spectrum together with its response files. Once the data are attached, we ignore the bad channels and restrict the fit to the energy band of interest.
+Next, let's load the source spectrum together with its response files. Once the data are loaded, we ignore the bad channels and restrict the fit to the energy band of interest.
 
 ``` python title="Load the data with OGIP files"
 xspec_observation = xspec.Spectrum(
@@ -51,7 +51,7 @@ xspec_model.show()
 
 ## Prior distributions
 
-The next block freezes or constrains the PyXSPEC parameters and then declares the priors for the parameters that will actually be sampled. Every parameter must be either frozen (by setting its `error` to a negative value) or set to a prior distribution.
+The next block freezes or constrains the `PyXSPEC` parameters and then declares the priors for the parameters that will actually be sampled. Every parameter must be either frozen (by setting its `error` to a negative value) or set to a prior distribution.
 
 ``` python title="Define prior distributions"
 from bsixsa.priors import uniform, loguniform
@@ -111,7 +111,7 @@ prior = [
 
 ## Solver
 
-Once the priors are ready, instantiate the solver. This object coordinates everything needed to run the inference, and the backend is inferred from the config passed at construction time.
+Once the priors are ready, instantiate the solver. This object coordinates everything needed to run the inference, and the backend is inferred from the [`BackendConfig`][bsixsa.backend.BackendConfig] passed at construction time.
 
 ``` python title="Define the solver"
 from bsixsa import Nautilus

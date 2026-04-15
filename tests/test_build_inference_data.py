@@ -11,6 +11,7 @@ import arviz as az
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import poisson
 
 from bsixsa.priors import MultipleIndependent
 from bsixsa.backend.abc import Backend
@@ -148,7 +149,7 @@ class TestBuildInferenceData:
         assert "prior" not in idata.groups()
 
     def test_observed_data_excluded_when_xspec_unavailable(self, mock_solver):
-        """observed_spectrum raises → observed_data group is simply absent."""
+        """observed_spectrum errors are surfaced to the caller."""
         with patch.object(
             type(mock_solver),
             "observed_spectrum",
@@ -156,10 +157,11 @@ class TestBuildInferenceData:
                 lambda self: (_ for _ in ()).throw(RuntimeError("no XSPEC"))
             ),
         ):
-            idata = mock_solver.build_inference_data(
-                num_samples=50, include_log_likelihood=False,
-            )
-        assert "observed_data" not in idata.groups()
+            with pytest.raises(RuntimeError, match="no XSPEC"):
+                mock_solver.build_inference_data(
+                    num_samples=50,
+                    include_log_likelihood=False,
+                )
 
     def test_observed_data_included(self, mock_solver):
         fake_obs = np.ones(100, dtype=np.float32)
@@ -285,11 +287,11 @@ class TestLikelihoodPerBin:
         assert result.shape == (2, 3)
 
     def test_known_values(self):
-        """Check against the Poisson log-likelihood formula y ln µ − µ."""
+        """Check against SciPy's Poisson log-PMF implementation."""
         observed = np.array([10.0, 5.0, 3.0])
         model = np.array([[10.0, 5.0, 3.0]])
         result = likelihood_per_bin(observed, model)
-        expected = observed * np.log(model) - model
+        expected = poisson.logpmf(observed, model)
         np.testing.assert_array_almost_equal(result, expected)
 
     def test_zero_observed(self):

@@ -77,7 +77,7 @@ def _validate_x0_length_for_solver(
 
 
 class Nautilus(BackendConfig):
-    """Configuration for :class:`bsixsa.backend.nautilus.NautilusBackend`."""
+    """Configuration for the [`nautilus`](https://nautilus-sampler.readthedocs.io/en/latest/) backend."""
 
     backend_name: ClassVar[str] = "nautilus"
 
@@ -93,7 +93,7 @@ class Nautilus(BackendConfig):
 
 
 class Nessai(BackendConfig):
-    """Configuration for :class:`bsixsa.backend.nessai.NessaiBackend`."""
+    """Configuration for the [`nessai`](https://nessai.readthedocs.io/en/latest/) backend."""
 
     backend_name: ClassVar[str] = "nessai"
     _protected_engine_keys: ClassVar[set[str]] = {
@@ -127,7 +127,7 @@ class Nessai(BackendConfig):
 
 
 class Ultranest(BackendConfig):
-    """Configuration for :class:`bsixsa.backend.ultranest.UltranestBackend`."""
+    """Configuration for the [`ultranest`](https://johannesbuchner.github.io/UltraNest/index.html) backend."""
 
     backend_name: ClassVar[str] = "ultranest"
 
@@ -146,7 +146,7 @@ class Ultranest(BackendConfig):
 
 
 class Iminuit(BackendConfig):
-    """Configuration for :class:`bsixsa.backend.iminuit.IminuitBackend`."""
+    """Configuration for the [`iminuit`](https://scikit-hep.org/iminuit/) backend."""
 
     backend_name: ClassVar[str] = "iminuit"
 
@@ -198,7 +198,7 @@ class Iminuit(BackendConfig):
 
 
 class LevenbergMarquardt(BackendConfig):
-    """Configuration for Levenberg-Marquardt optimisation."""
+    """Configuration for the [Levenberg-Marquardt](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.least_squares.html) backend."""
 
     backend_name: ClassVar[str] = "levenberg_marquardt"
 
@@ -246,7 +246,7 @@ class LevenbergMarquardt(BackendConfig):
 
 
 class Emcee(BackendConfig):
-    """Configuration for :class:`bsixsa.backend.emcee.EmceeBackend`."""
+    """Configuration for the [`emcee`](https://emcee.readthedocs.io/en/stable/index.html) backend."""
 
     backend_name: ClassVar[str] = "emcee"
 
