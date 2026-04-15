@@ -35,3 +35,10 @@ You can now install the extra samplers you want to use.
 ```
 uv pip install jupyterlab ipywidgets nessai nautilus-sampler # Install nautilus and nessai 
 ```
+
+## Current limitations
+
+While we do not explicitly support multi-observation fitting and background, solvers using only the likelihood should work correctly. 
+
+- Plotting : the plotters currently support the first spectrum. Also, there is no background support for plotting yet. 
+- Flux : flux computation is not yet supported.
