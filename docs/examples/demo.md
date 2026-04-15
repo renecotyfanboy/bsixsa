@@ -1,8 +1,8 @@
 ---
-icon: lucide/rocket
+icon: lucide/chart-spline
 ---
 
-# Example fit
+# Simple fit
 
 This page walks through a complete fit that is representative of the Tycho SNR analysis as seen by Chandra/ACIS, from loading OGIP files with `PyXSPEC` to checking the posterior predictive coverage. The snippets are meant to be read in order: each block builds on the objects created in the previous one.
 
@@ -63,7 +63,8 @@ with XSilence():
     
     xspec_model.vnei_3.Redshift.link = xspec_model.vnei.Redshift
 
-    xspec_model.TBabs.nH = '0.7,-1,0,0,9999,9999' # 'value,error,hard_low,soft_low,soft_high,hard_high'
+    xspec_model.TBabs.nH = '0.7,-1,0,0,9999,9999' 
+    # 'value,error,hard_low,soft_low,soft_high,hard_high'
     # Error set to negative value tells XSPEC to keep it frozen during the fit
 
     xspec_model.vnei.H = '1,-1,0,0,9999,9999'
@@ -116,7 +117,6 @@ Once the priors are ready, instantiate the solver. This object coordinates every
 from bsixsa import Nautilus
 from bsixsa.solver import SIXSASolver
 
-# Instantiate solver the BXA's way
 solver = SIXSASolver(
     prior,
     outputfiles_basename="result/",
@@ -128,7 +128,7 @@ solver = SIXSASolver(
 Before launching the fit, it is essential to check whether the prior alone generates spectra that are compatible with the observed counts. Large mismatches here often indicate that a bound or model assumption should be revisited.
 
 ``` python title="Prior predictive check"
-solver.plot_predictive_coverage("prior", min_counts=10, residual_kind="sigma");
+solver.plot_predictive_coverage("prior", min_counts=10, residual_kind="sigma", figsize=(7,5));
 ```
 
 ![Prior predictive](demo_plots/prior_ppc.png){ width="600"}
@@ -145,7 +145,7 @@ fit_result = solver.run()
 After sampling, compare posterior predictive spectra with the data. This is the quickest visual check that the fitted model explains the observed counts and residual structure.
 
 ``` python title="Posterior predictive check"
-solver.plot_predictive_coverage("posterior", min_counts=10, residual_kind="sigma");
+solver.plot_predictive_coverage("posterior", min_counts=10, residual_kind="sigma", figsize=(7,5));
 ```
 
 ![Posterior predictive](demo_plots/posterior_ppc.png){ width="600"}

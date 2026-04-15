@@ -43,3 +43,4 @@ While we do not explicitly support multi-observation fitting and background, sol
 
 - Plotting : the plotters currently support the first spectrum. Also, there is no background support for plotting yet. 
 - Flux : flux computation is not yet supported.
+- Cross calibration : cross calibration is not supported with the standard `xspec` interface, but the users can find ways to do this by incorporating this aspec within the spectral model.
