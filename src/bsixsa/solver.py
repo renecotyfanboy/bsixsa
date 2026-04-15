@@ -130,7 +130,7 @@ def set_parameters(values, indexes, model_indexes):
     AllModels.setPars(*parameter_to_set)
 
 
-class SIXSASolver(object):
+class Solver(object):
     allowed_stats = ["cstat", "pstat"]
 
     def __init__(

@@ -12,7 +12,7 @@ from .config import LevenbergMarquardt
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
-    from ..solver import SIXSASolver
+    from ..solver import Solver
 
 
 def covariance_from_jacobian(
@@ -73,7 +73,7 @@ class LevenbergMarquardtBackend(Backend):
     def __init__(
         self,
         *,
-        solver: SIXSASolver,
+        solver: Solver,
         config: LevenbergMarquardt,
     ):
         super().__init__(solver=solver, config=config)

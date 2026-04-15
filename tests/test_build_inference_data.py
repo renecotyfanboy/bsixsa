@@ -15,7 +15,7 @@ from scipy.stats import poisson
 
 from bsixsa.priors import MultipleIndependent
 from bsixsa.backend.abc import Backend
-from bsixsa.solver import SIXSASolver, FitResults, likelihood_per_bin
+from bsixsa.solver import Solver, FitResults, likelihood_per_bin
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +45,8 @@ def mock_solver():
     )
 
     # Patch __init__ to avoid XSPEC calls, then manually set attributes
-    with patch.object(SIXSASolver, "__init__", lambda self, *a, **kw: None):
-        solver = SIXSASolver.__new__(SIXSASolver)
+    with patch.object(Solver, "__init__", lambda self, *a, **kw: None):
+        solver = Solver.__new__(Solver)
 
     solver.prior = prior
     solver.distributions = {"prior": prior, "posterior": fake_posterior}

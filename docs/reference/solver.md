@@ -2,5 +2,5 @@
     options:
       show_root_heading: false
       members:
-      - SIXSASolver
+      - Solver
       - likelihood_per_bin

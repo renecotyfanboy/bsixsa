@@ -9,7 +9,7 @@ from .backend import (
     BackendConfig,
     Ultranest,
 )
-from .solver import FitResults, SIXSASolver
+from .solver import FitResults, Solver
 
 __all__ = [
     "Emcee",
@@ -18,7 +18,7 @@ __all__ = [
     "LevenbergMarquardt",
     "Nautilus",
     "Nessai",
-    "SIXSASolver",
+    "Solver",
     "BackendConfig",
     "Ultranest",
 ]

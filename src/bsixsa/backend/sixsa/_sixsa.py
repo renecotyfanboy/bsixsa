@@ -20,7 +20,7 @@ from .embedding import IdentityEmbedding
 from .embedding.abc import Embedding
 
 if TYPE_CHECKING:
-    from ...solver import FitResults, SIXSASolver
+    from ...solver import FitResults, Solver
 
 
 class FCEmbedding(torch.nn.Module):
@@ -174,7 +174,7 @@ class SIXSABackend(Backend):
     def __init__(
         self,
         *,
-        solver: "SIXSASolver",
+        solver: "Solver",
         config: BackendConfig,
         **kwargs,
     ):

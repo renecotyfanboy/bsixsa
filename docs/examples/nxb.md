@@ -79,10 +79,9 @@ prior = [
 Once this is set, we can fit the data.
 
 ```
-from bsixsa.solver import SIXSASolver
-from bsixsa import Nessai
+from bsixsa import Solver, Nessai
 
-solver = SIXSASolver(
+solver = Solver(
     prior,
     outputfiles_basename="result_nessai_nxb/",
     overwrite=True,

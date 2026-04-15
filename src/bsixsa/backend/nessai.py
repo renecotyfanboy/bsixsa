@@ -14,7 +14,7 @@ from .config import Nessai
 import warnings
 
 if typing.TYPE_CHECKING:
-    from ..solver import SIXSASolver
+    from ..solver import Solver
 
 
 class ModelFromSolver(NessaiModel):
@@ -74,7 +74,7 @@ class NessaiBackend(Backend):
     def __init__(
         self,
         *,
-        solver: 'SIXSASolver',
+        solver: 'Solver',
         config: Nessai,
     ):
         super().__init__(solver=solver, config=config)

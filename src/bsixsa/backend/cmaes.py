@@ -14,7 +14,7 @@ from .config import BackendConfig
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
-    from ..solver import SIXSASolver
+    from ..solver import Solver
 
 _EPS = 1e-10  # Small margin to keep unit-cube values away from the edges
 
@@ -35,7 +35,7 @@ class CMAESBackend(Backend):
     def __init__(
         self,
         *,
-        solver: SIXSASolver,
+        solver: Solver,
         config: BackendConfig,
         sigma0: float = 0.25,
         **kwargs,

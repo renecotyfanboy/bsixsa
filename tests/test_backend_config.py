@@ -22,7 +22,7 @@ from bsixsa import (
     Ultranest,
 )
 from bsixsa.backend.abc import Backend
-from bsixsa.solver import FitResults, SIXSASolver
+from bsixsa.solver import FitResults, Solver
 
 
 @pytest.fixture
@@ -36,8 +36,8 @@ def solver_stub(tmp_path):
 
 @pytest.fixture
 def mock_solver(tmp_path):
-    with patch.object(SIXSASolver, "__init__", lambda self, *args, **kwargs: None):
-        solver = SIXSASolver.__new__(SIXSASolver)
+    with patch.object(Solver, "__init__", lambda self, *args, **kwargs: None):
+        solver = Solver.__new__(Solver)
 
     solver.backend_name = "nessai"
     solver.backend_config = Nessai(trace=False)

@@ -114,10 +114,9 @@ prior = [
 Once the priors are ready, instantiate the solver. This object coordinates everything needed to run the inference, and the backend is inferred from the [`BackendConfig`][bsixsa.backend.BackendConfig] passed at construction time.
 
 ``` python title="Define the solver"
-from bsixsa import Nautilus
-from bsixsa.solver import SIXSASolver
+from bsixsa import Solver, Nautilus
 
-solver = SIXSASolver(
+solver = Solver(
     prior,
     outputfiles_basename="result/",
     overwrite=True,

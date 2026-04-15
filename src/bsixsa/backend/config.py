@@ -8,7 +8,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from ..solver import SIXSASolver
+    from ..solver import Solver
 
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
@@ -45,7 +45,7 @@ class BackendConfig(BaseModel):
         ),
     )
 
-    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+    def validate_for_solver(self, solver: "Solver") -> None:
         """Validate solver-dependent config constraints."""
 
     def create_tracer(
@@ -67,7 +67,7 @@ class BackendConfig(BaseModel):
 
 def _validate_x0_length_for_solver(
     x0_physical: np.ndarray | None,
-    solver: "SIXSASolver",
+    solver: "Solver",
 ) -> None:
     if x0_physical is not None and x0_physical.size != solver.num_parameters:
         raise ValueError(
@@ -193,7 +193,7 @@ class Iminuit(BackendConfig):
             )
         return self
 
-    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+    def validate_for_solver(self, solver: "Solver") -> None:
         _validate_x0_length_for_solver(self.x0_physical, solver)
 
 
@@ -241,7 +241,7 @@ class LevenbergMarquardt(BackendConfig):
             )
         return self
 
-    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+    def validate_for_solver(self, solver: "Solver") -> None:
         _validate_x0_length_for_solver(self.x0_physical, solver)
 
 
@@ -308,7 +308,7 @@ class Emcee(BackendConfig):
             )
         return self
 
-    def validate_for_solver(self, solver: "SIXSASolver") -> None:
+    def validate_for_solver(self, solver: "Solver") -> None:
         _validate_x0_length_for_solver(self.x0_physical, solver)
         if self.num_walkers < 2 * solver.num_parameters:
             raise ValueError(

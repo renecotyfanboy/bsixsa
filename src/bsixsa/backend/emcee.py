@@ -14,7 +14,7 @@ from .config import Emcee
 from ..solver import FitResults
 
 if typing.TYPE_CHECKING:
-    from ..solver import SIXSASolver
+    from ..solver import Solver
 
 
 @register_backend
@@ -26,7 +26,7 @@ class EmceeBackend(Backend):
     def __init__(
         self,
         *,
-        solver: SIXSASolver,
+        solver: Solver,
         config: Emcee,
     ):
         super().__init__(solver=solver, config=config)

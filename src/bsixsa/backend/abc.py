@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from scipy.special import expit as sigmoid
 
 if TYPE_CHECKING:
-    from ..solver import FitResults, SIXSASolver
+    from ..solver import FitResults, Solver
     from .config import BackendConfig
 
 
@@ -25,7 +25,7 @@ class Backend(ABC):
     def __init__(
         self,
         *,
-        solver: SIXSASolver,
+        solver: Solver,
         config: BackendConfig,
         **kwargs,
     ):
@@ -39,7 +39,7 @@ class Backend(ABC):
         )
 
     @classmethod
-    def validate_config(cls, *, solver: SIXSASolver, config: BackendConfig) -> None:
+    def validate_config(cls, *, solver: Solver, config: BackendConfig) -> None:
         expected_config_cls = cls.config_cls
         if expected_config_cls is None:
             if config is not None:
