@@ -24,17 +24,23 @@ mamba create -n bsixsa python=3.12 xspec xspec-data -c https://heasarc.gsfc.nasa
 conda activate bsixsa # Activate the environment
 ```
 
-Then install the package from the source code.
+Then install the package from `pypi`.
 
 ```
 pip install uv # uv is recommended as it is faster than pip and better handles dependencies
-uv pip install git+https://github.com/renecotyfanboy/bsixsa
+uv pip install bsixsa
 ```
 
 You can now install the extra samplers you want to use. 
 
 ```
 uv pip install jupyterlab ipywidgets nessai nautilus-sampler # Install nautilus and nessai 
+```
+
+If you require to work with the most recent version, install it directly from the source code.
+
+```
+uv pip install git+https://github.com/renecotyfanboy/bsixsa
 ```
 
 ## Current limitations
