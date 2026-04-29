@@ -44,18 +44,34 @@ def covariance_from_jacobian(
 
 
 def _poisson_deviance_residuals(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
-    """Signed square-root of the per-bin Poisson deviance (Cash C-statistic).
+    """Signed square-root of the per-bin Poisson deviance.
 
-    Minimising ``sum(r**2)`` is equivalent to minimising the C-statistic,
-    i.e. maximising the Poisson log-likelihood.
+    For binned Poisson data, ctools defines the negative log-likelihood as
+    ``-ln L = sum_i(e_i - n_i ln e_i)``. The corresponding deviance residual is
 
-    The signed residual is ``sign(y − µ) sqrt(d_i)``.
+    ``r_i = sign(n_i - e_i) * sqrt(2 * (n_i * ln(n_i / e_i) + e_i - n_i))``.
+
+    We handle the ``n_i = 0`` branch analytically and clip ``e_i`` to a tiny
+    positive value so the residual vector remains finite for SciPy's LM solver.
     """
-    from ..solver import likelihood_per_bin
+    observed = np.asarray(observed, dtype=np.float64)
+    model = np.asarray(model, dtype=np.float64)
 
-    log_lik = likelihood_per_bin(observed, model)
-    log_lik_saturated = likelihood_per_bin(observed, observed)
-    deviance = np.maximum(-2.0 * (log_lik - log_lik_saturated), 0.0)
+    safe_model = np.clip(model, np.finfo(np.float64).tiny, None)
+    deviance = np.empty_like(safe_model)
+
+    zero_observed = observed == 0.0
+    deviance[zero_observed] = 2.0 * safe_model[zero_observed]
+
+    positive_observed = ~zero_observed
+    if np.any(positive_observed):
+        obs = observed[positive_observed]
+        pred = safe_model[positive_observed]
+        deviance[positive_observed] = 2.0 * (
+            obs * (np.log(obs) - np.log(pred)) + pred - obs
+        )
+
+    deviance = np.maximum(deviance, 0.0)
     return np.sign(observed - model) * np.sqrt(deviance)
 
 
