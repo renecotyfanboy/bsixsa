@@ -213,6 +213,14 @@ class LevenbergMarquardt(BackendConfig):
         default=False,
         description="Initialise the optimizer from a draw from the prior.",
     )
+    reparametrise: StrictBool = Field(
+        default=False,
+        description=(
+            "If True, search in unconstrained logit-of-CDF space. If False "
+            "(default), search in physical space with explicit prior bounds "
+            "via scipy's `trf` method — matches XSPEC's `leven`."
+        ),
+    )
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional keyword arguments forwarded to scipy.optimize.least_squares().",

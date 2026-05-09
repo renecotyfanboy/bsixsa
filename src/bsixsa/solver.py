@@ -23,6 +23,8 @@ class FitResults:
     n_likelihood_evaluations: int
     log_Z: float
     log_Z_err: float
+    best_fit: pd.Series | None = None
+    best_fit_stat: float | None = None
 
 
 def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:

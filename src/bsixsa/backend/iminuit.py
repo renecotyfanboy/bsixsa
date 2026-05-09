@@ -111,12 +111,19 @@ class IminuitBackend(Backend):
             for i, name in enumerate(self.solver.parameter_names)
         }
 
+        best_fit = pd.Series(
+            self.best_fit_params, index=self.solver.parameter_names
+        )
+        best_fit_stat = float(self.minuit.fval)
+
         return FitResults(
             time=float(run_time()),
             posterior_samples=pd.DataFrame.from_dict(posterior_dict),
             n_likelihood_evaluations=int(self.minuit.nfcn),
             log_Z=float("nan"),
             log_Z_err=float("nan"),
+            best_fit=best_fit,
+            best_fit_stat=best_fit_stat,
         )
 
     def sample(self, n: int) -> np.ndarray:
