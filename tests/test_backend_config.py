@@ -96,6 +96,26 @@ def test_iminuit_config_rejects_conflicting_start_options():
         Iminuit(x0_physical=[1.0, 2.0], init_from_prior=True)
 
 
+def test_iminuit_config_default_strategy_and_tol():
+    config = Iminuit()
+    assert config.strategy == 1
+    assert config.tol is None
+
+
+def test_iminuit_config_rejects_out_of_range_strategy():
+    with pytest.raises(ValidationError, match="strategy"):
+        Iminuit(strategy=3)
+    with pytest.raises(ValidationError, match="strategy"):
+        Iminuit(strategy=-1)
+
+
+def test_iminuit_config_rejects_non_positive_tol():
+    with pytest.raises(ValidationError, match="tol"):
+        Iminuit(tol=0.0)
+    with pytest.raises(ValidationError, match="tol"):
+        Iminuit(tol=-1.0)
+
+
 def test_emcee_config_requires_initialisation_strategy():
     with pytest.raises(ValidationError, match="requires either `x0_physical`"):
         Emcee()

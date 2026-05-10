@@ -87,6 +87,9 @@ class IminuitBackend(Backend):
         self.minuit = Minuit(self._objective, x0, name=self.solver.parameter_names)
         self.minuit.errordef = Minuit.LEAST_SQUARES
         self.minuit.print_level = 2
+        self.minuit.strategy = self.config.strategy
+        if self.config.tol is not None:
+            self.minuit.tol = self.config.tol
 
         # --- run ---
         with catchtime("Running MIGRAD", print_time=False) as run_time:

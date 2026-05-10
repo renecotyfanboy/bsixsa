@@ -165,6 +165,24 @@ class Iminuit(BackendConfig):
         default=True,
         description="Run HESSE after MIGRAD to estimate parameter covariance.",
     )
+    strategy: Annotated[int, Field(strict=True, ge=0, le=2)] = Field(
+        default=1,
+        description=(
+            "MIGRAD strategy level (0, 1, or 2). Higher values trade more "
+            "function evaluations for more accurate gradient and Hessian "
+            "estimates. ``2`` is recommended for noisy or strongly "
+            "correlated likelihood surfaces."
+        ),
+    )
+    tol: PositiveFloat | None = Field(
+        default=None,
+        description=(
+            "MIGRAD EDM stopping tolerance. The actual stop threshold is "
+            "``0.002 * tol * errordef`` (so iminuit's default ``tol=0.1`` "
+            "with ``errordef=1`` gives an EDM threshold of ``2e-4``). Set "
+            "to ``None`` to keep iminuit's default."
+        ),
+    )
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional keyword arguments forwarded to Minuit.migrad().",
