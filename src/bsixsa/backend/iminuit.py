@@ -42,7 +42,8 @@ class IminuitBackend(Backend):
         self.minuit: Minuit | None = None
 
     def _objective(self, unconstrained_params: np.ndarray) -> float:
-        """C-statistic in unconstrained space (to minimise)."""
+        """``-2 ln P(theta | data)`` up to a constant — i.e. C-stat plus the
+        prior contribution. Minimising this gives the MAP, not the MLE."""
         physical = self._unconstrained_to_physical(unconstrained_params)
         sim = self.solver.simulate(
             physical,
@@ -50,8 +51,9 @@ class IminuitBackend(Backend):
             progress_bar=False,
         )
         cstat = float(sim["cstat"].item())
+        log_prior = float(self.solver.prior.log_prob(physical.ravel()))
         self.tracer.record(physical, cstat)
-        return cstat
+        return cstat - 2.0 * log_prior
 
     # ------------------------------------------------------------------
     # Core API
@@ -114,7 +116,13 @@ class IminuitBackend(Backend):
         best_fit = pd.Series(
             self.best_fit_params, index=self.solver.parameter_names
         )
-        best_fit_stat = float(self.minuit.fval)
+        # Bare cstat at the best fit (matches XSPEC's Fit.statistic).
+        sim_at_best = self.solver.simulate(
+            np.atleast_2d(self.best_fit_params),
+            return_kind="cstat",
+            progress_bar=False,
+        )
+        best_fit_stat = float(np.asarray(sim_at_best["cstat"]).ravel()[0])
 
         return FitResults(
             time=float(run_time()),

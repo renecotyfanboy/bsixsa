@@ -103,6 +103,29 @@ class MultipleIndependent:
 
         return lp[0] if x.ndim == 1 else lp
 
+    def max_log_pdf_per_axis(self, n_grid: int = 1024) -> np.ndarray:
+        """Per-axis upper bound on ``logpdf`` over the prior support.
+
+        Used by least-squares MAP fits to shift the prior log-density into a
+        non-negative range, so that the prior contribution can be encoded as
+        extra residuals whose sum of squares equals
+        ``-2 * log_prior + const``. The grid combines an inverse-CDF
+        sweep (denser where the prior is concentrated) with the support
+        endpoints, which suffices for the priors in this package
+        (``uniform``, ``loguniform``, truncated ``norm``).
+        """
+        quantiles = np.linspace(1.0e-6, 1.0 - 1.0e-6, n_grid)
+        out = np.empty(self.ndim, dtype=float)
+        for j, (dist, (lo, hi)) in enumerate(zip(self.dists, self.bounds)):
+            grid = np.concatenate(
+                [np.asarray(dist.ppf(quantiles), dtype=float),
+                 np.array([lo, hi], dtype=float)]
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_pdfs = np.asarray(dist.logpdf(grid), dtype=float)
+            out[j] = float(np.nanmax(log_pdfs))
+        return out
+
 
 def build_prior(define_prior):
     """Build the joint prior from a list of XSPEC prior specifications.
