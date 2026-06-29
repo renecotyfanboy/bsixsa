@@ -61,7 +61,8 @@ def norm(loc, scale, low, high):
         scale, and truncation limits.
     """
     from scipy.stats import truncnorm
-    return truncnorm(low, high, loc=loc, scale=scale)
+    a, b = (low - loc) / scale, (high - loc) / scale
+    return truncnorm(a, b, loc=loc, scale=scale)
 
 
 class MultipleIndependent:
@@ -207,7 +208,7 @@ def build_prior(define_prior):
 
         prior = None
 
-        # Smooth brain syntaxe to check whether a prior exist for a given parameter and extract its value
+        # Smooth brain syntax to check whether a prior exists for a given parameter and extract its value
         match define_prior_dict:
             # Prior is only instantiated in the following line if there is a match
             case {par.model.name: {par.component.name: {par.parameter.name: prior}}}:

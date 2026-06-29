@@ -34,6 +34,13 @@ DEFAULT_NDE_KWARGS = {
     "z_score_x": "independent",
 }
 
+# Minimum effective sample size below which the Pareto k_hat diagnostic is not
+# trustworthy: with too few effective samples the generalized-Pareto tail fit is
+# uninformative and psislw reports a spuriously LOW k_hat on a proposal that is
+# actually catastrophic. Mirrors `_sixsa_dev` (sixsa_main.py); below this we
+# report k_hat = inf so such rounds are never selected as best.
+_KHAT_MIN_ESS = 10.0
+
 
 def patch_sample_no_pbar(posterior):
     """Patch the sample method of a posterior to remove the progress bar."""
@@ -128,7 +135,7 @@ def training_job(
         ).train(**training_kwargs)
         training_time = time.time() - training_start
 
-        posterior = inference.build_posterior(density_estimator)
+        posterior = inference.build_posterior()
 
         with open(
             os.path.join(current_artifacts_dir, f"inference_{number}.pkl"),
@@ -188,6 +195,7 @@ class SIXSABackend(Backend):
         self.best_ensemble = None
         self.best_round = 0
         self.best_efficiency = -float("inf")
+        self.best_khat = float("inf")
         self.best_log_Z = float("nan")
         self.best_log_Z_err = float("nan")
         # Importance-resampling posterior: (theta_unit_cube, normalised_weights)
@@ -221,9 +229,7 @@ class SIXSABackend(Backend):
     def _compute_is_diagnostics(self, new_log, cstats, log_w):
         import torch
         import numpy as np
-        from sbi.samplers.importance.importance_sampling import (
-            exponentiate_weights, largest_weight_indices, gpdfit,
-        )
+        from arviz import psislw
 
         finite = torch.isfinite(log_w)
         log_w_safe = torch.where(finite, log_w, torch.full_like(log_w, -np.inf))
@@ -254,14 +260,38 @@ class SIXSABackend(Backend):
             diag["log_Z"] = float((torch.logsumexp(log_w_fin, 0) - np.log(n_total)).item())
             diag["log_Z_err"] = float(np.sqrt((n_total - ess) / (n_total * ess)))
 
+            # k_hat via arviz psislw, matching `_sixsa_dev` (which abandoned sbi's
+            # gpdfit because it reports a systematically different k_hat on
+            # identical weights, making in-loop and final k_hat non-comparable).
+            # The min-ESS guard returns k_hat=inf when there are too few effective
+            # samples for a meaningful generalized-Pareto tail fit (see _KHAT_MIN_ESS).
             try:
-                iw = exponentiate_weights(log_w_fin)
-                khat_val, pscale = gpdfit(iw[largest_weight_indices(iw)])
-                diag["k_hat"] = float(khat_val) if np.isfinite(pscale) else float("nan")
+                if not np.isfinite(ess) or ess < _KHAT_MIN_ESS:
+                    diag["k_hat"] = float("inf")
+                else:
+                    _, khat_val = psislw(log_w_fin.detach().cpu().numpy().copy())
+                    diag["k_hat"] = float(khat_val)
             except Exception:
                 diag["k_hat"] = float("nan")
 
         return diag
+
+    def _initial_unit_cube(self, n: int) -> torch.Tensor:
+        """Draw the first round's parameters in the unit cube ``[0, 1]^D``.
+
+        With ``first_round_sampling="lhs"`` (default) this returns a Latin
+        hypercube design, which fills the cube far more evenly than i.i.d.
+        uniform draws at the same simulation budget; ``"prior"`` restores the
+        previous i.i.d. uniform draw. The samples are mapped to physical space
+        downstream by ``solver.prior.from_unit_cube`` (per-marginal inverse CDF),
+        which preserves the per-axis stratification of the LHS design.
+        """
+        if self.config.first_round_sampling == "lhs":
+            from scipy.stats import qmc
+
+            cube = qmc.LatinHypercube(d=self.solver.prior.ndim).random(n)
+            return torch.as_tensor(cube, dtype=torch.float32)
+        return self.prior.sample((n,))
 
     def inference_round(
         self,
@@ -281,7 +311,7 @@ class SIXSABackend(Backend):
         # importance weight for training (round 1 has no weights and keeps all).
         n_pool = n_simulations
         if proposal is None:
-            parameters_unit_cube = self.prior.sample((n_pool,))
+            parameters_unit_cube = self._initial_unit_cube(n_pool)
         else:
             parameters_unit_cube = proposal.sample((n_pool,))
 
@@ -545,6 +575,7 @@ class SIXSABackend(Backend):
             self.best_ensemble = None
             self.best_round = 0
             self.best_efficiency = -float("inf")
+            self.best_khat = float("inf")
             self.best_log_Z = float("nan")
             self.best_log_Z_err = float("nan")
             self.best_weighted = None
@@ -582,12 +613,41 @@ class SIXSABackend(Backend):
                 round_info["n_simulations_total"] = n_sim_total
                 self.history.append(round_info)
 
-                # Update best-round tracking based on IS efficiency.
-                if (
-                    np.isfinite(round_info["efficiency"])
-                    and round_info["efficiency"] > self.best_efficiency
-                ):
-                    self.best_efficiency = round_info["efficiency"]
+                # Best-round tracking (hierarchical: reliability gate, then quality),
+                # mirroring `_sixsa_dev`. k_hat (PSIS) is a RELIABILITY gate -- can
+                # IS be trusted here at all? -- while efficiency/ESS is the QUALITY
+                # score GIVEN reliability. A round is "reliable" iff k_hat is finite
+                # AND below khat_threshold; among reliable rounds pick the highest
+                # efficiency; if none is reliable yet, prefer the lowest finite k_hat
+                # (least-bad), falling back to efficiency only when no finite k_hat
+                # exists. Without this gate a heavy-tailed round with a spuriously
+                # high efficiency could be selected and returned as the posterior.
+                khat = round_info["k_hat"]
+                eff = round_info["efficiency"]
+                thr = khat_threshold if khat_threshold is not None else float("inf")
+                this_reliable = np.isfinite(khat) and khat < thr
+                best_reliable = np.isfinite(self.best_khat) and self.best_khat < thr
+
+                if this_reliable and best_reliable:
+                    take = np.isfinite(eff) and eff > self.best_efficiency
+                elif this_reliable and not best_reliable:
+                    take = True
+                elif (not this_reliable) and best_reliable:
+                    take = False
+                elif np.isfinite(khat):
+                    take = khat < self.best_khat
+                else:
+                    take = (
+                        not np.isfinite(self.best_khat)
+                        and np.isfinite(eff)
+                        and eff > self.best_efficiency
+                    )
+
+                if take:
+                    self.best_khat = khat if np.isfinite(khat) else self.best_khat
+                    self.best_efficiency = (
+                        eff if np.isfinite(eff) else self.best_efficiency
+                    )
                     self.best_ensemble = proposal
                     self.best_log_Z = round_info["log_Z"]
                     self.best_log_Z_err = round_info["log_Z_err"]

@@ -316,12 +316,23 @@ class SIXSA(BackendConfig):
             "list length sets the number of rounds. Round 1 trains on all of them; "
             "later rounds keep the top `1 - is_filter_fraction` by importance "
             "weight. A front-loaded schedule like `[10_000, 1000, 1000, 1000]` "
-            "trains a solid base flow, then refines cheaply."
+            "trains a solid base flow, then refines cheaply. Note this is the "
+            "*simulated* (pool) count per round: `_sixsa_dev` instead controls the "
+            "*kept* count and inflates the pool, so to reproduce a reference kept "
+            "count `K` set the list entry to `ceil(K / (1 - is_filter_fraction))`."
         ),
     )
     n_ensemble: PositiveInt = Field(
         default=8,
         description="Number of neural posterior estimators trained per round.",
+    )
+    first_round_sampling: str = Field(
+        default="lhs",
+        description=(
+            "Round-1 design in the unit cube: 'lhs' draws a Latin hypercube for even "
+            "space-filling coverage of the prior at a fixed simulation budget; 'prior' "
+            "draws i.i.d. uniform samples (the previous behaviour)."
+        ),
     )
     embedding: Any = Field(
         default=None,
@@ -336,7 +347,8 @@ class SIXSA(BackendConfig):
         description=(
             "Embedding network trained jointly with the NPE via sbi's `embedding_net` "
             "(an `EmbeddingNet`, a list of one per round, or `None`). `None` uses the "
-            "built-in default `FCEmbedding(input_dim, 16)`."
+            "built-in default `FCEmbeddingNet()` (an `FCEmbeddingAPD` geometric pyramid "
+            "compressing the spectrum to `output_dim=32`, linear)."
         ),
     )
     training_kwargs: dict[str, Any] | list[dict[str, Any]] | None = Field(
@@ -384,11 +396,12 @@ class SIXSA(BackendConfig):
         description="Torch device used for the restricted proposal.",
     )
     proposal_mode: str = Field(
-        default="posterior",
+        default="truncated",
         description=(
-            "Strategy for the next round's proposal: 'posterior' draws directly "
-            "from the ensemble posterior (matches `_sixsa_dev`), 'truncated' wraps "
-            "it in a density-thresholded RestrictedPrior."
+            "Strategy for the next round's proposal: 'truncated' (the `_sixsa_dev` "
+            "default) wraps the ensemble posterior in a density-thresholded "
+            "RestrictedPrior over the clean prior; 'posterior' draws directly from "
+            "the ensemble posterior."
         ),
     )
     is_filter_fraction: float = Field(
