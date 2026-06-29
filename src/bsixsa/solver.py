@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import os
 import shutil
 from dataclasses import dataclass
@@ -65,21 +63,6 @@ def _validate_finite(parameters, parameter_names):
             f"Non-finite parameter values detected before simulation: "
             f"{', '.join(sorted(bad_params))}"
         )
-
-
-def _split_kwargs(cls, kwargs):
-    """Separate constructor kwargs from run kwargs by inspecting __init__."""
-    import inspect
-
-    init_params = inspect.signature(cls.__init__).parameters
-    init_kwargs = {}
-    run_kwargs = {}
-    for key, value in kwargs.items():
-        if key in init_params:
-            init_kwargs[key] = value
-        else:
-            run_kwargs[key] = value
-    return init_kwargs, run_kwargs
 
 
 def _prepare_output_directory(outputfiles_basename: str, *, overwrite: bool) -> str:
@@ -255,7 +238,7 @@ class Solver(object):
 
     def log_prob_fn(self, theta, x_o, from_unit_cube=False):
         r"""
-        Return the log-posterior probability, defined as $\mathcal{LL} = -\frac{1}{2} \texttt{Cstat}$. Include the log-likelihood and any prior term defined in `xspec`.
+        Return the unnormalised log-posterior $\log p(\theta \mid x) = -\frac{1}{2} \texttt{Cstat} + \log \pi(\theta)$, summing the C-stat log-likelihood and the Python-side prior set via [`build_prior`][bsixsa.priors.build_prior].
 
         !!! note "On `x_o` parameter"
             `x_o` is a dummy parameter used for compatibility with `sbi` as the true spectrum is directly extracted from

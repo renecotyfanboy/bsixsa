@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 from .backend import (
     Emcee,
     Iminuit,
@@ -7,6 +5,7 @@ from .backend import (
     Nautilus,
     Nessai,
     BackendConfig,
+    SIXSA,
     Ultranest,
 )
 from .solver import FitResults, Solver
@@ -20,5 +19,6 @@ __all__ = [
     "Nessai",
     "Solver",
     "BackendConfig",
+    "SIXSA",
     "Ultranest",
 ]

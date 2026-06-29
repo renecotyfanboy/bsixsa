@@ -154,6 +154,37 @@ class AutoencoderEmbedding(TorchModuleEmbedding):
         return super().fit(data, **kwargs)
 
 
+class DenseEmbedding(TorchModuleEmbedding):
+    """Simple dense embedding: a single linear projection to ``latent_dim`` features.
+
+    The encoder is one ``nn.Linear(n_bins, latent_dim)`` — an autoencoder with no
+    hidden layers — trained by reconstruction on each round's spectra. It is the
+    lightest trainable embedding: well suited to very high-resolution spectra
+    (thousands of channels) where a deep autoencoder would be prohibitively large,
+    while still learning a data-adapted linear compression.
+
+    Args:
+        latent_dim: Dimensionality of the projected embedding. Defaults to 32.
+    """
+
+    def __init__(self, latent_dim: int = 32, **kwargs):
+        self.latent_dim = latent_dim
+        model_kwargs = dict(hidden_dims=[])
+        super().__init__(**(model_kwargs | kwargs))
+
+    @property
+    def embedding_dim(self):
+        return self.latent_dim
+
+    def build_model(self, **kwargs):
+        return Autoencoder(self.input_dim, self.latent_dim, **kwargs)
+
+    def fit(self, data, **kwargs):
+        kwargs.setdefault("max_epochs", 1_000)
+        kwargs.setdefault("prefix", "Dense | ")
+        return super().fit(data, **kwargs)
+
+
 class ResnetEmbedding(TorchModuleEmbedding):
     def __init__(self, latent_dim=32, hidden_features=128, num_blocks=3, **kwargs):
         self.latent_dim = latent_dim
@@ -169,7 +200,7 @@ class ResnetEmbedding(TorchModuleEmbedding):
 
     def fit(self, data, **kwargs):
         kwargs.setdefault("max_epochs", 1_000)
-        kwargs.setdefault("prefix", "Autoencoder | ")
+        kwargs.setdefault("prefix", "Resnet | ")
         return super().fit(data, **kwargs)
 
 

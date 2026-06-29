@@ -1,17 +1,30 @@
 import itertools
 import matplotlib.pyplot as plt
 import numpy as np
-import catppuccin
-from catppuccin.extras.matplotlib import load_color
 from scipy.stats import nbinom, norm
-from xspec import Plot
 from ..xspec import SpectrumState
 from ..backend.abc import Backend
 
-PALETTE = catppuccin.PALETTE.latte
+# Hardcoded Catppuccin Latte palette (https://github.com/catppuccin/catppuccin).
+# Inlined to avoid depending on the ``catppuccin`` package, whose matplotlib
+# integration breaks on recent matplotlib releases.
+_LATTE = {
+    "sky": "#04a5e5",
+    "teal": "#179299",
+    "green": "#40a02b",
+    "yellow": "#df8e1d",
+    "peach": "#fe640b",
+    "maroon": "#e64553",
+    "red": "#d20f39",
+    "pink": "#ea76cb",
+    "mauve": "#8839ef",
+    "blue": "#1e66f5",
+    "overlay2": "#7c7f93",
+    "text": "#4c4f69",
+}
 
 COLOR_CYCLE = [
-    load_color(PALETTE.identifier, color)
+    _LATTE[color]
     for color in [
         "sky",
         "teal",
@@ -26,9 +39,9 @@ COLOR_CYCLE = [
     ][::-1]
 ]
 
-SPECTRUM_COLOR = load_color(PALETTE.identifier, "blue")
-SPECTRUM_DATA_COLOR = load_color(PALETTE.identifier, "overlay2")
-BACKGROUND_DATA_COLOR = load_color(PALETTE.identifier, "text")
+SPECTRUM_COLOR = _LATTE["blue"]
+SPECTRUM_DATA_COLOR = _LATTE["overlay2"]
+BACKGROUND_DATA_COLOR = _LATTE["text"]
 alpha_median = 0.7
 alpha_envelope = (0.15, 0.25)
 
@@ -262,6 +275,41 @@ def plot_median_and_bands(
     return median, envelope
 
 
+def _compute_bin_ids(observed_counts, min_counts, grouping):
+    """Integer bin-group ids for the requested rebinning, or ``None``.
+
+    Assumes *min_counts* and *grouping* are not both set (validated by callers).
+    """
+    if min_counts is not None:
+        return adaptive_bin_1d(observed_counts, min_counts)
+    if grouping is not None:
+        return np.arange(len(observed_counts)) // grouping
+    return None
+
+
+def _bin_geometry(bin_edges_1d):
+    """Return ``(bin_edges, bin_width, bin_center)`` derived from 1-D bin edges."""
+    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
+    bin_width = np.diff(bin_edges, axis=0).squeeze()
+    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
+    return bin_edges, bin_width, bin_center
+
+
+def _make_spectrum_axes(figsize, draw_residuals):
+    """Create the spectrum figure, with a residual panel below when requested.
+
+    Returns ``(fig, ax_spec, ax_res)`` where ``ax_res`` is ``None`` when
+    *draw_residuals* is ``False``.
+    """
+    if draw_residuals:
+        fig, (ax_spec, ax_res) = plt.subplots(
+            nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
+        )
+        return fig, ax_spec, ax_res
+    fig, ax_spec = plt.subplots(figsize=figsize)
+    return fig, ax_spec, None
+
+
 def plot_data(
     spectrum_index=1,
     plot_model=True,
@@ -331,12 +379,7 @@ def plot_data(
         component_counts = {}
 
     # Compute bin group ids (if any rebinning is requested)
-    bin_ids = None
-    if min_counts is not None:
-        bin_ids = adaptive_bin_1d(observed_counts, min_counts)
-    elif grouping is not None:
-        n_bins = len(observed_counts)
-        bin_ids = np.arange(n_bins) // grouping
+    bin_ids = _compute_bin_ids(observed_counts, min_counts, grouping)
 
     if bin_ids is not None:
         bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
@@ -346,22 +389,12 @@ def plot_data(
         model_counts = {k: rebin_counts(v, bin_ids) for k, v in model_counts.items()}
         component_counts = {k: rebin_counts(v, bin_ids) for k, v in component_counts.items()}
 
-    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
-    bin_width = np.diff(bin_edges, axis=0).squeeze()
-    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
+    bin_edges, bin_width, bin_center = _bin_geometry(bin_edges_1d)
     denominator = bin_width
 
     draw_residuals = show_residuals and plot_model
 
-    if draw_residuals:
-        fig, axs = plt.subplots(
-            nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
-        )
-        ax_spec = axs[0]
-        ax_res = axs[1]
-    else:
-        fig, ax_spec = plt.subplots(figsize=figsize)
-        axs = [ax_spec]
+    fig, ax_spec, ax_res = _make_spectrum_axes(figsize, draw_residuals)
 
     legend_names = []
     legend_list = []
@@ -447,7 +480,7 @@ def plot_data(
 
     if x_lim is None:
         x_lim = (np.min(bin_edges_1d), np.max(bin_edges_1d))
-    axs[0].set_xlim(*x_lim)
+    ax_spec.set_xlim(*x_lim)
 
     if y_lim is not None:
         ax_spec.set_ylim(*y_lim)
@@ -576,12 +609,7 @@ def plot_predictive_coverage(
     observed_counts = state.observed_counts
 
     # Compute bin group ids (if any rebinning is requested)
-    bin_ids = None
-    if min_counts is not None:
-        bin_ids = adaptive_bin_1d(observed_counts, min_counts)
-    elif grouping is not None:
-        n_bins = len(observed_counts)
-        bin_ids = np.arange(n_bins) // grouping
+    bin_ids = _compute_bin_ids(observed_counts, min_counts, grouping)
 
     if bin_ids is not None:
         bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
@@ -598,17 +626,14 @@ def plot_predictive_coverage(
             for k, v in data["component_counts"].items()
         }
 
-    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
-    bin_width = np.diff(bin_edges, axis=0).squeeze()
-    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
+    bin_edges, bin_width, bin_center = _bin_geometry(bin_edges_1d)
     denominator = bin_width
 
     legend_names = []
     legend_list = []
 
-    fig, axs = plt.subplots(
-        nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
-    )
+    fig, ax_spec, ax_res = _make_spectrum_axes(figsize, draw_residuals=True)
+    axs = (ax_spec, ax_res)
 
     ### OBSERVED SPECTRUM
     error_bar = plot_poisson_error_bars(bin_center, bin_edges, observed_counts, denominator, axs[0], SPECTRUM_DATA_COLOR)
@@ -656,18 +681,6 @@ def plot_predictive_coverage(
 
                     legend_list.append((median, envelope))
                     legend_names.append(component_name.lstrip("_")) # We remove the extra "_" if the model name is ""
-
-    """
-    if plot_background and data.get("background") is not None:
-        background = (
-            np.random.negative_binomial(
-                np.repeat(solver._background[None, :], len(models), axis=0) + 1, 1 / 2
-            )
-            * solver._backratio
-        )
-
-        total += background
-    """
 
     total_model_flux = total_model / denominator
     y_observed_flux = observed_counts / denominator

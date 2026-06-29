@@ -228,19 +228,14 @@ class LevenbergMarquardtBackend(Backend):
         best_fit_stat = float(np.asarray(sim_at_best["cstat"]).ravel()[0])
 
         # --- posterior samples + FitResults ---
-        n_posterior = 10_000
-        posterior_samples = self.sample(n_posterior)
-        posterior_dict = {
-            name: posterior_samples[:, i]
-            for i, name in enumerate(self.solver.parameter_names)
-        }
+        posterior = self._posterior_dataframe(self.sample(self.DEFAULT_POSTERIOR_SAMPLES))
         best_fit = pd.Series(
             self.best_fit_params, index=self.solver.parameter_names
         )
 
         return FitResults(
             time=float(run_time()),
-            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            posterior_samples=posterior,
             n_likelihood_evaluations=self.tracer.n_evals,
             log_Z=float("nan"),
             log_Z_err=float("nan"),

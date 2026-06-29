@@ -1,6 +1,3 @@
-from __future__ import print_function
-
-
 from xspec import Xset, Model, Component, Parameter, AllModels
 import re
 from dataclasses import dataclass
@@ -8,6 +5,15 @@ from typing import Iterator
 from collections.abc import Callable
 from contextlib import contextmanager
 from time import perf_counter
+
+# Components defined more than once (e.g. ``tbabs*(powerlaw + powerlaw)``) are
+# reported by XSPEC as ``powerlaw`` and ``powerlaw_3``: an ``_<int>`` suffix.
+_COMPONENT_INDEX_RE = re.compile(r'.*_\d+$')
+
+
+def has_indexed_suffix(name: str) -> bool:
+    """True if a component name ends in an ``_<int>`` index suffix."""
+    return bool(_COMPONENT_INDEX_RE.fullmatch(name))
 
 
 @contextmanager
@@ -78,7 +84,7 @@ def iter_all_parameters() -> Iterator[XspecParameter]:
             # Handle the weird situation where a component is defined multiple times
             # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
             # We explicitly remove the _index if it is here and reapply it so that every component has an index
-            if bool(re.fullmatch(r'.*_\d+$', component.name)):
+            if has_indexed_suffix(component.name):
                 component_name = component_name.split('_')[0]
 
             component_name = f"{component_name}_{component_index + 1}"
@@ -108,34 +114,6 @@ def iter_thawn_parameters() -> Iterator[XspecParameter]:
     for xspec_parameter in iter_all_parameters():
         if not (xspec_parameter.parameter.frozen or bool(xspec_parameter.parameter.link)):
             yield xspec_parameter
-
-
-def build_parameter_name():
-    """
-    Return {XSPEC parameter index -> unique parameter name}.
-    """
-
-    sources_models = AllModels.sources
-
-    name_map = [{} for k in range(len(sources_models))]
-
-    for model_nb, (source, model_name) in enumerate(zip(sources_models.keys(), sources_models.values())):
-        xspec_model = AllModels(1, model_name)
-        for comp_index, comp_name in enumerate(xspec_model.componentNames):
-            comp = getattr(xspec_model, comp_name)
-
-            # Handle the weird situation where a component is defined multiple times
-            # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
-            # Doing so we ensure that every parameter is linked to its component number and avoid duplicates
-            # like powerlaw_3_3
-            if bool(re.fullmatch(r'.*_\d+$', comp_name)):
-                comp_name = comp_name.split('_')[0]
-
-            for par_name in comp.parameterNames:
-                par = getattr(comp, par_name)
-                name_map[model_nb][par.index] = f"{str(comp_name)}_{comp_index + 1}_{str(par_name)}"
-
-    return name_map
 
 
 class XSilence(object):

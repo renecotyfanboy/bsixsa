@@ -12,6 +12,7 @@ if TYPE_CHECKING:
         Nautilus,
         Nessai,
         BackendConfig,
+        SIXSA,
         Ultranest,
     )
     from .emcee import EmceeBackend
@@ -38,6 +39,7 @@ __all__ = [
     "NessaiBackend",
     "Nessai",
     "SIXSABackend",
+    "SIXSA",
     "BackendConfig",
     "UltranestBackend",
     "Ultranest",
@@ -53,6 +55,7 @@ from .config import (
     Nautilus,
     Nessai,
     BackendConfig,
+    SIXSA,
     Ultranest,
 )
 

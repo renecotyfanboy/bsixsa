@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from pydantic import BaseModel
 from scipy.special import expit as sigmoid
 
@@ -21,6 +22,7 @@ class Backend(ABC):
 
     name: str  # registry key, e.g. "nessai"
     config_cls: type[BaseModel] | None = None
+    DEFAULT_POSTERIOR_SAMPLES: int = 10_000  # samples drawn into FitResults by point-estimate backends
 
     def __init__(
         self,
@@ -74,6 +76,10 @@ class Backend(ABC):
         ).ravel()
         unit_cube = np.clip(unit_cube, 1e-25, 1.0 - 1e-25)
         return np.log(unit_cube / (1.0 - unit_cube))
+
+    def _posterior_dataframe(self, samples: np.ndarray) -> pd.DataFrame:
+        """Wrap a ``(n_samples, n_params)`` array as a parameter-named DataFrame."""
+        return pd.DataFrame(samples, columns=self.solver.parameter_names)
 
     @abstractmethod
     def run(self, **kwargs) -> FitResults:

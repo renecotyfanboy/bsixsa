@@ -1,9 +1,6 @@
-from __future__ import print_function
-
 from collections import defaultdict
 import numpy as np
-import re
-from .convenience import XSilence
+from .convenience import XSilence, has_indexed_suffix
 from xspec import AllModels
 from .convenience import iter_all_parameters
 
@@ -103,27 +100,33 @@ class MultipleIndependent:
 
         return lp[0] if x.ndim == 1 else lp
 
-    def max_log_pdf_per_axis(self, n_grid: int = 1024) -> np.ndarray:
-        """Per-axis upper bound on ``logpdf`` over the prior support.
+    def max_log_pdf_per_axis(self) -> np.ndarray:
+        """Per-axis maximum of ``logpdf`` over the prior support.
 
         Used by least-squares MAP fits to shift the prior log-density into a
         non-negative range, so that the prior contribution can be encoded as
         extra residuals whose sum of squares equals
-        ``-2 * log_prior + const``. The grid combines an inverse-CDF
-        sweep (denser where the prior is concentrated) with the support
-        endpoints, which suffices for the priors in this package
-        (``uniform``, ``loguniform``, truncated ``norm``).
+        ``-2 * log_prior + const``.
+
+        Closed-form per family. Supported priors are ``uniform``,
+        ``loguniform``, and truncated ``norm``.
         """
-        quantiles = np.linspace(1.0e-6, 1.0 - 1.0e-6, n_grid)
         out = np.empty(self.ndim, dtype=float)
-        for j, (dist, (lo, hi)) in enumerate(zip(self.dists, self.bounds)):
-            grid = np.concatenate(
-                [np.asarray(dist.ppf(quantiles), dtype=float),
-                 np.array([lo, hi], dtype=float)]
-            )
-            with np.errstate(divide="ignore", invalid="ignore"):
-                log_pdfs = np.asarray(dist.logpdf(grid), dtype=float)
-            out[j] = float(np.nanmax(log_pdfs))
+        for j, dist in enumerate(self.dists):
+            lo, hi = (float(b) for b in dist.support())
+            name = dist.dist.name
+            if name == "uniform":
+                out[j] = float(dist.logpdf(0.5 * (lo + hi)))
+            elif name in ("loguniform", "reciprocal"):
+                out[j] = float(dist.logpdf(lo))
+            elif name == "truncnorm":
+                loc = float(dist.kwds.get("loc", 0.0))
+                out[j] = float(dist.logpdf(min(max(loc, lo), hi)))
+            else:
+                raise NotImplementedError(
+                    f"max_log_pdf is not implemented for {name!r}; "
+                    "supported priors are uniform, loguniform, and truncnorm."
+                )
         return out
 
 
@@ -184,7 +187,7 @@ def build_prior(define_prior):
         # Handle the weird situation where a component is defined multiple times
         # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
         # An insightful user might want to pass "powerlaw_2" & "powerlaw_3" instead of "powerlaw" & "powerlaw_3"
-        if bool(re.fullmatch(r'.*_\d+$', component_name)):
+        if has_indexed_suffix(component_name):
             if component_name not in model.componentNames:
                 split_name = component_name.split('_')[0]
                 if split_name in model.componentNames:

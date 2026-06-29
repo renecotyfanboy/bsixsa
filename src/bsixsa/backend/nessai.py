@@ -104,10 +104,7 @@ class NessaiBackend(Backend):
             warnings.filterwarnings("ignore", message="invalid value encountered in scalar subtract")
             warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
 
-            self._flow_sampler.run(
-                #compute_initial_posterior=True,
-                #redraw_samples=True
-            )
+            self._flow_sampler.run()
 
         posterior_dict = live_points_to_dict(
             self._flow_sampler.posterior_samples,

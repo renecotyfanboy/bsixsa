@@ -48,12 +48,8 @@ class SpectrumState:
         return np.diff(self.bin_edges, axis=0).squeeze()
 
     @property
-    def bin_center(self, log=True) -> np.ndarray:
-
-        if log:
-            return np.sqrt(np.prod(self.bin_edges, axis=0).squeeze())
-        else:
-            return np.mean(self.bin_edges, axis=0).squeeze()
+    def bin_center(self) -> np.ndarray:
+        return np.sqrt(np.prod(self.bin_edges, axis=0).squeeze())
 
     @property
     def component_counts(self) -> dict[str, np.ndarray]:
@@ -128,11 +124,6 @@ def get_model_block(lines):
             m = model_pattern.match(stripped)
 
             current_parameter_index = 1
-
-            if m.group(1) is not None:
-                current_model_index = int(m.group(1))
-            else:
-                current_model_index = None
 
             if m.group(2) is not None:
                 current_model_name = str(m.group(2))

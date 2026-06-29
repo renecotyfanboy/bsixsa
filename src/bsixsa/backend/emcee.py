@@ -1,4 +1,4 @@
-"""CMA-ES backend using *pycma*."""
+"""Ensemble MCMC backend using *emcee*."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import typing
 
 import emcee
 import numpy as np
-import pandas as pd
 
 from . import register_backend
 from .abc import Backend
@@ -83,15 +82,11 @@ class EmceeBackend(Backend):
         with catchtime("Run emcee", print_time=False) as run_time:
             self.sampler.run_mcmc(x0, num_warmup + num_samples, progress=True)
 
-        posterior_samples = self.sampler.get_chain(discard=num_warmup, thin=1, flat=True)
-        posterior_dict = {
-            name: posterior_samples[:, i]
-            for i, name in enumerate(self.solver.parameter_names)
-        }
+        chain = self.sampler.get_chain(discard=num_warmup, thin=1, flat=True)
 
         self.fit_result = FitResults(
             time=float(run_time()),
-            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            posterior_samples=self._posterior_dataframe(chain),
             n_likelihood_evaluations=int(self.tracer.n_evals),
             log_Z=float("nan"),
             log_Z_err=float("nan"),

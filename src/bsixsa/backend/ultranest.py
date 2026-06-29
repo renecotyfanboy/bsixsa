@@ -2,7 +2,6 @@ import os
 import typing
 
 import numpy as np
-import pandas as pd
 import ultranest
 import ultranest.popstepsampler
 import ultranest.calibrator
@@ -74,14 +73,9 @@ class UltranestBackend(Backend):
         self._reactive_sampler.plot()
         self._results = results
 
-        posterior_dict = {
-            name: results["samples"][:, i]
-            for i, name in enumerate(self.solver.parameter_names)
-        }
-
         return FitResults(
             time=float(run_time()),
-            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
+            posterior_samples=self._posterior_dataframe(results["samples"]),
             n_likelihood_evaluations=results["ncall"],
             log_Z=float(results["logz"]),
             log_Z_err=float(results["logzerr"]),
