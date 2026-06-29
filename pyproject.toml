@@ -1,6 +1,6 @@
 [project]
 name = "bsixsa"
-version = "0.1.5"
+version = "0.1.6"
 description = "Friendly BXA interface for SIXSA"
 readme = "README.md"
 authors = [
