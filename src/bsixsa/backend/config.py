@@ -327,11 +327,12 @@ class SIXSA(BackendConfig):
         description="Number of neural posterior estimators trained per round.",
     )
     first_round_sampling: str = Field(
-        default="lhs",
+        default="qmc",
         description=(
-            "Round-1 design in the unit cube: 'lhs' draws a Latin hypercube for even "
-            "space-filling coverage of the prior at a fixed simulation budget; 'prior' "
-            "draws i.i.d. uniform samples (the previous behaviour)."
+            "Round-1 design in the unit-Gaussian latent N(0, I): 'qmc' draws a "
+            "Sobol-based quasi-Monte-Carlo design (`MultivariateNormalQMC`) for even "
+            "space-filling coverage at a fixed simulation budget; 'prior' draws i.i.d. "
+            "standard-normal samples."
         ),
     )
     embedding: Any = Field(
@@ -437,7 +438,15 @@ class SIXSA(BackendConfig):
     )
     truncated_sampling_method: str = Field(
         default="sir",
-        description="Sampling method for the restricted prior (e.g. 'sir', 'rejection').",
+        description=(
+            "Sampling method for the restricted proposal ('sir' or 'rejection'). "
+            "SIXSA importance-weights each draw with the ensemble posterior density as "
+            "the proposal density (log_q_mix), so the proposal must approximate the "
+            "posterior: 'sir' draws from the posterior and rejects out-of-HPR points "
+            "(approx. posterior) and is the correct choice. 'rejection' samples the "
+            "truncated PRIOR instead, which is inconsistent with the IS weighting and "
+            "biases the k-hat/ESS/efficiency diagnostics and the resampled posterior."
+        ),
     )
     num_posterior_samples: PositiveInt = Field(
         default=10_000,

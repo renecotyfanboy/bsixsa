@@ -91,6 +91,31 @@ class MultipleIndependent:
             cube[..., j] = dist.cdf(x[..., j])
         return cube
 
+    def from_unit_gaussian(self, z):
+        """Map ``z ~ N(0, I)^D`` to physical space via ``ppf(Phi(z))`` per marginal.
+
+        Composes the standard-normal CDF ``Phi`` with each marginal's inverse CDF
+        (``from_unit_cube``), so a standard-normal latent is mapped to the prior
+        distribution. This is the unbounded counterpart of ``from_unit_cube`` used
+        by the SIXSA backend, whose latent space is a unit Gaussian rather than the
+        unit cube.
+        """
+        from scipy.stats import norm
+        z = np.asarray(z, dtype=float)
+        return self.from_unit_cube(norm.cdf(z))
+
+    def to_unit_gaussian(self, x):
+        """Map physical parameters to ``z ~ N(0, I)^D`` via ``Phi^{-1}(cdf(x))`` per marginal.
+
+        Inverse of ``from_unit_gaussian``: the per-marginal CDF (``to_unit_cube``)
+        followed by the standard-normal inverse CDF. The unit-cube values are
+        clipped away from ``0``/``1`` so the inverse CDF stays finite at the prior
+        bounds.
+        """
+        from scipy.stats import norm
+        cube = np.clip(self.to_unit_cube(x), 1e-12, 1.0 - 1e-12)
+        return norm.ppf(cube)
+
     def log_prob(self, x):
         x = np.asarray(x)
         x2 = np.atleast_2d(x)

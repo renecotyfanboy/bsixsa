@@ -11,7 +11,7 @@ import torch
 from joblib import Parallel, delayed
 from sbi.inference import EnsemblePosterior, NPE
 from sbi.neural_nets import posterior_nn
-from sbi.utils import BoxUniform, RestrictedPrior, get_density_thresholder
+from sbi.utils import RestrictedPrior, get_density_thresholder
 
 from .. import register_backend
 from ..abc import Backend
@@ -40,6 +40,20 @@ DEFAULT_NDE_KWARGS = {
 # actually catastrophic. Mirrors `_sixsa_dev` (sixsa_main.py); below this we
 # report k_hat = inf so such rounds are never selected as best.
 _KHAT_MIN_ESS = 10.0
+
+
+def _unit_gaussian_prior(ndim):
+    """Standard-normal prior ``N(0, I)`` over the SIXSA latent space.
+
+    SIXSA works in a unit-Gaussian latent space (rather than the unit cube): the
+    unbounded support lets the flow and the rejection sampler avoid the hard box
+    edges that previously caused mass leakage and inefficient sampling. Latent
+    draws are mapped to physical parameters by ``solver.prior.from_unit_gaussian``
+    (``ppf(Phi(z))`` per marginal).
+    """
+    return torch.distributions.MultivariateNormal(
+        torch.zeros(ndim), torch.eye(ndim)
+    )
 
 
 def patch_sample_no_pbar(posterior):
@@ -102,7 +116,7 @@ def training_job(
             net = embedding_net.build(x.shape[1])
         else:
             net = FCEmbeddingNet().build(x.shape[1])
-        prior_sbi = BoxUniform(torch.zeros(theta.shape[-1]), torch.ones(theta.shape[-1]))
+        prior_sbi = _unit_gaussian_prior(theta.shape[-1])
         build_fun = posterior_nn(
             embedding_net=net, **(nde_kwargs or DEFAULT_NDE_KWARGS)
         )
@@ -188,43 +202,40 @@ class SIXSABackend(Backend):
         self.proposals = []
         self.history = []
         self.n_nets = config.n_ensemble
-        self.prior = BoxUniform(
-            low=torch.zeros(solver.prior.ndim),
-            high=torch.ones(solver.prior.ndim),
-        )
+        self.prior = _unit_gaussian_prior(solver.prior.ndim)
         self.best_ensemble = None
         self.best_round = 0
         self.best_efficiency = -float("inf")
         self.best_khat = float("inf")
         self.best_log_Z = float("nan")
         self.best_log_Z_err = float("nan")
-        # Importance-resampling posterior: (theta_unit_cube, normalised_weights)
+        # Importance-resampling posterior: (theta_latent, normalised_weights)
         # for the best round, and the most recent round's set.
         self.best_weighted = None
         self._last_weighted = None
 
     def sample(self, n: int) -> np.ndarray:
-        # The backend works in the unit cube internally (flow, IS weights,
-        # resampling); convert to physical here, at the public boundary, so the
-        # returned posterior matches the prior and the other backends and can be
-        # fed straight to `solver.simulate()` / the predictive-coverage plots.
+        # The backend works in the unit-Gaussian latent internally (flow, IS
+        # weights, resampling); convert to physical here, at the public boundary,
+        # so the returned posterior matches the prior and the other backends and
+        # can be fed straight to `solver.simulate()` / the predictive-coverage plots.
         if self.best_weighted is not None:
             # Preferred: importance-resample the best round's simulated points
-            # (the reference's posterior). These are real in-box draws, so the
-            # physical samples are strictly within the prior support (no
-            # out-of-distribution events) and the flow is never sampled.
+            # (the reference's posterior). These are real prior draws, so the
+            # physical samples lie within the prior support (no out-of-distribution
+            # events) and the flow is never sampled.
             theta, weights = self.best_weighted
             idx = torch.multinomial(weights, n, replacement=True)
-            cube = theta[idx]
+            latent = theta[idx]
         elif self.best_ensemble is not None:
-            cube = self.best_ensemble.sample((n,))
+            latent = self.best_ensemble.sample((n,))
         else:
             sampler = self.proposals[-1] if self.proposals else self.prior
-            cube = sampler.sample((n,))
+            latent = sampler.sample((n,))
 
-        if hasattr(cube, "detach"):
-            cube = cube.detach().cpu().numpy()
-        return self._cube_to_physical(np.asarray(cube))
+        if hasattr(latent, "detach"):
+            latent = latent.detach().cpu().numpy()
+        return self._gaussian_to_physical(np.asarray(latent))
 
     def _compute_is_diagnostics(self, new_log, cstats, log_w):
         import torch
@@ -276,21 +287,23 @@ class SIXSABackend(Backend):
 
         return diag
 
-    def _initial_unit_cube(self, n: int) -> torch.Tensor:
-        """Draw the first round's parameters in the unit cube ``[0, 1]^D``.
+    def _initial_latent(self, n: int) -> torch.Tensor:
+        """Draw the first round's parameters in the unit-Gaussian latent ``N(0, I)``.
 
-        With ``first_round_sampling="lhs"`` (default) this returns a Latin
-        hypercube design, which fills the cube far more evenly than i.i.d.
-        uniform draws at the same simulation budget; ``"prior"`` restores the
-        previous i.i.d. uniform draw. The samples are mapped to physical space
-        downstream by ``solver.prior.from_unit_cube`` (per-marginal inverse CDF),
-        which preserves the per-axis stratification of the LHS design.
+        With ``first_round_sampling="qmc"`` (default) this returns a Sobol-based
+        quasi-Monte-Carlo design (``MultivariateNormalQMC``), which fills the
+        latent far more evenly than i.i.d. normal draws at the same simulation
+        budget; ``"prior"`` restores the plain i.i.d. ``N(0, I)`` draw. The
+        samples are mapped to physical space downstream by
+        ``solver.prior.from_unit_gaussian`` (``ppf(Phi(z))`` per marginal).
         """
-        if self.config.first_round_sampling == "lhs":
+        if self.config.first_round_sampling == "qmc":
             from scipy.stats import qmc
 
-            cube = qmc.LatinHypercube(d=self.solver.prior.ndim).random(n)
-            return torch.as_tensor(cube, dtype=torch.float32)
+            z = qmc.MultivariateNormalQMC(
+                mean=np.zeros(self.solver.prior.ndim)
+            ).random(n)
+            return torch.as_tensor(z, dtype=torch.float32)
         return self.prior.sample((n,))
 
     def inference_round(
@@ -311,18 +324,18 @@ class SIXSABackend(Backend):
         # importance weight for training (round 1 has no weights and keeps all).
         n_pool = n_simulations
         if proposal is None:
-            parameters_unit_cube = self._initial_unit_cube(n_pool)
+            parameters_latent = self._initial_latent(n_pool)
         else:
-            parameters_unit_cube = proposal.sample((n_pool,))
+            parameters_latent = proposal.sample((n_pool,))
 
-        parameters = self.solver.prior.from_unit_cube(parameters_unit_cube.numpy())
+        parameters = self.solver.prior.from_unit_gaussian(parameters_latent.numpy())
         simulations_results = self.solver.simulate(parameters, return_kind="full_model_counts")
         spectra = simulations_results["total_model_counts"]
         cstats = torch.as_tensor(simulations_results["cstat"], dtype=torch.float32)
 
         diag = None
         selected_mask = None
-        kept_theta_cube = parameters_unit_cube
+        kept_theta_latent = parameters_latent
         kept_spectra = spectra
         kept_cstats = cstats
         self._last_weighted = None
@@ -332,25 +345,31 @@ class SIXSABackend(Backend):
 
             # Evaluate log_q under the previous ensemble of NPE posteriors
             log_q = torch.stack(
-                [pk.log_prob(parameters_unit_cube, x=observation)
+                [pk.log_prob(parameters_latent, x=observation)
                  for pk in previous_posteriors_list],
                 0,
             )
             log_q_mix = torch.logsumexp(log_q, dim=0) - np.log(len(previous_posteriors_list))
 
-            # Prior density (BoxUniform prior log_prob on unit cube)
-            log_prior = self.prior.log_prob(parameters_unit_cube)
+            # log_q_mix is the proposal density in the IS weights below, so this is
+            # only valid when the proposal approximates the posterior
+            # (proposal_mode="posterior", or "truncated" with sample_with="sir").
+            # Rejection sampling draws the truncated prior instead and would bias
+            # these weights -- see `run()` for the guard.
+
+            # Prior density (standard-normal prior log_prob on the latent samples)
+            log_prior = self.prior.log_prob(parameters_latent)
 
             # Raw importance log-weights: -0.5 cstat + log prior - log proposal
             log_w = -0.5 * cstats + log_prior - log_q_mix
 
-            diag = self._compute_is_diagnostics(parameters_unit_cube, cstats, log_w)
+            diag = self._compute_is_diagnostics(parameters_latent, cstats, log_w)
 
             # Stash the importance-weighted simulated points (all finite samples)
             # so the run can return an IS-resampled posterior from the best round.
             if diag["w_norm"] is not None:
                 self._last_weighted = (
-                    parameters_unit_cube[diag["finite"]].detach(),
+                    parameters_latent[diag["finite"]].detach(),
                     diag["w_norm"].detach(),
                 )
             else:
@@ -360,13 +379,13 @@ class SIXSABackend(Backend):
             if is_filter_fraction > 0.0:
                 n_keep = max(
                     1,
-                    int(round((1.0 - is_filter_fraction) * len(parameters_unit_cube))),
+                    int(round((1.0 - is_filter_fraction) * len(parameters_latent))),
                 )
                 keep_idx = torch.argsort(diag["log_w_safe"], descending=True)[:n_keep]
-                kept_theta_cube = parameters_unit_cube[keep_idx]
+                kept_theta_latent = parameters_latent[keep_idx]
                 kept_spectra = spectra[keep_idx]
                 kept_cstats = cstats[keep_idx]
-                selected_mask = np.zeros(len(parameters_unit_cube), dtype=bool)
+                selected_mask = np.zeros(len(parameters_latent), dtype=bool)
                 selected_mask[keep_idx.numpy()] = True
 
         # Fit the (optional) pre-processor embedding on the kept spectra. The NPEs
@@ -386,11 +405,11 @@ class SIXSABackend(Backend):
         # machine's worth of threads per worker -> n_nets x cores contention).
         nde_kwargs = self.config.nde_kwargs or DEFAULT_NDE_KWARGS
         num_threads = max(1, (os.cpu_count() or 1) // max(1, self.n_nets))
-        kept_theta_cube_np = kept_theta_cube.numpy().copy()
+        kept_theta_latent_np = kept_theta_latent.numpy().copy()
         results = Parallel(n_jobs=-1)(
             delayed(training_job)(
                 i,
-                kept_theta_cube_np,
+                kept_theta_latent_np,
                 kept_spectra,
                 embedding_net=embedding_net,
                 round_number=round_number,
@@ -416,7 +435,7 @@ class SIXSABackend(Backend):
         round_info = {
             "round": round_number,
             "n_simulations_round": n_pool,
-            "n_kept": int(len(kept_theta_cube)),
+            "n_kept": int(len(kept_theta_latent)),
             "nde_stats": nde_stats,
             "cstat_min": float(kept_cstats.min().item()),
             "cstat_median": float(kept_cstats.median().item()),
@@ -504,10 +523,10 @@ class SIXSABackend(Backend):
             # Defaults matching `_sixsa_dev`'s effective regime. Two key knobs:
             #
             # * `force_first_round_loss=True` keeps the simple (non-atomic) MLE
-            #   loss every round instead of the atomic SNPE-C loss (which makes
-            #   the flow leak mass outside the prior box -> broken rejection
-            #   sampling). The loss is applied to the importance-filtered (in-box)
-            #   current batch, which approximates the posterior.
+            #   loss every round instead of the atomic SNPE-C loss. The loss is
+            #   applied to the importance-filtered current batch, which approximates
+            #   the posterior. (The unit-Gaussian latent is unbounded, so the flow
+            #   no longer needs to respect a prior box.)
             # * `retrain_from_scratch=True` trains a FRESH net + FRESH embedding
             #   each round on that round's kept batch ONLY. The reference does
             #   this (a new NPE_C per round); warm-starting + accumulating earlier
@@ -667,6 +686,17 @@ class SIXSABackend(Backend):
                 # We train a restricted proposal if not in the last round
                 if round_number < num_rounds:
                     if proposal_mode == "truncated":
+                        if truncated_sampling_method == "rejection":
+                            warnings.warn(
+                                "proposal_mode='truncated' with "
+                                "truncated_sampling_method='rejection' samples the "
+                                "truncated prior, which is inconsistent with SIXSA's "
+                                "importance weighting (it uses the posterior density "
+                                "as the proposal density) and biases the k-hat/ESS/"
+                                "efficiency diagnostics and the resampled posterior. "
+                                "Use truncated_sampling_method='sir'.",
+                                stacklevel=2,
+                            )
                         accept_reject_fn = get_density_thresholder(
                             proposal,
                             num_samples_to_estimate_support=truncated_num_samples_to_estimate_support,

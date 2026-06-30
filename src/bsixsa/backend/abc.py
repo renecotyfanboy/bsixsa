@@ -64,6 +64,16 @@ class Backend(ABC):
             np.atleast_2d(physical)
         ).ravel()
 
+    def _gaussian_to_physical(self, latent: np.ndarray) -> np.ndarray:
+        """Map unit-Gaussian latent parameters to physical space."""
+        return self.solver.prior.from_unit_gaussian(np.atleast_2d(latent))
+
+    def _physical_to_gaussian(self, physical: np.ndarray) -> np.ndarray:
+        """Map physical-space parameters to the unit-Gaussian latent space."""
+        return self.solver.prior.to_unit_gaussian(
+            np.atleast_2d(physical)
+        ).ravel()
+
     def _unconstrained_to_physical(self, unconstrained: np.ndarray) -> np.ndarray:
         """Map unconstrained-space parameters to physical space (sigmoid then inverse CDF)."""
         unit_cube = sigmoid(np.atleast_2d(unconstrained))
