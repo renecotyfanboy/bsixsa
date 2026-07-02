@@ -114,13 +114,17 @@ class IminuitBackend(Backend):
         best_fit = pd.Series(
             self.best_fit_params, index=self.solver.parameter_names
         )
-        # Bare cstat at the best fit (matches XSPEC's Fit.statistic).
+        # Statistic at the best fit: bare cstat plus XSPEC's bayes-on prior
+        # term (matches Fit.statistic with Fit.bayes="on").
         sim_at_best = self.solver.simulate(
             np.atleast_2d(self.best_fit_params),
             return_kind="cstat",
             progress_bar=False,
         )
         best_fit_stat = float(np.asarray(sim_at_best["cstat"]).ravel()[0])
+        best_fit_stat += self.solver.prior.xspec_bayes_contribution(
+            self.best_fit_params
+        )
 
         return FitResults(
             time=float(run_time()),

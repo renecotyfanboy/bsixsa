@@ -306,6 +306,27 @@ class SIXSABackend(Backend):
             return torch.as_tensor(z, dtype=torch.float32)
         return self.prior.sample((n,))
 
+    @contextlib.contextmanager
+    def _phase(self, round_number, name):
+        """Time a named per-round phase and print it (gated on ``config.trace``).
+
+        Lets you see which step between folding rounds dominates the wall time
+        (e.g. SIR proposal sampling, the IS-diagnostics log_prob loop, building
+        the next proposal, or plotting) without confusing it with NDE training.
+        Printed with ``flush=True`` so a slow/hanging phase is visible live.
+        """
+        if not self.config.trace:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            print(
+                f"[SIXSA r{round_number}] {name}: {time.perf_counter() - t0:.2f} s",
+                flush=True,
+            )
+
     def inference_round(
         self,
         n_simulations,
@@ -316,22 +337,34 @@ class SIXSABackend(Backend):
         round_number=0,
         training_kwargs=None,
         is_filter_fraction=0.0,
-        proposal_mode="truncated",
         previous_posteriors_list=None,
     ):
         # `n_simulations` is the per-round simulation budget: we draw and simulate
         # exactly this many, then keep the top (1 - is_filter_fraction) fraction by
         # importance weight for training (round 1 has no weights and keeps all).
         n_pool = n_simulations
-        if proposal is None:
-            parameters_latent = self._initial_latent(n_pool)
-        else:
-            parameters_latent = proposal.sample((n_pool,))
+        with self._phase(
+            round_number,
+            "proposal sampling (SIR)" if proposal is not None else "initial sampling",
+        ):
+            if proposal is None:
+                parameters_latent = self._initial_latent(n_pool)
+            else:
+                # `proposal` is the truncated RestrictedPrior (sample_with="sir"). Draw
+                # in smaller SIR batches (mirroring `_sixsa_dev`) so each iteration only
+                # draws `max_sampling_batch_size * 32` candidates from the ensemble
+                # posterior instead of the full `n_pool * 32` at once. Purely a
+                # performance knob -- the sampled distribution is unchanged.
+                parameters_latent = proposal.sample(
+                    (n_pool,),
+                    max_sampling_batch_size=self.config.truncated_max_sampling_batch_size,
+                )
 
-        parameters = self.solver.prior.from_unit_gaussian(parameters_latent.numpy())
-        simulations_results = self.solver.simulate(parameters, return_kind="full_model_counts")
-        spectra = simulations_results["total_model_counts"]
-        cstats = torch.as_tensor(simulations_results["cstat"], dtype=torch.float32)
+        with self._phase(round_number, "simulation (folding)"):
+            parameters = self.solver.prior.from_unit_gaussian(parameters_latent.numpy())
+            simulations_results = self.solver.simulate(parameters, return_kind="full_model_counts")
+            spectra = simulations_results["total_model_counts"]
+            cstats = torch.as_tensor(simulations_results["cstat"], dtype=torch.float32)
 
         diag = None
         selected_mask = None
@@ -341,6 +374,10 @@ class SIXSABackend(Backend):
         self._last_weighted = None
 
         if proposal is not None and previous_posteriors_list is not None:
+            # Timed explicitly (rather than via `self._phase`) to wrap this whole
+            # block without re-indenting it; the `log_prob` loop over the previous
+            # ensemble is the usual non-training suspect between folding rounds.
+            _t_is_diag = time.perf_counter()
             observation = torch.from_numpy(self.solver.observed_spectrum)
 
             # Evaluate log_q under the previous ensemble of NPE posteriors
@@ -352,10 +389,10 @@ class SIXSABackend(Backend):
             log_q_mix = torch.logsumexp(log_q, dim=0) - np.log(len(previous_posteriors_list))
 
             # log_q_mix is the proposal density in the IS weights below, so this is
-            # only valid when the proposal approximates the posterior
-            # (proposal_mode="posterior", or "truncated" with sample_with="sir").
-            # Rejection sampling draws the truncated prior instead and would bias
-            # these weights -- see `run()` for the guard.
+            # only valid when the proposal approximates the posterior. SIXSA only
+            # supports the truncated proposal sampled with SIR (see
+            # `_build_proposal`), which draws from the posterior and rejects
+            # out-of-HPR points, so this assumption always holds.
 
             # Prior density (standard-normal prior log_prob on the latent samples)
             log_prior = self.prior.log_prob(parameters_latent)
@@ -388,16 +425,24 @@ class SIXSABackend(Backend):
                 selected_mask = np.zeros(len(parameters_latent), dtype=bool)
                 selected_mask[keep_idx.numpy()] = True
 
+            if self.config.trace:
+                print(
+                    f"[SIXSA r{round_number}] IS diagnostics (log_prob over ensemble): "
+                    f"{time.perf_counter() - _t_is_diag:.2f} s",
+                    flush=True,
+                )
+
         # Fit the (optional) pre-processor embedding on the kept spectra. The NPEs
         # train on the raw kept spectra with their own jointly-trained embedding
         # net, so this only matters for a trainable pre-processor embedding.
         noisy_spectra = np.random.poisson(kept_spectra).astype(np.float32)
         round_path = os.path.join(self.solver.outputfiles_basename, f"round_{round_number}")
         os.makedirs(round_path, exist_ok=True)
-        embedding.fit(
-            noisy_spectra,
-            metrics_path=os.path.join(round_path, "embedding_training.pdf"),
-        )
+        with self._phase(round_number, "embedding fit"):
+            embedding.fit(
+                noisy_spectra,
+                metrics_path=os.path.join(round_path, "embedding_training.pdf"),
+            )
 
         # Train the ensemble of NPEs on the kept (filtered) parameters. Each job
         # returns (posterior, training_stats). Split the cores evenly across the
@@ -406,21 +451,22 @@ class SIXSABackend(Backend):
         nde_kwargs = self.config.nde_kwargs or DEFAULT_NDE_KWARGS
         num_threads = max(1, (os.cpu_count() or 1) // max(1, self.n_nets))
         kept_theta_latent_np = kept_theta_latent.numpy().copy()
-        results = Parallel(n_jobs=-1)(
-            delayed(training_job)(
-                i,
-                kept_theta_latent_np,
-                kept_spectra,
-                embedding_net=embedding_net,
-                round_number=round_number,
-                output_dir=self.solver.outputfiles_basename,
-                proposal=proposal,
-                training_kwargs=training_kwargs,
-                nde_kwargs=nde_kwargs,
-                num_threads=num_threads,
+        with self._phase(round_number, "training (ensemble NPE)"):
+            results = Parallel(n_jobs=-1)(
+                delayed(training_job)(
+                    i,
+                    kept_theta_latent_np,
+                    kept_spectra,
+                    embedding_net=embedding_net,
+                    round_number=round_number,
+                    output_dir=self.solver.outputfiles_basename,
+                    proposal=proposal,
+                    training_kwargs=training_kwargs,
+                    nde_kwargs=nde_kwargs,
+                    num_threads=num_threads,
+                )
+                for i in range(self.n_nets)
             )
-            for i in range(self.n_nets)
-        )
 
         # Gather the posterior ensemble + per-NDE training stats
         posteriors = [patch_sample_no_pbar(result[0]) for result in results]
@@ -449,10 +495,11 @@ class SIXSABackend(Backend):
 
         # Optional per-round diagnostic plots (coverage band + ensemble corner).
         if self.config.plot_diagnostics:
-            self._plot_round_diagnostics(
-                spectra, selected_mask, posteriors, ensemble,
-                round_number, round_path,
-            )
+            with self._phase(round_number, "round diagnostics plotting"):
+                self._plot_round_diagnostics(
+                    spectra, selected_mask, posteriors, ensemble,
+                    round_number, round_path,
+                )
 
         return ensemble, posteriors, round_info
 
@@ -494,6 +541,33 @@ class SIXSABackend(Backend):
 
         plt.close("all")
 
+    def _build_proposal(self, ens_post):
+        """Build the next round's proposal: a density-thresholded RestrictedPrior
+        over the clean prior, sampled with SIR.
+
+        Mirrors `_sixsa_dev/src/sixsa_main.py::_build_proposal` (truncated branch,
+        ``restrict_from_prior=True``). Each round restricts the ORIGINAL prior
+        (``self.prior``) with the current round's density thresholder, so
+        restrictions do not stack -- an early over-restriction does not persist,
+        because the next round restricts the clean prior afresh with a
+        better-trained NDE. ``ens_post`` is passed to ``RestrictedPrior`` as the
+        SIR proposal, which sbi requires for ``sample_with="sir"``.
+        """
+        accept_reject_fn = get_density_thresholder(
+            ens_post,
+            quantile=self.config.truncated_quantile,
+            num_samples_to_estimate_support=(
+                self.config.truncated_num_samples_to_estimate_support
+            ),
+        )
+        return RestrictedPrior(
+            self.prior,
+            accept_reject_fn,
+            ens_post,
+            sample_with="sir",
+            device=self.config.device,
+        )
+
     def run(self) -> 'FitResults':
         from ...solver import FitResults
         from ...convenience import catchtime
@@ -505,16 +579,9 @@ class SIXSABackend(Backend):
         embedding_net = self.config.embedding_net
         training_kwargs = self.config.training_kwargs
         max_num_epochs = self.config.max_num_epochs
-        device = self.config.device
-        proposal_mode = self.config.proposal_mode
         is_filter_fraction = self.config.is_filter_fraction
         khat_threshold = self.config.khat_threshold
         force_last_round = self.config.force_last_round
-        truncated_quantile = self.config.truncated_quantile
-        truncated_num_samples_to_estimate_support = (
-            self.config.truncated_num_samples_to_estimate_support
-        )
-        truncated_sampling_method = self.config.truncated_sampling_method
 
         self.n_nets = self.config.n_ensemble
         num_rounds = len(num_simulations_per_round)
@@ -622,7 +689,6 @@ class SIXSABackend(Backend):
                     round_number=round_number,
                     training_kwargs=current_training_kwargs,
                     is_filter_fraction=is_filter_fraction,
-                    proposal_mode=proposal_mode,
                     previous_posteriors_list=previous_posteriors_list,
                 )
                 self.proposals.append(proposal)
@@ -685,30 +751,8 @@ class SIXSABackend(Backend):
 
                 # We train a restricted proposal if not in the last round
                 if round_number < num_rounds:
-                    if proposal_mode == "truncated":
-                        if truncated_sampling_method == "rejection":
-                            warnings.warn(
-                                "proposal_mode='truncated' with "
-                                "truncated_sampling_method='rejection' samples the "
-                                "truncated prior, which is inconsistent with SIXSA's "
-                                "importance weighting (it uses the posterior density "
-                                "as the proposal density) and biases the k-hat/ESS/"
-                                "efficiency diagnostics and the resampled posterior. "
-                                "Use truncated_sampling_method='sir'.",
-                                stacklevel=2,
-                            )
-                        accept_reject_fn = get_density_thresholder(
-                            proposal,
-                            num_samples_to_estimate_support=truncated_num_samples_to_estimate_support,
-                            quantile=truncated_quantile,
-                        )
-                        proposal = RestrictedPrior(
-                            self.prior,
-                            accept_reject_fn,
-                            posterior=proposal,
-                            sample_with=truncated_sampling_method,
-                            device=device,
-                        )
+                    with self._phase(round_number, "build next proposal (density thresholder)"):
+                        proposal = self._build_proposal(proposal)
 
             # Fallback to the final proposal if best_ensemble is not populated
             if self.best_ensemble is None and self.proposals:

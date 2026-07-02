@@ -126,6 +126,36 @@ class MultipleIndependent:
 
         return lp[0] if x.ndim == 1 else lp
 
+    def xspec_bayes_contribution(self, x) -> float:
+        """XSPEC ``Fit.bayes="on"`` prior contribution to the fit statistic.
+
+        Evaluates ``-2 * Log(prior)`` per axis with XSPEC's unnormalised
+        conventions (``Bayes::lPrior``) for the priors we compare against
+        XSPEC: ``uniform`` -> ``cons`` contributes ``0``, ``loguniform`` ->
+        ``jeffreys`` contributes ``2*ln(x)``. Adding this to the bare cstat
+        at ``x`` reproduces XSPEC's ``Fit.statistic`` when ``Fit.bayes`` is
+        on for those priors.
+        """
+        x = np.asarray(x, dtype=float).ravel()
+        contribution = 0.0
+        for j, dist in enumerate(self.dists):
+            name = dist.dist.name
+            if name == "uniform":
+                continue
+            elif name in ("loguniform", "reciprocal"):
+                contribution += 2.0 * np.log(x[j])
+            else:
+                # Only uniform (-> cons) and loguniform (-> jeffreys) are
+                # guaranteed to match XSPEC's bayes-on statistic exactly.
+                # Everything else uses the scipy log-pdf, which differs
+                # from the XSPEC counterpart by normalisation constants
+                # (e.g. XSPEC's gauss prior is an untruncated Gaussian
+                # while bsixsa's norm() is a truncated one) — acceptable,
+                # as only uniform/loguniform fits are cross-checked
+                # against XSPEC.
+                contribution += -2.0 * float(dist.logpdf(x[j]))
+        return float(contribution)
+
     def max_log_pdf_per_axis(self) -> np.ndarray:
         """Per-axis maximum of ``logpdf`` over the prior support.
 

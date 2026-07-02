@@ -396,15 +396,6 @@ class SIXSA(BackendConfig):
         default="cpu",
         description="Torch device used for the restricted proposal.",
     )
-    proposal_mode: str = Field(
-        default="truncated",
-        description=(
-            "Strategy for the next round's proposal: 'truncated' (the `_sixsa_dev` "
-            "default) wraps the ensemble posterior in a density-thresholded "
-            "RestrictedPrior over the clean prior; 'posterior' draws directly from "
-            "the ensemble posterior."
-        ),
-    )
     is_filter_fraction: float = Field(
         default=0.5,
         strict=True,
@@ -436,16 +427,18 @@ class SIXSA(BackendConfig):
         default=10_000,
         description="Number of samples used to estimate the restricted-proposal support.",
     )
-    truncated_sampling_method: str = Field(
-        default="sir",
+    truncated_max_sampling_batch_size: PositiveInt = Field(
+        default=1_000,
         description=(
-            "Sampling method for the restricted proposal ('sir' or 'rejection'). "
-            "SIXSA importance-weights each draw with the ensemble posterior density as "
-            "the proposal density (log_q_mix), so the proposal must approximate the "
-            "posterior: 'sir' draws from the posterior and rejects out-of-HPR points "
-            "(approx. posterior) and is the correct choice. 'rejection' samples the "
-            "truncated PRIOR instead, which is inconsistent with the IS weighting and "
-            "biases the k-hat/ESS/efficiency diagnostics and the resampled posterior."
+            "Batch size for SIR sampling from the truncated proposal, forwarded to "
+            "sbi's `RestrictedPrior.sample(max_sampling_batch_size=...)`. Each "
+            "iteration draws `batch_size * 32` candidates from the ensemble posterior "
+            "and resamples `batch_size`, so a smaller value caps peak memory/compute "
+            "at the cost of more iterations. This is purely a performance knob -- it "
+            "does not change the sampled distribution. sbi's default is 10_000; SIXSA "
+            "uses a smaller batch by default, mirroring `_sixsa_dev`'s small-batch SIR. "
+            "(Note: sbi 0.25.0 ignores the related `oversampling_factor`; "
+            "candidates-per-sample is fixed at 32.)"
         ),
     )
     num_posterior_samples: PositiveInt = Field(
