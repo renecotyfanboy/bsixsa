@@ -219,13 +219,15 @@ class LevenbergMarquardtBackend(Backend):
                 prior, self.best_fit_params, cov_phys
             )
 
-        # --- bare cstat at the best fit (matches XSPEC's Fit.statistic) ---
+        # --- statistic at the best fit: bare cstat plus XSPEC's bayes-on
+        # prior term (matches Fit.statistic with Fit.bayes="on") ---
         sim_at_best = self.solver.simulate(
             np.atleast_2d(self.best_fit_params),
             return_kind="cstat",
             progress_bar=False,
         )
         best_fit_stat = float(np.asarray(sim_at_best["cstat"]).ravel()[0])
+        best_fit_stat += prior.xspec_bayes_contribution(self.best_fit_params)
 
         # --- posterior samples + FitResults ---
         posterior = self._posterior_dataframe(self.sample(self.DEFAULT_POSTERIOR_SAMPLES))

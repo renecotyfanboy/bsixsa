@@ -167,6 +167,17 @@ def local_xcm_path(params, indexes, model_indexes, base_xcm_path, *, tmp_dir=Non
 
     for model_name, parameter_index, value in zip(model_indexes, indexes, params):
         line, line_index = mapping[(model_name, parameter_index)]
+        # XSPEC serialises this .xcm line's hard limits to ~6 significant figures
+        # (fields: value delta hardmin softmin softmax hardmax), i.e. a hair tighter
+        # than the full-precision scipy prior support. A sample sitting on the support
+        # edge can therefore land just below the stored hardmin and be rejected by
+        # Xset.restore ("outside hard range"). Clamp the value against the bounds XSPEC
+        # will actually enforce. The move is <= ~1e-6 (below XSPEC's own bound
+        # resolution, on points of near-zero measure), so the effect on the (theta, x)
+        # pairs is negligible.
+        fields = line.split()
+        hard_min, hard_max = float(fields[2]), float(fields[5])
+        value = float(np.clip(value, hard_min, hard_max))
         line = f"{value:.8g}".rjust(15) + line[15:]
         lines[line_index] = line
 

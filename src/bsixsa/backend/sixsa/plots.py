@@ -236,15 +236,15 @@ def plot_ensemble_posteriors(posteriors, ensemble, observation, prior,
                              round_index=None, filename=None, save=True):
     """Overlay each NDE posterior and the ensemble posterior for one round.
 
-    Samples are drawn in the unit cube (conditioned on the observed spectrum) and
-    mapped to physical space via ``prior.from_unit_cube`` before plotting with
-    ``chainconsumer``.
+    Samples are drawn in the unit-Gaussian latent (conditioned on the observed
+    spectrum) and mapped to physical space via ``prior.from_unit_gaussian`` before
+    plotting with ``chainconsumer``.
 
     Args:
         posteriors: List of per-NDE posteriors (sbi ``DirectPosterior``).
         ensemble: The combined ``EnsemblePosterior``.
         observation: Observed spectrum used to condition the posteriors.
-        prior: Object exposing ``from_unit_cube`` (the solver prior).
+        prior: Object exposing ``from_unit_gaussian`` (the solver prior).
         parameter_names: Column names for the corner plot.
         n_samples: Samples drawn from each posterior.
         outdir: Directory to save into (``None`` -> do not save).
@@ -256,9 +256,17 @@ def plot_ensemble_posteriors(posteriors, ensemble, observation, prior,
         The figure, or ``None`` on failure (e.g. chainconsumer missing).
     """
     try:
+        import logging
+
         import pandas as pd
         import torch
         from chainconsumer import Chain, ChainConsumer
+
+        # chainconsumer renders labels/titles with font weight "medium" (500),
+        # which DejaVu Sans lacks; matplotlib's font_manager then logs a benign
+        # "Failed to find font weight medium, now using 400" warning per label.
+        # Raise that logger above WARNING to keep inference output clean.
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
         obs_t = torch.as_tensor(np.asarray(observation), dtype=torch.float32)
         names = list(parameter_names)
@@ -267,7 +275,7 @@ def plot_ensemble_posteriors(posteriors, ensemble, observation, prior,
         def _add(sampler, name):
             samples = sampler.sample((n_samples,), x=obs_t)
             samples = _to_numpy(samples)
-            physical = np.asarray(prior.from_unit_cube(samples))
+            physical = np.asarray(prior.from_unit_gaussian(samples))
             cc.add_chain(Chain(samples=pd.DataFrame(physical, columns=names),
                                name=name))
 

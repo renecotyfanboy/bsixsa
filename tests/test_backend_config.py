@@ -263,7 +263,6 @@ def test_sixsa_backend_run_mock(tmp_path):
         embedding=embedding,
         n_ensemble=1,
         is_filter_fraction=0.2,
-        proposal_mode="truncated",
         khat_threshold=None,      # disable early stopping for a deterministic run
         plot_diagnostics=False,   # skip the xspec-backed diagnostic plots under mocks
     )

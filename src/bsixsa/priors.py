@@ -61,7 +61,8 @@ def norm(loc, scale, low, high):
         scale, and truncation limits.
     """
     from scipy.stats import truncnorm
-    return truncnorm(low, high, loc=loc, scale=scale)
+    a, b = (low - loc) / scale, (high - loc) / scale
+    return truncnorm(a, b, loc=loc, scale=scale)
 
 
 class MultipleIndependent:
@@ -90,6 +91,31 @@ class MultipleIndependent:
             cube[..., j] = dist.cdf(x[..., j])
         return cube
 
+    def from_unit_gaussian(self, z):
+        """Map ``z ~ N(0, I)^D`` to physical space via ``ppf(Phi(z))`` per marginal.
+
+        Composes the standard-normal CDF ``Phi`` with each marginal's inverse CDF
+        (``from_unit_cube``), so a standard-normal latent is mapped to the prior
+        distribution. This is the unbounded counterpart of ``from_unit_cube`` used
+        by the SIXSA backend, whose latent space is a unit Gaussian rather than the
+        unit cube.
+        """
+        from scipy.stats import norm
+        z = np.asarray(z, dtype=float)
+        return self.from_unit_cube(norm.cdf(z))
+
+    def to_unit_gaussian(self, x):
+        """Map physical parameters to ``z ~ N(0, I)^D`` via ``Phi^{-1}(cdf(x))`` per marginal.
+
+        Inverse of ``from_unit_gaussian``: the per-marginal CDF (``to_unit_cube``)
+        followed by the standard-normal inverse CDF. The unit-cube values are
+        clipped away from ``0``/``1`` so the inverse CDF stays finite at the prior
+        bounds.
+        """
+        from scipy.stats import norm
+        cube = np.clip(self.to_unit_cube(x), 1e-12, 1.0 - 1e-12)
+        return norm.ppf(cube)
+
     def log_prob(self, x):
         x = np.asarray(x)
         x2 = np.atleast_2d(x)
@@ -99,6 +125,36 @@ class MultipleIndependent:
             lp += dist.logpdf(x2[:, j])
 
         return lp[0] if x.ndim == 1 else lp
+
+    def xspec_bayes_contribution(self, x) -> float:
+        """XSPEC ``Fit.bayes="on"`` prior contribution to the fit statistic.
+
+        Evaluates ``-2 * Log(prior)`` per axis with XSPEC's unnormalised
+        conventions (``Bayes::lPrior``) for the priors we compare against
+        XSPEC: ``uniform`` -> ``cons`` contributes ``0``, ``loguniform`` ->
+        ``jeffreys`` contributes ``2*ln(x)``. Adding this to the bare cstat
+        at ``x`` reproduces XSPEC's ``Fit.statistic`` when ``Fit.bayes`` is
+        on for those priors.
+        """
+        x = np.asarray(x, dtype=float).ravel()
+        contribution = 0.0
+        for j, dist in enumerate(self.dists):
+            name = dist.dist.name
+            if name == "uniform":
+                continue
+            elif name in ("loguniform", "reciprocal"):
+                contribution += 2.0 * np.log(x[j])
+            else:
+                # Only uniform (-> cons) and loguniform (-> jeffreys) are
+                # guaranteed to match XSPEC's bayes-on statistic exactly.
+                # Everything else uses the scipy log-pdf, which differs
+                # from the XSPEC counterpart by normalisation constants
+                # (e.g. XSPEC's gauss prior is an untruncated Gaussian
+                # while bsixsa's norm() is a truncated one) — acceptable,
+                # as only uniform/loguniform fits are cross-checked
+                # against XSPEC.
+                contribution += -2.0 * float(dist.logpdf(x[j]))
+        return float(contribution)
 
     def max_log_pdf_per_axis(self) -> np.ndarray:
         """Per-axis maximum of ``logpdf`` over the prior support.
@@ -207,7 +263,7 @@ def build_prior(define_prior):
 
         prior = None
 
-        # Smooth brain syntaxe to check whether a prior exist for a given parameter and extract its value
+        # Smooth brain syntax to check whether a prior exists for a given parameter and extract its value
         match define_prior_dict:
             # Prior is only instantiated in the following line if there is a match
             case {par.model.name: {par.component.name: {par.parameter.name: prior}}}:

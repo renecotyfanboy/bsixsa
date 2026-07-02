@@ -316,12 +316,24 @@ class SIXSA(BackendConfig):
             "list length sets the number of rounds. Round 1 trains on all of them; "
             "later rounds keep the top `1 - is_filter_fraction` by importance "
             "weight. A front-loaded schedule like `[10_000, 1000, 1000, 1000]` "
-            "trains a solid base flow, then refines cheaply."
+            "trains a solid base flow, then refines cheaply. Note this is the "
+            "*simulated* (pool) count per round: `_sixsa_dev` instead controls the "
+            "*kept* count and inflates the pool, so to reproduce a reference kept "
+            "count `K` set the list entry to `ceil(K / (1 - is_filter_fraction))`."
         ),
     )
     n_ensemble: PositiveInt = Field(
         default=8,
         description="Number of neural posterior estimators trained per round.",
+    )
+    first_round_sampling: str = Field(
+        default="qmc",
+        description=(
+            "Round-1 design in the unit-Gaussian latent N(0, I): 'qmc' draws a "
+            "Sobol-based quasi-Monte-Carlo design (`MultivariateNormalQMC`) for even "
+            "space-filling coverage at a fixed simulation budget; 'prior' draws i.i.d. "
+            "standard-normal samples."
+        ),
     )
     embedding: Any = Field(
         default=None,
@@ -336,7 +348,8 @@ class SIXSA(BackendConfig):
         description=(
             "Embedding network trained jointly with the NPE via sbi's `embedding_net` "
             "(an `EmbeddingNet`, a list of one per round, or `None`). `None` uses the "
-            "built-in default `FCEmbedding(input_dim, 16)`."
+            "built-in default `FCEmbeddingNet()` (an `FCEmbeddingAPD` geometric pyramid "
+            "compressing the spectrum to `output_dim=32`, linear)."
         ),
     )
     training_kwargs: dict[str, Any] | list[dict[str, Any]] | None = Field(
@@ -383,14 +396,6 @@ class SIXSA(BackendConfig):
         default="cpu",
         description="Torch device used for the restricted proposal.",
     )
-    proposal_mode: str = Field(
-        default="posterior",
-        description=(
-            "Strategy for the next round's proposal: 'posterior' draws directly "
-            "from the ensemble posterior (matches `_sixsa_dev`), 'truncated' wraps "
-            "it in a density-thresholded RestrictedPrior."
-        ),
-    )
     is_filter_fraction: float = Field(
         default=0.5,
         strict=True,
@@ -422,9 +427,19 @@ class SIXSA(BackendConfig):
         default=10_000,
         description="Number of samples used to estimate the restricted-proposal support.",
     )
-    truncated_sampling_method: str = Field(
-        default="sir",
-        description="Sampling method for the restricted prior (e.g. 'sir', 'rejection').",
+    truncated_max_sampling_batch_size: PositiveInt = Field(
+        default=1_000,
+        description=(
+            "Batch size for SIR sampling from the truncated proposal, forwarded to "
+            "sbi's `RestrictedPrior.sample(max_sampling_batch_size=...)`. Each "
+            "iteration draws `batch_size * 32` candidates from the ensemble posterior "
+            "and resamples `batch_size`, so a smaller value caps peak memory/compute "
+            "at the cost of more iterations. This is purely a performance knob -- it "
+            "does not change the sampled distribution. sbi's default is 10_000; SIXSA "
+            "uses a smaller batch by default, mirroring `_sixsa_dev`'s small-batch SIR. "
+            "(Note: sbi 0.25.0 ignores the related `oversampling_factor`; "
+            "candidates-per-sample is fixed at 32.)"
+        ),
     )
     num_posterior_samples: PositiveInt = Field(
         default=10_000,
