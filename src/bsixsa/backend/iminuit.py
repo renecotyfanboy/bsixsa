@@ -90,6 +90,8 @@ class IminuitBackend(Backend):
         self.minuit.strategy = self.config.strategy
         if self.config.tol is not None:
             self.minuit.tol = self.config.tol
+        if self.config.precision is not None:
+            self.minuit.precision = self.config.precision
 
         # --- run ---
         with catchtime("Running MIGRAD", print_time=False) as run_time:

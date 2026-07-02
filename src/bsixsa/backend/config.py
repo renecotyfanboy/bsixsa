@@ -225,6 +225,13 @@ class Iminuit(_OptimizerInitConfig):
             "to ``None`` to keep iminuit's default."
         ),
     )
+    precision: PositiveFloat | None = Field(
+        default=None,
+        description=(
+            "Declared precision of the objective function "
+            "(``Minuit.precision``)."
+        ),
+    )
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional keyword arguments forwarded to Minuit.migrad().",

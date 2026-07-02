@@ -194,6 +194,7 @@ class LevenbergMarquardtBackend(Backend):
                 jac="3-point",
                 bounds=(low, high),
                 x_scale="jac",
+                diff_step=1e-2,
             )
 
         defaults.update(least_squares_kwargs)
