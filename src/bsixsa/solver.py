@@ -1,3 +1,4 @@
+import contextlib
 import os
 import shutil
 from dataclasses import dataclass
@@ -175,7 +176,41 @@ class Solver(object):
         self.backend = None
         self.fit_result: FitResults | None = None
         self.backend_config.validate_for_solver(self)
-        self.pool = multiprocessing.Pool(processes=n_jobs)
+        self._n_jobs = n_jobs
+        self.pool = None
+        self._pool_depth = 0
+
+    def _get_pool(self):
+        """Materialise the worker pool lazily. Only valid inside a `_pool_scope`."""
+        if self.pool is None:
+            self.pool = multiprocessing.Pool(processes=self._n_jobs)
+        return self.pool
+
+    @contextlib.contextmanager
+    def _pool_scope(self):
+        """Re-entrant pool scope: nested scopes share one pool, torn down when
+        the outermost scope exits. A closed pool cannot be restarted, so each
+        outermost scope owns a fresh pool.
+        """
+        self._pool_depth += 1
+        try:
+            yield
+        finally:
+            self._pool_depth -= 1
+            if self._pool_depth <= 0:
+                self.close_pool()
+
+    def close_pool(self):
+        """Terminate and drop the worker pool if one is open. Idempotent."""
+        pool = self.pool
+        self.pool = None
+        self._pool_depth = 0
+        if pool is not None:
+            try:
+                pool.terminate()
+                pool.join()
+            except Exception:
+                pass
 
     @property
     def num_parameters(self):
@@ -227,14 +262,15 @@ class Solver(object):
         parameters = np.asarray(parameters)
         _validate_finite(parameters, self.parameter_names)
 
-        return parallel_folding(
-            parameters,
-            self.indexes,
-            self.model_indexes,
-            pool=self.pool,
-            return_kind=return_kind,
-            progress_bar=progress_bar
-        )
+        with self._pool_scope():
+            return parallel_folding(
+                parameters,
+                self.indexes,
+                self.model_indexes,
+                pool=self._get_pool(),
+                return_kind=return_kind,
+                progress_bar=progress_bar
+            )
 
     def log_prob_fn(self, theta, x_o, from_unit_cube=False):
         r"""
@@ -260,20 +296,26 @@ class Solver(object):
     def log_likelihood_fn(self, theta, x_o, progress_bar=True, no_pool=False):
 
         if no_pool:
-            pool = None
-
+            simulation_outputs = parallel_folding(
+                theta,
+                self.indexes,
+                self.model_indexes,
+                desc="Evaluating C_stat - ",
+                progress_bar=progress_bar,
+                pool=None,
+                return_kind="cstat",
+            )
         else:
-            pool = self.pool
-
-        simulation_outputs = parallel_folding(
-            theta,
-            self.indexes,
-            self.model_indexes,
-            desc="Evaluating C_stat - ",
-            progress_bar=progress_bar,
-            pool=pool,
-            return_kind="cstat",
-        )
+            with self._pool_scope():
+                simulation_outputs = parallel_folding(
+                    theta,
+                    self.indexes,
+                    self.model_indexes,
+                    desc="Evaluating C_stat - ",
+                    progress_bar=progress_bar,
+                    pool=self._get_pool(),
+                    return_kind="cstat",
+                )
 
         return -0.5 * simulation_outputs["cstat"]
 
@@ -417,13 +459,14 @@ class Solver(object):
     def run(self) -> FitResults:
         from .backend import get_backend_class
 
-        backend_cls = get_backend_class(self.backend_name)
-        self.backend = backend_cls(solver=self, config=self.backend_config)
-        self.fit_result = self.backend.run()
-        self.posterior_samples = self.fit_result.posterior_samples
-        self.distributions["posterior"] = self.backend
+        with self._pool_scope():
+            backend_cls = get_backend_class(self.backend_name)
+            self.backend = backend_cls(solver=self, config=self.backend_config)
+            self.fit_result = self.backend.run()
+            self.posterior_samples = self.fit_result.posterior_samples
+            self.distributions["posterior"] = self.backend
 
-        self.backend.tracer.plot_progress()
-        self.backend.tracer.save()
+            self.backend.tracer.plot_progress()
+            self.backend.tracer.save()
 
-        return self.fit_result
+            return self.fit_result

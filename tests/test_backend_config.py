@@ -47,6 +47,9 @@ def mock_solver(tmp_path):
     solver._parameter_names = ["par_a", "par_b"]
     solver.posterior_samples = None
     solver.fit_result = None
+    solver.pool = None
+    solver._pool_depth = 0
+    solver._n_jobs = 1
 
     return solver
 

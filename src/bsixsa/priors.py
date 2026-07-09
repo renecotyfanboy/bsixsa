@@ -275,7 +275,12 @@ def build_prior(define_prior):
         if prior is not None:
 
             low, high = prior.support()
-            parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},0.1,{low},{low},{high},{high}"
+            # Range-proportional fit delta: XSPEC only uses these per-parameter
+            # deltas when Fit.delta == 0 (PyXspec defaults to proportional
+            # deltas of 0.01), but a fixed 0.1 here is a landmine — it exceeds
+            # e.g. a whole redshift range and is ~1e5 times a typical norm.
+            delta = 0.01 * (high - low)
+            parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},{delta},{low},{low},{high},{high}"
 
             list_of_prior.append(prior)
             parameters_index.append(par.parameter.index)
