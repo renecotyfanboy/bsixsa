@@ -313,3 +313,68 @@ def test_sixsa_backend_run_mock(tmp_path):
     assert physical.shape == (50, 2)
     assert float(physical.max()) > 1.0
 
+
+def test_available_cpu_count_is_positive_int():
+    from bsixsa.convenience import available_cpu_count
+
+    n = available_cpu_count()
+    assert isinstance(n, int)
+    assert n >= 1
+
+
+def test_nautilus_config_worker_defaults_and_overrides():
+    # Memory-safe defaults, decoupled from os.cpu_count().
+    default = Nautilus()
+    assert default.n_networks == 4
+    assert default.n_pool == 4
+
+    override = Nautilus(n_networks=8, n_pool=2)
+    assert override.n_networks == 8
+    assert override.n_pool == 2
+
+    with pytest.raises(ValidationError):
+        Nautilus(n_pool=0)
+    with pytest.raises(ValidationError):
+        Nautilus(n_networks=0)
+
+
+def _nautilus_mock_solver(tmp_path):
+    solver = SimpleNamespace(
+        outputfiles_basename=str(tmp_path),
+        parameter_names=["p1", "p2"],
+        prior=SimpleNamespace(dists=[object(), object()]),
+    )
+    return solver
+
+
+def test_nautilus_backend_sizes_pool_from_config_not_cpu_count(tmp_path):
+    """The sampler must be built from config (not os.cpu_count()), and the
+    sampler pool must be capped at the available CPU count."""
+    from bsixsa.backend.nautilus import NautilusBackend
+
+    params = [SimpleNamespace(name="p1"), SimpleNamespace(name="p2")]
+
+    with patch("bsixsa.backend.nautilus.iter_thawn_parameters", return_value=params), \
+         patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
+         patch("bsixsa.backend.nautilus.available_cpu_count", return_value=8), \
+         patch("bsixsa.backend.nautilus.NestedSampler") as sampler_cls:
+
+        # Defaults: n_networks=4, n_pool=4 -> pool=(None, 4)
+        NautilusBackend(
+            solver=_nautilus_mock_solver(tmp_path),
+            config=Nautilus(trace=False),
+        )
+        kwargs = sampler_cls.call_args.kwargs
+        assert kwargs["n_networks"] == 4
+        assert kwargs["pool"] == (None, 4)
+
+        # n_pool larger than available cores is capped at available_cpu_count()
+        sampler_cls.reset_mock()
+        NautilusBackend(
+            solver=_nautilus_mock_solver(tmp_path),
+            config=Nautilus(trace=False, n_networks=16, n_pool=100),
+        )
+        kwargs = sampler_cls.call_args.kwargs
+        assert kwargs["n_networks"] == 16
+        assert kwargs["pool"] == (None, 8)  # min(100, 8)
+

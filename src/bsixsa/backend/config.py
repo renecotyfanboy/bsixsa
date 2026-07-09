@@ -144,6 +144,23 @@ class Nautilus(BackendConfig):
         description="Minimal number of likelihood evaluation performed at once.",
     )
 
+    n_networks: PositiveInt = Field(
+        default=4,
+        description=(
+            "Number of neural-network emulators nautilus trains per bound "
+            "(nautilus `n_networks`). Default 4 matches the library."
+        ),
+    )
+
+    n_pool: PositiveInt = Field(
+        default=4,
+        description=(
+            "Worker processes for nautilus's sampler / NN-training pool. "
+            "Bounded so it does not add a full node-wide fleet on top of the "
+            "solver's likelihood pool. Set to 1 for serial."
+        ),
+    )
+
 
 class Nessai(BackendConfig):
     """Configuration for the [`nessai`](https://nessai.readthedocs.io/en/latest/) backend."""

@@ -124,7 +124,7 @@ class Solver(object):
         prior,
         outputfiles_basename="./sixsa",
         overwrite=False,
-        n_jobs=os.cpu_count(),
+        n_jobs=None,
         *,
         backend,
     ):
@@ -144,7 +144,9 @@ class Solver(object):
             overwrite: If `True`, clear *outputfiles_basename* when it
                 already contains files.  Defaults to `False`.
             n_jobs: Number of worker processes for the multiprocessing
-                pool.  Defaults to [`cpu_count()`][os.cpu_count].
+                pool.  Defaults to the number of CPUs available to this
+                process (affinity-aware: respects a SLURM/cgroup cpuset on
+                Linux, falling back to the full core count on macOS).
             backend: Backend configuration object. The solver infers the
                 backend at construction time from this mandatory config.
         """
@@ -176,7 +178,8 @@ class Solver(object):
         self.backend = None
         self.fit_result: FitResults | None = None
         self.backend_config.validate_for_solver(self)
-        self._n_jobs = n_jobs
+        from .convenience import available_cpu_count
+        self._n_jobs = available_cpu_count() if n_jobs is None else n_jobs
         self.pool = None
         self._pool_depth = 0
 

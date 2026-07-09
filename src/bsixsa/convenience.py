@@ -1,10 +1,24 @@
 from xspec import Xset, Model, Component, Parameter, AllModels
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterator
 from collections.abc import Callable
 from contextlib import contextmanager
 from time import perf_counter
+
+
+def available_cpu_count() -> int:
+    """CPUs actually available to this process.
+
+    Respects cgroup/cpuset/SLURM affinity on Linux; falls back to the full
+    core count on platforms without ``sched_getaffinity`` (e.g. macOS).
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
 
 # Components defined more than once (e.g. ``tbabs*(powerlaw + powerlaw)``) are
 # reported by XSPEC as ``powerlaw`` and ``powerlaw_3``: an ``_<int>`` suffix.

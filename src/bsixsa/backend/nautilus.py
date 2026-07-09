@@ -1,11 +1,10 @@
-import os
 import typing
 
 import numpy as np
 import pandas as pd
 from nautilus import Prior, Sampler as NestedSampler
 
-from ..convenience import iter_thawn_parameters
+from ..convenience import iter_thawn_parameters, available_cpu_count
 from .abc import Backend
 from . import register_backend
 from .config import Nautilus
@@ -42,14 +41,16 @@ class NautilusBackend(Backend):
             self.tracer.record(np.atleast_2d(x), -2.0 * np.atleast_1d(ll))
             return ll
 
+        n_pool = min(config.n_pool, available_cpu_count())
+
         self._nested_sampler = NestedSampler(
             prior, likelihood,
             n_live=config.num_live_points,
             vectorized=True,
             pass_dict=False,
             n_batch=config.n_batch,
-            n_networks=os.cpu_count(),
-            pool=(None, os.cpu_count())
+            n_networks=config.n_networks,
+            pool=(None, n_pool),
         )
 
     def run(self, **kwargs) -> 'FitResults':

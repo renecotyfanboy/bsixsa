@@ -16,6 +16,7 @@ from sbi.utils import RestrictedPrior, get_density_thresholder
 from .. import register_backend
 from ..abc import Backend
 from ..config import SIXSA
+from ...convenience import available_cpu_count
 from . import plots
 from .embedding import IdentityEmbedding
 from .embedding.abc import Embedding
@@ -449,7 +450,7 @@ class SIXSABackend(Backend):
         # parallel workers so torch does not oversubscribe (default: a full
         # machine's worth of threads per worker -> n_nets x cores contention).
         nde_kwargs = self.config.nde_kwargs or DEFAULT_NDE_KWARGS
-        num_threads = max(1, (os.cpu_count() or 1) // max(1, self.n_nets))
+        num_threads = max(1, available_cpu_count() // max(1, self.n_nets))
         kept_theta_latent_np = kept_theta_latent.numpy().copy()
         with self._phase(round_number, "training (ensemble NPE)"):
             results = Parallel(n_jobs=-1)(
