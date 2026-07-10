@@ -18,6 +18,7 @@ from ..abc import Backend
 from ..config import SIXSA
 from ...convenience import available_cpu_count
 from . import plots
+from ._importance import final_importance_pass
 from .embedding import IdentityEmbedding
 from .embedding.abc import Embedding
 from .embedding.nets import EmbeddingNet, FCEmbeddingNet
@@ -224,17 +225,29 @@ class SIXSABackend(Backend):
         # for the best round, and the most recent round's set.
         self.best_weighted = None
         self._last_weighted = None
+        # Final importance pass: pooled PSIS-smoothed (theta_latent, weights)
+        # and its info dict; populated by `_run_final_importance_pass`.
+        self.final_weighted = None
+        self.final_is_info = None
 
     def sample(self, n: int) -> np.ndarray:
         # The backend works in the unit-Gaussian latent internally (flow, IS
         # weights, resampling); convert to physical here, at the public boundary,
         # so the returned posterior matches the prior and the other backends and
         # can be fed straight to `solver.simulate()` / the predictive-coverage plots.
-        if self.best_weighted is not None:
-            # Preferred: importance-resample the best round's simulated points
-            # (the reference's posterior). These are real prior draws, so the
-            # physical samples lie within the prior support (no out-of-distribution
-            # events) and the flow is never sampled.
+        if self.final_weighted is not None:
+            # Preferred: the final importance pass's pooled, PSIS-smoothed
+            # weighted draws -- the reference's reported posterior. An
+            # on-demand multinomial resample is statistically identical to the
+            # reference's one-shot resample of the same pooled weights.
+            theta, weights = self.final_weighted
+            idx = torch.multinomial(weights, n, replacement=True)
+            latent = theta[idx]
+        elif self.best_weighted is not None:
+            # Fallback when the final pass is disabled or failed: importance-
+            # resample the best round's in-loop simulated points. These are real
+            # proposal draws, so the physical samples lie within the prior
+            # support and the flow is never sampled.
             theta, weights = self.best_weighted
             idx = torch.multinomial(weights, n, replacement=True)
             latent = theta[idx]
@@ -598,6 +611,43 @@ class SIXSABackend(Backend):
 
         plt.close("all")
 
+    def _run_final_importance_pass(self):
+        """Run the final iterative IS refinement on the best ensemble posterior.
+
+        Populates ``self.final_weighted`` with the pooled, PSIS-smoothed
+        weighted latent draws (the reference's reported posterior) and returns
+        the info dict (log_Z, ESS, k_hat, round counts...). The likelihood is
+        the exact simulator: each latent draw is folded through XSPEC and
+        scored with `-0.5 * cstat` against the real observation.
+        """
+        n_per_round = self.config.final_is_n_per_round or int(
+            self.history[-1]["n_simulations_round"]
+        )
+
+        def log_likelihood_fn(z):
+            physical = self._gaussian_to_physical(z.detach().cpu().numpy())
+            out = self.solver.simulate(
+                physical, return_kind="cstat", progress_bar=False
+            )
+            return torch.as_tensor(
+                -0.5 * np.asarray(out["cstat"], dtype=np.float64)
+            )
+
+        info = final_importance_pass(
+            proposal=self.best_ensemble,
+            latent_prior=self.prior,
+            log_likelihood_fn=log_likelihood_fn,
+            n_per_round=n_per_round,
+            target_ess=self.config.final_is_target_ess,
+            fallback_target_ess=self.config.final_is_fallback_ess,
+            max_rounds=self.config.final_is_max_rounds,
+            max_rounds_extended=self.config.final_is_max_rounds_extended,
+            trace=self.config.trace,
+        )
+        if info["pooled_weighted"] is not None:
+            self.final_weighted = info["pooled_weighted"]
+        return info
+
     def _build_proposal(self, ens_post):
         """Build the next round's proposal, mirroring `_sixsa_dev`'s
         `_build_proposal` (both arms).
@@ -739,6 +789,8 @@ class SIXSABackend(Backend):
             self.best_log_Z = float("nan")
             self.best_log_Z_err = float("nan")
             self.best_weighted = None
+            self.final_weighted = None
+            self.final_is_info = None
 
             self.history = []
             n_sim_total = 0
@@ -832,6 +884,19 @@ class SIXSABackend(Backend):
             if self.best_ensemble is None and self.proposals:
                 self.best_ensemble = self.proposals[-1]
 
+            # Final iterative importance-sampling refinement on the best
+            # ensemble: the in-loop rounds located the posterior, this pass
+            # quantifies it (returned posterior + evidence). Failures fall
+            # back to the in-loop importance-resampled posterior.
+            if self.config.final_is and self.best_ensemble is not None and self.history:
+                try:
+                    self.final_is_info = self._run_final_importance_pass()
+                except Exception as exc:
+                    warnings.warn(
+                        f"SIXSA final importance pass failed ({exc!r}); falling "
+                        f"back to the in-loop importance-resampled posterior."
+                    )
+
         # End-of-run six-panel training-history summary.
         if self.config.plot_diagnostics and self.history:
             try:
@@ -847,6 +912,18 @@ class SIXSABackend(Backend):
             except Exception:
                 pass
 
+        # The final pass is the authoritative posterior/evidence when it ran
+        # and its proposal covered the posterior; otherwise report the in-loop
+        # best-round estimates.
+        log_Z, log_Z_err = self.best_log_Z, self.best_log_Z_err
+        n_evaluations = n_sim_total
+        if self.final_is_info is not None:
+            n_evaluations += int(self.final_is_info["n_simulations"])
+            if self.final_weighted is not None:
+                log_Z = self.final_is_info["log_Z"]
+                log_Z_err = self.final_is_info["log_Z_err"]
+            self._write_final_is_summary()
+
         # Build posterior samples from the best proposal/ensemble. `sample()`
         # already returns physical-space parameters.
         n_posterior = self.config.num_posterior_samples
@@ -855,10 +932,29 @@ class SIXSABackend(Backend):
         return FitResults(
             time=float(run_time()),
             posterior_samples=posterior,
-            n_likelihood_evaluations=0,
-            log_Z=self.best_log_Z,
-            log_Z_err=self.best_log_Z_err,
+            n_likelihood_evaluations=n_evaluations,
+            log_Z=log_Z,
+            log_Z_err=log_Z_err,
         )
+
+    def _write_final_is_summary(self):
+        """Best-effort dump of the final-IS scalars next to the round outputs."""
+        try:
+            import json
+
+            summary = {
+                key: value
+                for key, value in self.final_is_info.items()
+                if isinstance(value, (int, float, bool, str, list, type(None)))
+            }
+            summary["best_round"] = self.best_round
+            path = os.path.join(
+                self.solver.outputfiles_basename, "final_is_summary.json"
+            )
+            with open(path, "w") as file:
+                json.dump(summary, file, indent=2, default=float)
+        except Exception:
+            pass
 
     def plot_training_history(self, save=False, outdir=None, **kwargs):
         """Build the six-panel training-history figure from ``self.history``.

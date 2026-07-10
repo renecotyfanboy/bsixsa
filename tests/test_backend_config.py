@@ -271,6 +271,7 @@ def test_sixsa_backend_run_mock(tmp_path, proposal_mode):
         proposal_mode=proposal_mode,
         is_filter_fraction=0.2,
         khat_threshold=None,      # disable early stopping for a deterministic run
+        final_is=False,           # keep this test on the in-loop posterior path
         plot_diagnostics=False,   # skip the xspec-backed diagnostic plots under mocks
     )
     backend = SIXSABackend(solver=solver, config=config)
@@ -358,6 +359,7 @@ def test_sixsa_filter_round0_fraction_keeps_best_cstat(tmp_path):
         n_ensemble=1,
         filter_round0_fraction=0.5,
         khat_threshold=None,
+        final_is=False,
         plot_diagnostics=False,
     )
     backend = SIXSABackend(solver=solver, config=config)
@@ -391,6 +393,89 @@ def test_sixsa_filter_round0_fraction_keeps_best_cstat(tmp_path):
     assert backend.history[0]["cstat_min"] == 0.0
     assert backend.history[0]["cstat_max"] == 4.0
     assert len(captured["theta"]) == 5
+
+
+def test_sixsa_backend_run_mock_with_final_is(tmp_path):
+    """End-to-end mocked run with the final importance pass enabled: the pass
+    must populate `final_weighted`, take precedence in `sample()`, and report
+    its evidence in the FitResults."""
+    import torch
+    import numpy as np
+    from unittest.mock import MagicMock, patch
+    from bsixsa.backend.sixsa import SIXSABackend
+    from bsixsa.backend.config import SIXSA
+    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
+
+    solver = MagicMock()
+    solver.prior.ndim = 2
+    solver.prior.from_unit_gaussian = lambda z: np.asarray(z) * 10.0
+    solver.prior.to_unit_gaussian = lambda x: np.asarray(x) / 10.0
+    solver.outputfiles_basename = str(tmp_path)
+    solver.parameter_names = ["p1", "p2"]
+
+    def mock_simulate(params, *args, **kwargs):
+        n = len(params)
+        return {
+            "total_model_counts": np.ones((n, 50), dtype=np.float32),
+            # Narrow deterministic cstat spread -> well-behaved IS weights.
+            "cstat": np.linspace(50.0, 52.0, n).astype(np.float32),
+        }
+
+    solver.simulate.side_effect = mock_simulate
+    solver.observed_spectrum = np.ones(50, dtype=np.float32)
+
+    config = SIXSA(
+        trace=False,
+        num_simulations_per_round=[16, 16],
+        embedding=IdentityEmbedding(),
+        n_ensemble=1,
+        is_filter_fraction=0.2,
+        khat_threshold=None,
+        final_is=True,
+        final_is_target_ess=5.0,
+        final_is_fallback_ess=2.0,
+        final_is_max_rounds=2,
+        final_is_n_per_round=16,
+        plot_diagnostics=False,
+    )
+    backend = SIXSABackend(solver=solver, config=config)
+
+    mock_post = MagicMock()
+    mock_post.log_prob.side_effect = lambda t, *a, **k: torch.ones(t.shape[0])
+
+    def mock_sample(shape, *args, **kwargs):
+        n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
+        return 0.5 + 0.01 * torch.randn(n, 2)
+
+    mock_post.sample.side_effect = mock_sample
+    mock_post.potential_fn = MagicMock()
+    mock_post.potential_fn.device = "cpu"
+    mock_post._device = "cpu"
+    mock_stats = {"nde_index": 0, "training_time_s": 0.0, "best_val_loss": 1.0,
+                  "best_train_loss": 1.0, "n_epochs": 1}
+    mock_parallel = MagicMock()
+    mock_parallel.return_value = [(mock_post, mock_stats)]
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel):
+        results = backend.run()
+
+    assert backend.final_is_info is not None
+    assert backend.final_weighted is not None
+    theta, weights = backend.final_weighted
+    assert len(theta) == len(weights)
+    assert np.isclose(float(weights.sum()), 1.0)
+    # FitResults carries the final pass's evidence and the full simulation budget.
+    assert np.isfinite(results.log_Z)
+    assert results.log_Z == backend.final_is_info["log_Z"]
+    assert results.n_likelihood_evaluations == (
+        32 + backend.final_is_info["n_simulations"]
+    )
+    assert results.posterior_samples.shape == (10000, 2)
+    # The summary file is written next to the round outputs.
+    import os
+    assert os.path.exists(os.path.join(str(tmp_path), "final_is_summary.json"))
 
 
 def test_sixsa_nde_kwargs_merge_keeps_reference_defaults():

@@ -504,6 +504,66 @@ class SIXSA(BackendConfig):
         default=10_000,
         description="Number of posterior samples drawn into the returned results.",
     )
+    final_is: StrictBool = Field(
+        default=True,
+        description=(
+            "Run the final iterative importance-sampling refinement on the best "
+            "round's ensemble posterior (mirroring `_sixsa_dev`'s "
+            "`is_on_given_posterior`). The in-loop rounds locate the posterior; "
+            "this pass quantifies it against the exact likelihood and produces "
+            "the returned posterior samples and log_Z. Disabling falls back to "
+            "the single-shot in-loop importance resample."
+        ),
+    )
+    final_is_target_ess: PositiveFloat = Field(
+        default=10_000.0,
+        description=(
+            "Pooled effective-sample-size target of the final importance pass; "
+            "rounds of `final_is_n_per_round` simulations run until it is "
+            "reached (or `final_is_max_rounds`)."
+        ),
+    )
+    final_is_fallback_ess: float | None = Field(
+        default=2_500.0,
+        description=(
+            "Graceful-degradation ESS floor: if the main final-IS loop runs out "
+            "of rounds short of `final_is_target_ess`, keep running (up to "
+            "`final_is_max_rounds_extended`) until this lower target, stopping "
+            "early when the ESS gain plateaus. `None` disables the extension."
+        ),
+    )
+    final_is_max_rounds: PositiveInt = Field(
+        default=10,
+        description="Round budget of the final importance pass's main loop.",
+    )
+    final_is_max_rounds_extended: PositiveInt | None = Field(
+        default=None,
+        description=(
+            "Hard ceiling on the TOTAL number of final-IS rounds (main + "
+            "extension). `None` -> `5 * final_is_max_rounds`."
+        ),
+    )
+    final_is_n_per_round: PositiveInt | None = Field(
+        default=None,
+        description=(
+            "Simulations per final-IS round. `None` uses the last executed loop "
+            "round's pool size, so the final-pass k_hat is computed at the same "
+            "sample size as the in-loop k_hat (the reference's "
+            "`match_loop_batch` behaviour)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_final_is_targets(self):
+        if (
+            self.final_is_fallback_ess is not None
+            and self.final_is_fallback_ess > self.final_is_target_ess
+        ):
+            raise ValueError(
+                "`final_is_fallback_ess` must not exceed `final_is_target_ess` "
+                f"({self.final_is_fallback_ess} > {self.final_is_target_ess})."
+            )
+        return self
 
 
 Backend = (
