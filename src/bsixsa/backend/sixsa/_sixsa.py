@@ -35,6 +35,16 @@ DEFAULT_NDE_KWARGS = {
     "z_score_x": "independent",
 }
 
+def merge_nde_kwargs(user_kwargs):
+    """Merge user `nde_kwargs` over `DEFAULT_NDE_KWARGS` (user keys win).
+
+    A partial override like ``{"model": "nsf"}`` keeps the reference capacity
+    (``hidden_features=100``, ``num_transforms=10``) and the independent
+    z-scoring of theta and x instead of silently dropping them.
+    """
+    return {**DEFAULT_NDE_KWARGS, **(user_kwargs or {})}
+
+
 # Minimum effective sample size below which the Pareto k_hat diagnostic is not
 # trustworthy: with too few effective samples the generalized-Pareto tail fit is
 # uninformative and psislw reports a spuriously LOW k_hat on a proposal that is
@@ -294,8 +304,11 @@ class SIXSABackend(Backend):
         With ``first_round_sampling="qmc"`` (default) this returns a Sobol-based
         quasi-Monte-Carlo design (``MultivariateNormalQMC``), which fills the
         latent far more evenly than i.i.d. normal draws at the same simulation
-        budget; ``"prior"`` restores the plain i.i.d. ``N(0, I)`` draw. The
-        samples are mapped to physical space downstream by
+        budget; ``"lhs"`` returns a Latin-hypercube design pushed through the
+        normal quantile function (per-marginal stratified -- composed with
+        ``from_unit_gaussian`` this is exactly `_sixsa_dev`'s box LHS);
+        ``"prior"`` restores the plain i.i.d. ``N(0, I)`` draw. The samples are
+        mapped to physical space downstream by
         ``solver.prior.from_unit_gaussian`` (``ppf(Phi(z))`` per marginal).
         """
         if self.config.first_round_sampling == "qmc":
@@ -304,6 +317,12 @@ class SIXSABackend(Backend):
             z = qmc.MultivariateNormalQMC(
                 mean=np.zeros(self.solver.prior.ndim)
             ).random(n)
+            return torch.as_tensor(z, dtype=torch.float32)
+        if self.config.first_round_sampling == "lhs":
+            from scipy.stats import norm, qmc
+
+            u = qmc.LatinHypercube(d=self.solver.prior.ndim).random(n)
+            z = norm.ppf(np.clip(u, 1e-12, 1.0 - 1e-12))
             return torch.as_tensor(z, dtype=torch.float32)
         return self.prior.sample((n,))
 
@@ -435,21 +454,23 @@ class SIXSABackend(Backend):
 
         # Fit the (optional) pre-processor embedding on the kept spectra. The NPEs
         # train on the raw kept spectra with their own jointly-trained embedding
-        # net, so this only matters for a trainable pre-processor embedding.
-        noisy_spectra = np.random.poisson(kept_spectra).astype(np.float32)
+        # net, so this only matters for a trainable pre-processor embedding --
+        # skip it (and the large Poisson realization) for the identity embedding.
         round_path = os.path.join(self.solver.outputfiles_basename, f"round_{round_number}")
         os.makedirs(round_path, exist_ok=True)
-        with self._phase(round_number, "embedding fit"):
-            embedding.fit(
-                noisy_spectra,
-                metrics_path=os.path.join(round_path, "embedding_training.pdf"),
-            )
+        if not isinstance(embedding, IdentityEmbedding):
+            noisy_spectra = np.random.poisson(kept_spectra).astype(np.float32)
+            with self._phase(round_number, "embedding fit"):
+                embedding.fit(
+                    noisy_spectra,
+                    metrics_path=os.path.join(round_path, "embedding_training.pdf"),
+                )
 
         # Train the ensemble of NPEs on the kept (filtered) parameters. Each job
         # returns (posterior, training_stats). Split the cores evenly across the
         # parallel workers so torch does not oversubscribe (default: a full
         # machine's worth of threads per worker -> n_nets x cores contention).
-        nde_kwargs = self.config.nde_kwargs or DEFAULT_NDE_KWARGS
+        nde_kwargs = merge_nde_kwargs(self.config.nde_kwargs)
         num_threads = max(1, available_cpu_count() // max(1, self.n_nets))
         kept_theta_latent_np = kept_theta_latent.numpy().copy()
         with self._phase(round_number, "training (ensemble NPE)"):

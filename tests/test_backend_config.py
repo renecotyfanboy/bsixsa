@@ -235,11 +235,13 @@ def test_sixsa_backend_run_mock(tmp_path):
     from bsixsa.backend.sixsa import SIXSABackend
     from bsixsa.backend.config import SIXSA
 
-    # Mock Solver
+    # Mock Solver. The backend works in the unit-Gaussian latent, so the
+    # latent<->physical hooks are `from/to_unit_gaussian` (a bare MagicMock here
+    # would silently yield len()==0 arrays and empty rounds).
     solver = MagicMock()
     solver.prior.ndim = 2
-    solver.prior.from_unit_cube = lambda x: x * 10.0
-    solver.prior.to_unit_cube = lambda x: x / 10.0
+    solver.prior.from_unit_gaussian = lambda z: np.asarray(z) * 10.0
+    solver.prior.to_unit_gaussian = lambda x: np.asarray(x) / 10.0
     solver.outputfiles_basename = str(tmp_path)
     solver.parameter_names = ["p1", "p2"]
 
@@ -279,8 +281,8 @@ def test_sixsa_backend_run_mock(tmp_path):
     mock_post.log_prob.side_effect = mock_log_prob
     def mock_sample(shape, *args, **kwargs):
         n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
-        # Interior of the unit cube so the prior log-prob is finite and the
-        # importance weights are well-defined (boundary points give -inf).
+        # A point well inside the unit-Gaussian latent so the prior log-prob is
+        # finite and the importance weights are well-defined.
         return torch.full((n, 2), 0.5, dtype=torch.float32)
     mock_post.sample.side_effect = mock_sample
     mock_post.potential_fn = MagicMock()
@@ -307,11 +309,29 @@ def test_sixsa_backend_run_mock(tmp_path):
     assert backend.history[0]["nde_stats"] == [mock_stats]
     # The returned posterior is importance-resampled (no flow rejection sampling).
     assert backend.best_weighted is not None
-    # sample() returns physical-space parameters, not the unit cube. The mock
-    # `from_unit_cube` scales by 10, so physical values exceed the unit cube.
+    # sample() returns physical-space parameters, not the latent. The mock
+    # `from_unit_gaussian` scales by 10, so physical values exceed the latent range.
     physical = np.asarray(backend.sample(50))
     assert physical.shape == (50, 2)
     assert float(physical.max()) > 1.0
+
+
+def test_sixsa_nde_kwargs_merge_keeps_reference_defaults():
+    """A partial `nde_kwargs` override merges over the reference defaults instead
+    of replacing them (e.g. `{"model": "nsf"}` must keep the MAF-era capacity
+    and z-scoring settings)."""
+    from bsixsa.backend.sixsa._sixsa import DEFAULT_NDE_KWARGS, merge_nde_kwargs
+
+    merged = merge_nde_kwargs({"model": "nsf"})
+    assert merged["model"] == "nsf"
+    assert merged["hidden_features"] == 100
+    assert merged["num_transforms"] == 10
+    assert merged["z_score_theta"] == "independent"
+    assert merged["z_score_x"] == "independent"
+
+    assert merge_nde_kwargs(None) == DEFAULT_NDE_KWARGS
+    # User values win over defaults.
+    assert merge_nde_kwargs({"hidden_features": 64})["hidden_features"] == 64
 
 
 def test_available_cpu_count_is_positive_int():

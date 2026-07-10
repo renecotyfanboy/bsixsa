@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Pydantic-backed configuration models for bsixsa backends."""
 
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
@@ -350,21 +350,25 @@ class SIXSA(BackendConfig):
         default=8,
         description="Number of neural posterior estimators trained per round.",
     )
-    first_round_sampling: str = Field(
+    first_round_sampling: Literal["qmc", "lhs", "prior"] = Field(
         default="qmc",
         description=(
             "Round-1 design in the unit-Gaussian latent N(0, I): 'qmc' draws a "
             "Sobol-based quasi-Monte-Carlo design (`MultivariateNormalQMC`) for even "
-            "space-filling coverage at a fixed simulation budget; 'prior' draws i.i.d. "
-            "standard-normal samples."
+            "space-filling coverage at a fixed simulation budget; 'lhs' draws a "
+            "Latin-hypercube design pushed through the normal quantile function "
+            "(per-marginal stratified, matching `_sixsa_dev`'s box LHS); 'prior' "
+            "draws i.i.d. standard-normal samples."
         ),
     )
     embedding: Any = Field(
         default=None,
         description=(
-            "Embedding network(s) used to compress spectra. Accepts a single "
-            "`Embedding`, a list of one `Embedding` per round, or `None` to use "
-            "the identity embedding."
+            "Diagnostic-only numpy pre-processor embedding(s). Accepts a single "
+            "`Embedding`, a list of one `Embedding` per round, or `None` for the "
+            "identity embedding. NOTE: its output never feeds the NPE -- the "
+            "network input is the raw spectrum through `embedding_net`; fitting "
+            "is skipped entirely for the identity embedding."
         ),
     )
     embedding_net: Any = Field(
@@ -388,9 +392,10 @@ class SIXSA(BackendConfig):
         default=None,
         description=(
             "Keyword arguments forwarded to sbi's `posterior_nn` building the "
-            "density estimator (the normalizing flow). `None` uses the reference "
-            "defaults: a MAF with `hidden_features=100`, `num_transforms=10`, and "
-            "independent z-scoring of theta and x."
+            "density estimator (the normalizing flow). User keys are MERGED over "
+            "the reference defaults (a MAF with `hidden_features=100`, "
+            "`num_transforms=10`, and independent z-scoring of theta and x), so "
+            "e.g. `{'model': 'nsf'}` keeps the default capacity and z-scoring."
         ),
     )
     max_num_epochs: PositiveInt = Field(
