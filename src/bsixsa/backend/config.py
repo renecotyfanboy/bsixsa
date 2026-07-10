@@ -448,6 +448,20 @@ class SIXSA(BackendConfig):
         default=True,
         description="Run one extra round after the k-hat threshold is crossed.",
     )
+    proposal_mode: Literal["posterior", "truncated"] = Field(
+        default="posterior",
+        description=(
+            "Proposal used to draw rounds >= 2. 'posterior' (the reference "
+            "default): sample the previous round's ensemble posterior directly, "
+            "so the ensemble-mixture density used in the importance weights is "
+            "exactly the sampling density and the in-loop IS diagnostics "
+            "(ESS/k-hat/log_Z) are consistent. 'truncated' (legacy): a "
+            "density-thresholded `RestrictedPrior` sampled with SIR; its true "
+            "sampling density is intractable, so the in-loop IS diagnostics are "
+            "approximate (see `_build_proposal`) and the final importance pass "
+            "is the authoritative posterior/evidence."
+        ),
+    )
     truncated_quantile: PositiveFloat = Field(
         default=1e-4,
         description="Density quantile used to truncate the restricted proposal.",

@@ -228,7 +228,8 @@ def test_solver_run_rejects_mismatched_backend_config(mock_solver):
             mock_solver.run()
 
 
-def test_sixsa_backend_run_mock(tmp_path):
+@pytest.mark.parametrize("proposal_mode", ["posterior", "truncated"])
+def test_sixsa_backend_run_mock(tmp_path, proposal_mode):
     import torch
     import numpy as np
     from unittest.mock import MagicMock, patch
@@ -267,6 +268,7 @@ def test_sixsa_backend_run_mock(tmp_path):
         num_simulations_per_round=[10, 10],
         embedding=embedding,
         n_ensemble=1,
+        proposal_mode=proposal_mode,
         is_filter_fraction=0.2,
         khat_threshold=None,      # disable early stopping for a deterministic run
         plot_diagnostics=False,   # skip the xspec-backed diagnostic plots under mocks
@@ -307,6 +309,12 @@ def test_sixsa_backend_run_mock(tmp_path):
     # The run records a per-round history that drives the diagnostics.
     assert len(backend.history) >= 1
     assert backend.history[0]["nde_stats"] == [mock_stats]
+    # Round 1 always trains on prior draws (exact weights); rounds >= 2 are
+    # exact only in posterior mode, where the pool is drawn from the very
+    # mixture whose density enters the importance weights.
+    assert backend.history[0]["is_weights_exact"] is True
+    assert backend.history[1]["is_weights_exact"] is (proposal_mode == "posterior")
+    assert backend.history[1]["proposal_mode"] == proposal_mode
     # The returned posterior is importance-resampled (no flow rejection sampling).
     assert backend.best_weighted is not None
     # sample() returns physical-space parameters, not the latent. The mock

@@ -363,22 +363,33 @@ class SIXSABackend(Backend):
         # exactly this many, then keep the top (1 - is_filter_fraction) fraction by
         # importance weight for training (round 1 has no weights and keeps all).
         n_pool = n_simulations
-        with self._phase(
-            round_number,
-            "proposal sampling (SIR)" if proposal is not None else "initial sampling",
-        ):
+        is_truncated_proposal = isinstance(proposal, RestrictedPrior)
+        if proposal is None:
+            phase_label = "initial sampling"
+        elif is_truncated_proposal:
+            phase_label = "proposal sampling (SIR)"
+        else:
+            phase_label = "proposal sampling (ensemble posterior)"
+        with self._phase(round_number, phase_label):
             if proposal is None:
                 parameters_latent = self._initial_latent(n_pool)
-            else:
-                # `proposal` is the truncated RestrictedPrior (sample_with="sir"). Draw
-                # in smaller SIR batches (mirroring `_sixsa_dev`) so each iteration only
-                # draws `max_sampling_batch_size * 32` candidates from the ensemble
+            elif is_truncated_proposal:
+                # Truncated mode: `proposal` is the RestrictedPrior
+                # (sample_with="sir"). Draw in smaller SIR batches (mirroring
+                # `_sixsa_dev`) so each iteration only draws
+                # `max_sampling_batch_size * 32` candidates from the ensemble
                 # posterior instead of the full `n_pool * 32` at once. Purely a
                 # performance knob -- the sampled distribution is unchanged.
                 parameters_latent = proposal.sample(
                     (n_pool,),
                     max_sampling_batch_size=self.config.truncated_max_sampling_batch_size,
                 )
+            else:
+                # Posterior mode: `proposal` is the previous round's
+                # EnsemblePosterior (default_x already set). No rejection is
+                # involved -- the unbounded latent has no prior box to leak out
+                # of -- so this is a plain mixture draw.
+                parameters_latent = proposal.sample((n_pool,)).detach()
 
         with self._phase(round_number, "simulation (folding)"):
             parameters = self.solver.prior.from_unit_gaussian(parameters_latent.numpy())
@@ -408,11 +419,13 @@ class SIXSABackend(Backend):
             )
             log_q_mix = torch.logsumexp(log_q, dim=0) - np.log(len(previous_posteriors_list))
 
-            # log_q_mix is the proposal density in the IS weights below, so this is
-            # only valid when the proposal approximates the posterior. SIXSA only
-            # supports the truncated proposal sampled with SIR (see
-            # `_build_proposal`), which draws from the posterior and rejects
-            # out-of-HPR points, so this assumption always holds.
+            # log_q_mix is the proposal density in the IS weights below. In
+            # posterior mode the pool was drawn from this very mixture, so the
+            # weights (and ESS/k-hat/log_Z) are exact. In truncated mode the
+            # SIR-sampled RestrictedPrior has an intractable density and the
+            # mixture is only an approximation (see `_build_proposal`): the
+            # diagnostics steer round selection, but the final importance pass
+            # is the authoritative posterior/evidence.
 
             # Prior density (standard-normal prior log_prob on the latent samples)
             log_prior = self.prior.log_prob(parameters_latent)
@@ -504,6 +517,11 @@ class SIXSABackend(Backend):
             "round": round_number,
             "n_simulations_round": n_pool,
             "n_kept": int(len(kept_theta_latent)),
+            "proposal_mode": self.config.proposal_mode,
+            # Exact when the pool was drawn from the density used in the weights:
+            # round 1 has no weights, posterior mode samples the mixture itself;
+            # only the truncated RestrictedPrior rounds are approximate.
+            "is_weights_exact": not is_truncated_proposal,
             "nde_stats": nde_stats,
             "cstat_min": float(kept_cstats.min().item()),
             "cstat_median": float(kept_cstats.median().item()),
@@ -564,17 +582,34 @@ class SIXSABackend(Backend):
         plt.close("all")
 
     def _build_proposal(self, ens_post):
-        """Build the next round's proposal: a density-thresholded RestrictedPrior
-        over the clean prior, sampled with SIR.
+        """Build the next round's proposal, mirroring `_sixsa_dev`'s
+        `_build_proposal` (both arms).
 
-        Mirrors `_sixsa_dev/src/sixsa_main.py::_build_proposal` (truncated branch,
-        ``restrict_from_prior=True``). Each round restricts the ORIGINAL prior
-        (``self.prior``) with the current round's density thresholder, so
-        restrictions do not stack -- an early over-restriction does not persist,
-        because the next round restricts the clean prior afresh with a
-        better-trained NDE. ``ens_post`` is passed to ``RestrictedPrior`` as the
-        SIR proposal, which sbi requires for ``sample_with="sir"``.
+        ``proposal_mode="posterior"`` (the reference default) returns the
+        ensemble posterior itself: the next round samples it directly, so the
+        ensemble-mixture density (`EnsemblePosterior.log_prob`) used in the
+        importance weights is exactly the sampling density -- the in-loop IS
+        diagnostics are consistent by construction.
+
+        ``proposal_mode="truncated"`` (legacy) returns a density-thresholded
+        `RestrictedPrior` over the clean prior, sampled with SIR. Each round
+        restricts the ORIGINAL prior (``self.prior``) with the current round's
+        density thresholder, so restrictions do not stack -- an early
+        over-restriction does not persist, because the next round restricts the
+        clean prior afresh with a better-trained NDE. ``ens_post`` is passed to
+        ``RestrictedPrior`` as the SIR proposal, which sbi requires for
+        ``sample_with="sir"``. CAVEAT: sbi's SIR does not actually return
+        restricted-prior (nor posterior) samples -- it softmax-picks 1 of 32
+        ensemble candidates with weights ~ e^{accept}/q, i.e. a soft
+        restriction tilted toward the low-density fringes of the ensemble
+        support, and its exact density is intractable. The in-loop IS
+        diagnostics therefore use the ensemble mixture as an approximate
+        proposal density in this mode (log_Z biased, ESS/k-hat heuristic),
+        matching the `_sixsa_dev` truncated arm; the final importance pass is
+        the authoritative posterior/evidence.
         """
+        if self.config.proposal_mode == "posterior":
+            return ens_post
         accept_reject_fn = get_density_thresholder(
             ens_post,
             quantile=self.config.truncated_quantile,
