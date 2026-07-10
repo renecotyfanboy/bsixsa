@@ -347,8 +347,11 @@ class SIXSA(BackendConfig):
         ),
     )
     n_ensemble: PositiveInt = Field(
-        default=8,
-        description="Number of neural posterior estimators trained per round.",
+        default=3,
+        description=(
+            "Number of neural posterior estimators trained per round "
+            "(`_sixsa_dev` reference default: 3)."
+        ),
     )
     first_round_sampling: Literal["qmc", "lhs", "prior"] = Field(
         default="qmc",
@@ -399,11 +402,12 @@ class SIXSA(BackendConfig):
         ),
     )
     max_num_epochs: PositiveInt = Field(
-        default=20,
+        default=25,
         description=(
             "Maximum number of training epochs for each neural density estimator. "
             "Forwarded to sbi's `train(max_num_epochs=...)`. An explicit "
-            "`max_num_epochs` inside `training_kwargs` takes precedence."
+            "`max_num_epochs` inside `training_kwargs` takes precedence "
+            "(`_sixsa_dev` reference default: 25)."
         ),
     )
     plot_diagnostics: StrictBool = Field(
@@ -453,11 +457,12 @@ class SIXSA(BackendConfig):
         ),
     )
     khat_threshold: float | None = Field(
-        default=0.5,
+        default=0.7,
         description=(
             "Pareto k-hat threshold for early stopping. A round whose IS "
             "diagnostics fall below this value triggers convergence. `None` "
-            "disables the early-stopping check."
+            "disables the early-stopping check (`_sixsa_dev` reference "
+            "default: 0.7, the standard PSIS reliability limit)."
         ),
     )
     force_last_round: StrictBool = Field(
