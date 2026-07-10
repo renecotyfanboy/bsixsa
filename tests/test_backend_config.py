@@ -324,6 +324,75 @@ def test_sixsa_backend_run_mock(tmp_path, proposal_mode):
     assert float(physical.max()) > 1.0
 
 
+def test_sixsa_filter_round0_fraction_keeps_best_cstat(tmp_path):
+    """`filter_round0_fraction` trains round 1 on the lowest-cstat fraction only."""
+    import torch
+    import numpy as np
+    from unittest.mock import MagicMock, patch
+    from bsixsa.backend.sixsa import SIXSABackend
+    from bsixsa.backend.config import SIXSA
+    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
+
+    solver = MagicMock()
+    solver.prior.ndim = 2
+    solver.prior.from_unit_gaussian = lambda z: np.asarray(z)
+    solver.prior.to_unit_gaussian = lambda x: np.asarray(x)
+    solver.outputfiles_basename = str(tmp_path)
+    solver.parameter_names = ["p1", "p2"]
+
+    def mock_simulate(params, *args, **kwargs):
+        n = len(params)
+        return {
+            "total_model_counts": np.ones((n, 50), dtype=np.float32),
+            # Deterministic, strictly increasing cstat: rows 0..n-1 are best..worst.
+            "cstat": np.arange(n, dtype=np.float32),
+        }
+
+    solver.simulate.side_effect = mock_simulate
+    solver.observed_spectrum = np.ones(50, dtype=np.float32)
+
+    config = SIXSA(
+        trace=False,
+        num_simulations_per_round=[10],
+        embedding=IdentityEmbedding(),
+        n_ensemble=1,
+        filter_round0_fraction=0.5,
+        khat_threshold=None,
+        plot_diagnostics=False,
+    )
+    backend = SIXSABackend(solver=solver, config=config)
+
+    mock_post = MagicMock()
+    mock_post.log_prob.side_effect = lambda t, *a, **k: torch.ones(t.shape[0])
+    mock_post.sample.side_effect = lambda s, *a, **k: torch.full((s[0], 2), 0.5)
+    mock_post.potential_fn = MagicMock()
+    mock_post.potential_fn.device = "cpu"
+    mock_post._device = "cpu"
+    mock_stats = {"nde_index": 0, "training_time_s": 0.0, "best_val_loss": 1.0,
+                  "best_train_loss": 1.0, "n_epochs": 1}
+    mock_parallel = MagicMock()
+    # Consume the lazy `delayed(...)` generator so the capture below runs.
+    mock_parallel.side_effect = lambda jobs: [(mock_post, mock_stats) for _ in list(jobs)]
+
+    captured = {}
+
+    def capture_delayed(func):
+        def wrapper(*args, **kwargs):
+            captured["theta"] = args[1]
+            return (func, args, kwargs)
+        return wrapper
+
+    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel), \
+         patch("bsixsa.backend.sixsa._sixsa.delayed", capture_delayed):
+        backend.run()
+
+    # Half the 10-sample pool is kept, and only the 5 lowest-cstat rows survive.
+    assert backend.history[0]["n_kept"] == 5
+    assert backend.history[0]["cstat_min"] == 0.0
+    assert backend.history[0]["cstat_max"] == 4.0
+    assert len(captured["theta"]) == 5
+
+
 def test_sixsa_nde_kwargs_merge_keeps_reference_defaults():
     """A partial `nde_kwargs` override merges over the reference defaults instead
     of replacing them (e.g. `{"model": "nsf"}` must keep the MAF-era capacity

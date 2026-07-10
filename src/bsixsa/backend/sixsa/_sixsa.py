@@ -404,6 +404,23 @@ class SIXSABackend(Backend):
         kept_cstats = cstats
         self._last_weighted = None
 
+        if proposal is None and self.config.filter_round0_fraction > 0.0:
+            # Round-1 pre-filter (mirroring `_sixsa_dev`'s filter_round0_fraction):
+            # train the first NDEs on the best-cstat fraction only, instead of the
+            # whole prior pool. Under prior sampling the importance weight is
+            # proportional to the likelihood, so ranking by cstat IS ranking by
+            # weight -- this is the round-1 analogue of the in-loop IS filter.
+            n_keep0 = max(
+                1,
+                int(round(self.config.filter_round0_fraction * len(parameters_latent))),
+            )
+            keep_idx = torch.argsort(cstats)[:n_keep0]
+            kept_theta_latent = parameters_latent[keep_idx]
+            kept_spectra = spectra[keep_idx]
+            kept_cstats = cstats[keep_idx]
+            selected_mask = np.zeros(len(parameters_latent), dtype=bool)
+            selected_mask[keep_idx.numpy()] = True
+
         if proposal is not None and previous_posteriors_list is not None:
             # Timed explicitly (rather than via `self._phase`) to wrap this whole
             # block without re-indenting it; the `log_prob` loop over the previous

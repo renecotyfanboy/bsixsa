@@ -433,7 +433,23 @@ class SIXSA(BackendConfig):
         description=(
             "Fraction of each round's simulations discarded by importance-sampling "
             "filtering before training; the top `1 - is_filter_fraction` by weight "
-            "are kept. `0.0` disables filtering."
+            "are kept. `0.0` disables filtering. Applies to rounds >= 2 (round 1 "
+            "has no proposal weights; see `filter_round0_fraction`)."
+        ),
+    )
+    filter_round0_fraction: float = Field(
+        default=0.0,
+        strict=True,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "If > 0, the FIRST round's NDEs train only on this fraction of the "
+            "round-1 simulations, keeping the LOWEST-cstat rows (under prior "
+            "sampling, ranking by cstat is ranking by importance weight). NOTE "
+            "the asymmetry: this is the fraction KEPT, while `is_filter_fraction` "
+            "is the fraction DISCARDED -- names kept for `_sixsa_dev` parity. "
+            "Keep it gentler than the in-loop filter (e.g. 0.5): round 1 is the "
+            "coverage guard for everything downstream. `0.0` disables (keep all)."
         ),
     )
     khat_threshold: float | None = Field(
