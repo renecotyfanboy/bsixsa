@@ -228,254 +228,171 @@ def test_solver_run_rejects_mismatched_backend_config(mock_solver):
             mock_solver.run()
 
 
-@pytest.mark.parametrize("proposal_mode", ["posterior", "truncated"])
-def test_sixsa_backend_run_mock(tmp_path, proposal_mode):
-    import torch
+def _sixsa_mock_solver(tmp_path, d=2, seed=None):
+    """Mock Solver working in the unit-Gaussian latent (from/to_unit_gaussian)."""
     import numpy as np
-    from unittest.mock import MagicMock, patch
-    from bsixsa.backend.sixsa import SIXSABackend
-    from bsixsa.backend.config import SIXSA
+    from unittest.mock import MagicMock
 
-    # Mock Solver. The backend works in the unit-Gaussian latent, so the
-    # latent<->physical hooks are `from/to_unit_gaussian` (a bare MagicMock here
-    # would silently yield len()==0 arrays and empty rounds).
     solver = MagicMock()
-    solver.prior.ndim = 2
+    solver.prior.ndim = d
     solver.prior.from_unit_gaussian = lambda z: np.asarray(z) * 10.0
     solver.prior.to_unit_gaussian = lambda x: np.asarray(x) / 10.0
     solver.outputfiles_basename = str(tmp_path)
-    solver.parameter_names = ["p1", "p2"]
+    solver.parameter_names = [f"p{i}" for i in range(d)]
 
-    # Mock simulations results
+    rng = np.random.default_rng(seed)
+
     def mock_simulate(params, *args, **kwargs):
         n = len(params)
         return {
             "total_model_counts": np.ones((n, 50), dtype=np.float32),
-            "cstat": np.random.uniform(50, 100, size=n).astype(np.float32)
+            "cstat": rng.uniform(50, 100, size=n).astype(np.float64),
         }
+
     solver.simulate.side_effect = mock_simulate
     solver.observed_spectrum = np.ones(50, dtype=np.float32)
+    return solver
 
-    # Mock embedding
-    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
-    class MockEmbedding(IdentityEmbedding):
-        pass
-    embedding = MockEmbedding()
-    embedding.transform = MagicMock(return_value=np.ones(50, dtype=np.float32))
+
+def _mock_member_posterior(d):
+    """A stand-in NDE posterior with real-tensor `log_prob`/`sample`."""
+    import torch
+    from unittest.mock import MagicMock
+
+    p = MagicMock()
+    p.log_prob.side_effect = lambda theta, *a, **k: torch.zeros(
+        theta.shape[0], dtype=torch.float64
+    )
+
+    def _sample(shape, *a, **k):
+        n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
+        return 0.1 * torch.randn(int(n), d)
+
+    p.sample.side_effect = _sample
+    p.set_default_x.return_value = p
+    return p
+
+
+def _patch_sixsa_internals(d):
+    """Patch training/proposal/ensemble internals so run() needs no real flows."""
+    from unittest.mock import patch
+
+    stats = {"nde_index": 0, "training_time_s": 0.0, "best_val_loss": 1.0,
+             "best_train_loss": 1.0, "n_epochs": 1}
+
+    def fake_training_job(number, theta, x, **kwargs):
+        s = dict(stats, nde_index=number)
+        return _mock_member_posterior(d), s
+
+    def fake_sample_flat(proposal, n, *args, **kwargs):
+        import torch
+        return 0.1 * torch.randn(int(n), d)
+
+    return [
+        patch("bsixsa.backend.sixsa._sixsa.training_job", side_effect=fake_training_job),
+        patch("bsixsa.backend.sixsa._sixsa.build_truncated_proposal",
+              side_effect=lambda *a, **k: object()),
+        patch("bsixsa.backend.sixsa._sixsa.sample_flat", side_effect=fake_sample_flat),
+        patch("bsixsa.backend.sixsa._sixsa.EnsemblePosterior",
+              side_effect=lambda members, *a, **k: _mock_member_posterior(d)),
+    ]
+
+
+def test_sixsa_backend_run_mock(tmp_path):
+    """End-to-end mocked run of the spec loop: checks + gates banked, pooled
+    posterior returned, FitResults carries the pooled evidence."""
+    import contextlib
+    import numpy as np
+    from bsixsa.backend.sixsa import SIXSABackend
+    from bsixsa.backend.config import SIXSA
+
+    solver = _sixsa_mock_solver(tmp_path, d=2, seed=0)
 
     config = SIXSA(
         trace=False,
-        num_simulations_per_round=[10, 10],
-        embedding=embedding,
-        n_ensemble=1,
-        proposal_mode=proposal_mode,
-        is_filter_fraction=0.2,
-        khat_threshold=None,      # disable early stopping for a deterministic run
-        final_is=False,           # keep this test on the in-loop posterior path
-        plot_diagnostics=False,   # skip the xspec-backed diagnostic plots under mocks
+        n_initial_per_param=8,      # d=2 -> 16 initial
+        n_picked_per_param=4,
+        n_sub_batch=4,
+        n_ensemble=2,
+        n_rounds=2,
+        khat_from_round=1,          # gate/check from round 1
+        early_member_n=64,
+        gate_n=128,
+        round_gate_n=64,
+        gate_alpha=0.05,
+        # Impossible efficiency floor -> checks/gates never PASS -> deterministic
+        # full run that still banks every check/gate batch.
+        early_member_min_eff=200.0,
+        run_emulator_pass=False,
+        plot_diagnostics=False,
     )
     backend = SIXSABackend(solver=solver, config=config)
 
-    # Patch training_job to return mock posteriors
-    mock_post = MagicMock()
-    def mock_log_prob(theta, *args, **kwargs):
-        n = theta.shape[0] if hasattr(theta, "shape") else 1
-        return torch.ones(n, dtype=torch.float32)
-    mock_post.log_prob.side_effect = mock_log_prob
-    def mock_sample(shape, *args, **kwargs):
-        n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
-        # A point well inside the unit-Gaussian latent so the prior log-prob is
-        # finite and the importance weights are well-defined.
-        return torch.full((n, 2), 0.5, dtype=torch.float32)
-    mock_post.sample.side_effect = mock_sample
-    mock_post.potential_fn = MagicMock()
-    mock_post.potential_fn.device = "cpu"
-    mock_post._device = "cpu"
-
-    # Each training job now returns (posterior, training_stats); mock that shape.
-    mock_stats = {
-        "nde_index": 0,
-        "training_time_s": 0.0,
-        "best_val_loss": 1.0,
-        "best_train_loss": 1.0,
-        "n_epochs": 1,
-    }
-    mock_parallel = MagicMock()
-    mock_parallel.return_value = [(mock_post, mock_stats)]
-    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel):
+    with contextlib.ExitStack() as stack:
+        for p in _patch_sixsa_internals(2):
+            stack.enter_context(p)
         results = backend.run()
 
     assert results is not None
     assert results.posterior_samples.shape == (10000, 2)
-    # The run records a per-round history that drives the diagnostics.
-    assert len(backend.history) >= 1
-    assert backend.history[0]["nde_stats"] == [mock_stats]
-    # Round 1 always trains on prior draws (exact weights); rounds >= 2 are
-    # exact only in posterior mode, where the pool is drawn from the very
-    # mixture whose density enters the importance weights.
-    assert backend.history[0]["is_weights_exact"] is True
-    assert backend.history[1]["is_weights_exact"] is (proposal_mode == "posterior")
-    assert backend.history[1]["proposal_mode"] == proposal_mode
-    # The returned posterior is importance-resampled (no flow rejection sampling).
-    assert backend.best_weighted is not None
-    # sample() returns physical-space parameters, not the latent. The mock
-    # `from_unit_gaussian` scales by 10, so physical values exceed the latent range.
+    # Two rounds recorded; each round trained the 2-member ensemble.
+    assert len(backend.history) == 2
+    assert len(backend.history[0]["nde_stats"]) == 2
+    # Defensive-IS bank populated (per-member checks + round/final gates).
+    assert backend.bank is not None and len(backend.bank) > 0
+    assert backend.pool_info is not None
+    assert np.isfinite(results.log_Z)
+    assert results.n_likelihood_evaluations > 16
+    # sample() returns physical-space parameters (mock scales latent by 10).
     physical = np.asarray(backend.sample(50))
     assert physical.shape == (50, 2)
-    assert float(physical.max()) > 1.0
+    assert float(np.abs(physical).max()) > 1.0
+    # best_fit is the lowest-cstat pooled sample.
+    assert results.best_fit is not None
+    assert np.isfinite(results.best_fit_stat)
 
 
-def test_sixsa_filter_round0_fraction_keeps_best_cstat(tmp_path):
-    """`filter_round0_fraction` trains round 1 on the lowest-cstat fraction only."""
-    import torch
+def test_sixsa_backend_run_mock_with_emulator_pass(tmp_path):
+    """Mocked run with the emulator pass enabled: it must populate
+    `emulator_pass_info` and extend the run's likelihood-evaluation budget."""
+    import contextlib
     import numpy as np
-    from unittest.mock import MagicMock, patch
     from bsixsa.backend.sixsa import SIXSABackend
     from bsixsa.backend.config import SIXSA
-    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
 
-    solver = MagicMock()
-    solver.prior.ndim = 2
-    solver.prior.from_unit_gaussian = lambda z: np.asarray(z)
-    solver.prior.to_unit_gaussian = lambda x: np.asarray(x)
-    solver.outputfiles_basename = str(tmp_path)
-    solver.parameter_names = ["p1", "p2"]
-
-    def mock_simulate(params, *args, **kwargs):
-        n = len(params)
-        return {
-            "total_model_counts": np.ones((n, 50), dtype=np.float32),
-            # Deterministic, strictly increasing cstat: rows 0..n-1 are best..worst.
-            "cstat": np.arange(n, dtype=np.float32),
-        }
-
-    solver.simulate.side_effect = mock_simulate
-    solver.observed_spectrum = np.ones(50, dtype=np.float32)
+    solver = _sixsa_mock_solver(tmp_path, d=2, seed=1)
 
     config = SIXSA(
         trace=False,
-        num_simulations_per_round=[10],
-        embedding=IdentityEmbedding(),
-        n_ensemble=1,
-        filter_round0_fraction=0.5,
-        khat_threshold=None,
-        final_is=False,
+        n_initial_per_param=8,
+        n_picked_per_param=4,
+        n_sub_batch=4,
+        n_ensemble=2,
+        n_rounds=2,
+        khat_from_round=1,
+        early_member_n=64,
+        gate_n=128,
+        round_gate_n=64,
+        gate_alpha=0.05,
+        early_member_min_eff=200.0,
+        run_emulator_pass=True,
+        emulator_min_per_param=8,   # d=2 -> 16 surrogate draws
+        train_likelihood_emulator=False,
         plot_diagnostics=False,
     )
     backend = SIXSABackend(solver=solver, config=config)
 
-    mock_post = MagicMock()
-    mock_post.log_prob.side_effect = lambda t, *a, **k: torch.ones(t.shape[0])
-    mock_post.sample.side_effect = lambda s, *a, **k: torch.full((s[0], 2), 0.5)
-    mock_post.potential_fn = MagicMock()
-    mock_post.potential_fn.device = "cpu"
-    mock_post._device = "cpu"
-    mock_stats = {"nde_index": 0, "training_time_s": 0.0, "best_val_loss": 1.0,
-                  "best_train_loss": 1.0, "n_epochs": 1}
-    mock_parallel = MagicMock()
-    # Consume the lazy `delayed(...)` generator so the capture below runs.
-    mock_parallel.side_effect = lambda jobs: [(mock_post, mock_stats) for _ in list(jobs)]
-
-    captured = {}
-
-    def capture_delayed(func):
-        def wrapper(*args, **kwargs):
-            captured["theta"] = args[1]
-            return (func, args, kwargs)
-        return wrapper
-
-    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel), \
-         patch("bsixsa.backend.sixsa._sixsa.delayed", capture_delayed):
-        backend.run()
-
-    # Half the 10-sample pool is kept, and only the 5 lowest-cstat rows survive.
-    assert backend.history[0]["n_kept"] == 5
-    assert backend.history[0]["cstat_min"] == 0.0
-    assert backend.history[0]["cstat_max"] == 4.0
-    assert len(captured["theta"]) == 5
-
-
-def test_sixsa_backend_run_mock_with_final_is(tmp_path):
-    """End-to-end mocked run with the final importance pass enabled: the pass
-    must populate `final_weighted`, take precedence in `sample()`, and report
-    its evidence in the FitResults."""
-    import torch
-    import numpy as np
-    from unittest.mock import MagicMock, patch
-    from bsixsa.backend.sixsa import SIXSABackend
-    from bsixsa.backend.config import SIXSA
-    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
-
-    solver = MagicMock()
-    solver.prior.ndim = 2
-    solver.prior.from_unit_gaussian = lambda z: np.asarray(z) * 10.0
-    solver.prior.to_unit_gaussian = lambda x: np.asarray(x) / 10.0
-    solver.outputfiles_basename = str(tmp_path)
-    solver.parameter_names = ["p1", "p2"]
-
-    def mock_simulate(params, *args, **kwargs):
-        n = len(params)
-        return {
-            "total_model_counts": np.ones((n, 50), dtype=np.float32),
-            # Narrow deterministic cstat spread -> well-behaved IS weights.
-            "cstat": np.linspace(50.0, 52.0, n).astype(np.float32),
-        }
-
-    solver.simulate.side_effect = mock_simulate
-    solver.observed_spectrum = np.ones(50, dtype=np.float32)
-
-    config = SIXSA(
-        trace=False,
-        num_simulations_per_round=[16, 16],
-        embedding=IdentityEmbedding(),
-        n_ensemble=1,
-        is_filter_fraction=0.2,
-        khat_threshold=None,
-        final_is=True,
-        final_is_target_ess=5.0,
-        final_is_fallback_ess=2.0,
-        final_is_max_rounds=2,
-        final_is_n_per_round=16,
-        plot_diagnostics=False,
-    )
-    backend = SIXSABackend(solver=solver, config=config)
-
-    mock_post = MagicMock()
-    mock_post.log_prob.side_effect = lambda t, *a, **k: torch.ones(t.shape[0])
-
-    def mock_sample(shape, *args, **kwargs):
-        n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
-        return 0.5 + 0.01 * torch.randn(n, 2)
-
-    mock_post.sample.side_effect = mock_sample
-    mock_post.potential_fn = MagicMock()
-    mock_post.potential_fn.device = "cpu"
-    mock_post._device = "cpu"
-    mock_stats = {"nde_index": 0, "training_time_s": 0.0, "best_val_loss": 1.0,
-                  "best_train_loss": 1.0, "n_epochs": 1}
-    mock_parallel = MagicMock()
-    mock_parallel.return_value = [(mock_post, mock_stats)]
-
-    torch.manual_seed(0)
-    np.random.seed(0)
-    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel):
+    with contextlib.ExitStack() as stack:
+        for p in _patch_sixsa_internals(2):
+            stack.enter_context(p)
         results = backend.run()
 
-    assert backend.final_is_info is not None
-    assert backend.final_weighted is not None
-    theta, weights = backend.final_weighted
-    assert len(theta) == len(weights)
-    assert np.isclose(float(weights.sum()), 1.0)
-    # FitResults carries the final pass's evidence and the full simulation budget.
-    assert np.isfinite(results.log_Z)
-    assert results.log_Z == backend.final_is_info["log_Z"]
-    assert results.n_likelihood_evaluations == (
-        32 + backend.final_is_info["n_simulations"]
-    )
+    assert backend.emulator_pass_info is not None
+    assert "log_Z" in backend.emulator_pass_info
+    assert backend.emulator_pass_info["n_draws"] == 16
+    # The emulator-pass sims are included in the reported budget.
+    assert results.n_likelihood_evaluations >= 16
     assert results.posterior_samples.shape == (10000, 2)
-    # The summary file is written next to the round outputs.
-    import os
-    assert os.path.exists(os.path.join(str(tmp_path), "final_is_summary.json"))
 
 
 def test_sixsa_nde_kwargs_merge_keeps_reference_defaults():

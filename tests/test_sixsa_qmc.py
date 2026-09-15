@@ -78,7 +78,7 @@ def _make_backend(ndim: int, first_round_sampling: str):
 
     config = SIXSA(
         trace=False,
-        num_simulations_per_round=[16, 16],
+        n_rounds=2,
         first_round_sampling=first_round_sampling,
         plot_diagnostics=False,
     )
@@ -126,4 +126,4 @@ def test_first_round_sampling_rejects_unknown_mode():
     from bsixsa.backend.config import SIXSA
 
     with pytest.raises(ValidationError, match="first_round_sampling"):
-        SIXSA(num_simulations_per_round=[16], first_round_sampling="bogus")
+        SIXSA(first_round_sampling="bogus")

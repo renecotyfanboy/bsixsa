@@ -1,33 +1,51 @@
+"""SIXSA backend: persistent replace-worst loop with defensive-IS gates.
+
+Implements the SIXSA specification (code version 1.11.1) on the `bsixsa`
+Solver/prior/XSPEC boundaries, in the unit-Gaussian latent ``N(0, I)``.
+
+Each round trains an ensemble of NPE_C flows SEQUENTIALLY on a single persistent
+training set ``T``: member ``k`` trains on ``T``, draws a flat sub-batch from its
+truncated proposal, and replace-worst-merges it into ``T`` before member ``k+1``
+trains -- so members differ by initialization AND by their (progressively
+refined) training set. Convergence is gated by defensive-mixture importance
+sampling (see ``_importance``); the headline posterior / khat / ESS / log_Z come
+from the banked pooled multiple-IS estimator, followed by an optional emulator
+pass. The flows are never trusted directly -- the defensive-IS khat is the
+arbiter.
+"""
+
 import contextlib
 import functools
+import math
 import os
 import time
 import warnings
 from typing import TYPE_CHECKING
 
-import dill
 import numpy as np
 import torch
-from joblib import Parallel, delayed
-from sbi.inference import EnsemblePosterior, NPE
+from sbi.inference import EnsemblePosterior, NPE_C
 from sbi.neural_nets import posterior_nn
-from sbi.utils import RestrictedPrior, get_density_thresholder
 
 from .. import register_backend
 from ..abc import Backend
 from ..config import SIXSA
 from ...convenience import available_cpu_count
 from . import plots
-from ._importance import final_importance_pass
-from .embedding import IdentityEmbedding
-from .embedding.abc import Embedding
+from ._buffer import TrainingBuffer
+from ._emulator import emulator_importance_pass, train_likelihood_emulator
+from ._importance import DefensiveISBank, defensive_is_diagnostics, run_check, run_gate
+from ._proposal import build_truncated_proposal, sample_flat
 from .embedding.nets import EmbeddingNet, FCEmbeddingNet
 
 if TYPE_CHECKING:
     from ...solver import FitResults, Solver
 
-# Density-estimator defaults mirroring `_sixsa_dev` (sixsa_default.yml nde_kwargs):
-# a MAF with wide transforms and independent z-scoring of theta and x.
+# Code version reported on the first log line (spec logging contract).
+SIXSA_VERSION = "1.11.1"
+
+# Density-estimator defaults mirroring the reference nde_kwargs: a MAF with wide
+# transforms and independent z-scoring of theta and x.
 DEFAULT_NDE_KWARGS = {
     "model": "maf",
     "hidden_features": 100,
@@ -36,42 +54,25 @@ DEFAULT_NDE_KWARGS = {
     "z_score_x": "independent",
 }
 
+
 def merge_nde_kwargs(user_kwargs):
-    """Merge user `nde_kwargs` over `DEFAULT_NDE_KWARGS` (user keys win).
-
-    A partial override like ``{"model": "nsf"}`` keeps the reference capacity
-    (``hidden_features=100``, ``num_transforms=10``) and the independent
-    z-scoring of theta and x instead of silently dropping them.
-    """
+    """Merge user `nde_kwargs` over `DEFAULT_NDE_KWARGS` (user keys win)."""
     return {**DEFAULT_NDE_KWARGS, **(user_kwargs or {})}
-
-
-# Minimum effective sample size below which the Pareto k_hat diagnostic is not
-# trustworthy: with too few effective samples the generalized-Pareto tail fit is
-# uninformative and psislw reports a spuriously LOW k_hat on a proposal that is
-# actually catastrophic. Mirrors `_sixsa_dev` (sixsa_main.py); below this we
-# report k_hat = inf so such rounds are never selected as best.
-_KHAT_MIN_ESS = 10.0
 
 
 def _unit_gaussian_prior(ndim):
     """Standard-normal prior ``N(0, I)`` over the SIXSA latent space.
 
-    SIXSA works in a unit-Gaussian latent space (rather than the unit cube): the
-    unbounded support lets the flow and the rejection sampler avoid the hard box
-    edges that previously caused mass leakage and inefficient sampling. Latent
-    draws are mapped to physical parameters by ``solver.prior.from_unit_gaussian``
-    (``ppf(Phi(z))`` per marginal).
+    Latent draws map to physical parameters by ``solver.prior.from_unit_gaussian``
+    (``ppf(Phi(z))`` per marginal); log-uniform parameters are a per-parameter
+    `loguniform` prior-object choice handled there.
     """
-    return torch.distributions.MultivariateNormal(
-        torch.zeros(ndim), torch.eye(ndim)
-    )
+    return torch.distributions.MultivariateNormal(torch.zeros(ndim), torch.eye(ndim))
 
 
 def patch_sample_no_pbar(posterior):
-    """Patch the sample method of a posterior to remove the progress bar."""
+    """Default the posterior's `sample` to no progress bar."""
     original = posterior.sample
-    posterior._original_sample = original
 
     @functools.wraps(original)
     def sample(*args, _original=original, **kwargs):
@@ -83,7 +84,7 @@ def patch_sample_no_pbar(posterior):
 
 
 def work_quiet(func):
-    """Decorator to run a function without printing anything to stdout."""
+    """Run a function with stdout redirected to devnull."""
 
     def quiet_func(*args, **kwargs):
         with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
@@ -100,100 +101,50 @@ def training_job(
     *,
     embedding_net,
     round_number,
-    output_dir,
-    proposal=None,
     training_kwargs=None,
     nde_kwargs=None,
     num_threads=None,
 ):
-    # Each ensemble member trains in its own process; cap torch's intra-op
-    # threads so the `n_ensemble` parallel workers fill the cores instead of
-    # oversubscribing them (the default is one full machine's worth per worker).
+    """Train one ensemble member (NPE_C, plain MLE loss, fresh weights).
+
+    Trains on the STORED Poisson realization ``x`` (no per-member Poisson --
+    the single realization is drawn once per theta at simulation time). Returns
+    ``(posterior, stats)``.
+    """
     if num_threads is not None:
         torch.set_num_threads(int(num_threads))
 
-    current_round_dir = os.path.join(output_dir, f"round_{round_number}")
-    current_artifacts_dir = os.path.join(current_round_dir, "artifacts")
-    os.makedirs(current_artifacts_dir, exist_ok=True)
+    theta_t = torch.as_tensor(np.asarray(theta), dtype=torch.float32)
+    x_t = torch.as_tensor(np.asarray(x), dtype=torch.float32)
 
-    # Each ensemble member sees its own Poisson realization of the model counts,
-    # which diversifies the ensemble and stabilises training and generation.
-    x = torch.as_tensor(np.random.poisson(x).astype(np.float32))
-
-    if (round_number == 1) or training_kwargs.get("retrain_from_scratch", False):
-        # Embedding network trained jointly with the NPE. A user-provided
-        # `EmbeddingNet` spec wins; otherwise use the default FC pyramid, which
-        # mirrors how `_sixsa_dev` embeds spectra.
-        if embedding_net is not None:
-            net = embedding_net.build(x.shape[1])
-        else:
-            net = FCEmbeddingNet().build(x.shape[1])
-        prior_sbi = _unit_gaussian_prior(theta.shape[-1])
-        build_fun = posterior_nn(
-            embedding_net=net, **(nde_kwargs or DEFAULT_NDE_KWARGS)
-        )
-        inference = NPE(prior=prior_sbi, density_estimator=build_fun, device="cpu")
+    if embedding_net is not None:
+        net = embedding_net.build(x_t.shape[1])
     else:
-        previous_round_dir = os.path.join(output_dir, f"round_{round_number - 1}")
-        previous_artifacts_dir = os.path.join(previous_round_dir, "artifacts")
-        previous_inference_path = os.path.join(
-            previous_artifacts_dir,
-            f"inference_{number}.pkl",
-        )
-        if not os.path.exists(previous_inference_path):
-            raise FileNotFoundError(
-                f"Missing previous round state for net {number}: {previous_inference_path}"
-            )
-        with open(previous_inference_path, "rb") as file:
-            inference = dill.load(file)
+        net = FCEmbeddingNet().build(x_t.shape[1])
+    prior_sbi = _unit_gaussian_prior(theta_t.shape[-1])
+    build_fun = posterior_nn(embedding_net=net, **(nde_kwargs or DEFAULT_NDE_KWARGS))
+    inference = NPE_C(prior=prior_sbi, density_estimator=build_fun, device="cpu")
 
-    training_kwargs = {} if training_kwargs is None else training_kwargs
-
+    training_kwargs = {} if training_kwargs is None else dict(training_kwargs)
     with warnings.catch_warnings():
-        # Catches warning about pickling NPE / Restricted prior not pointing to wrong address
         warnings.simplefilter("ignore", category=UserWarning)
-
-        training_start = time.time()
-        density_estimator = inference.append_simulations(
-            torch.from_numpy(theta.copy()),
-            x,
-            proposal=proposal,
-        ).train(**training_kwargs)
-        training_time = time.time() - training_start
-
+        t0 = time.time()
+        inference.append_simulations(theta_t, x_t).train(**training_kwargs)
+        training_time = time.time() - t0
         posterior = inference.build_posterior()
 
-        with open(
-            os.path.join(current_artifacts_dir, f"inference_{number}.pkl"),
-            "wb",
-        ) as file:
-            dill.dump(inference, file, recurse=True)
-
-        with open(
-            os.path.join(current_artifacts_dir, f"density_estimator_{number}.pkl"),
-            "wb",
-        ) as file:
-            dill.dump(density_estimator, file, recurse=True)
-
-        with open(
-            os.path.join(current_artifacts_dir, f"posterior_{number}.pkl"),
-            "wb",
-        ) as file:
-            dill.dump(posterior, file, recurse=True)
-
-    # Per-NDE training summary, consumed by the diagnostics history.
     summary = getattr(inference, "summary", {}) or {}
     val = summary.get("validation_loss", []) or []
     trn = summary.get("training_loss", []) or []
     epochs = summary.get("epochs_trained", []) or []
     stats = {
         "nde_index": number,
+        "round": round_number,
         "training_time_s": float(training_time),
         "best_val_loss": float(np.min(val)) if len(val) else float("nan"),
         "best_train_loss": float(np.min(trn)) if len(trn) else float("nan"),
         "n_epochs": int(epochs[-1]) if len(epochs) else (len(val) if len(val) else 0),
     }
-
     return posterior, stats
 
 
@@ -203,127 +154,129 @@ class SIXSABackend(Backend):
     name = "sixsa"
     config_cls = SIXSA
 
-    def __init__(
-        self,
-        *,
-        solver: "Solver",
-        config: SIXSA,
-        **kwargs,
-    ):
+    def __init__(self, *, solver: "Solver", config: SIXSA, **kwargs):
         super().__init__(solver=solver, config=config)
-        self.proposals = []
-        self.history = []
-        self.n_nets = config.n_ensemble
         self.prior = _unit_gaussian_prior(solver.prior.ndim)
+        self.history = []
+        self.bank = None
+        self.pool_info = None
+        self.emulator_pass_info = None
+        self.likelihood_emulator = None
         self.best_ensemble = None
         self.best_round = 0
-        self.best_efficiency = -float("inf")
-        self.best_khat = float("inf")
-        self.best_log_Z = float("nan")
-        self.best_log_Z_err = float("nan")
-        # Importance-resampling posterior: (theta_latent, normalised_weights)
-        # for the best round, and the most recent round's set.
-        self.best_weighted = None
-        self._last_weighted = None
-        # Final importance pass: pooled PSIS-smoothed (theta_latent, weights)
-        # and its info dict; populated by `_run_final_importance_pass`.
-        self.final_weighted = None
-        self.final_is_info = None
+        # Which `posterior_source` actually produced the returned samples
+        # (may differ from the config when the preferred source is missing).
+        self.posterior_source_used = None
+        self.all_theta_log = None
+        self.all_cstat = None
+        self._buffer_sims = 0
+        self._sim_theta = []
+        self._sim_cstat = []
 
+    # ------------------------------------------------------------------ #
+    # Public sampling boundary (latent -> physical)
+    # ------------------------------------------------------------------ #
     def sample(self, n: int) -> np.ndarray:
-        # The backend works in the unit-Gaussian latent internally (flow, IS
-        # weights, resampling); convert to physical here, at the public boundary,
-        # so the returned posterior matches the prior and the other backends and
-        # can be fed straight to `solver.simulate()` / the predictive-coverage plots.
-        if self.final_weighted is not None:
-            # Preferred: the final importance pass's pooled, PSIS-smoothed
-            # weighted draws -- the reference's reported posterior. An
-            # on-demand multinomial resample is statistically identical to the
-            # reference's one-shot resample of the same pooled weights.
-            theta, weights = self.final_weighted
-            idx = torch.multinomial(weights, n, replacement=True)
-            latent = theta[idx]
-        elif self.best_weighted is not None:
-            # Fallback when the final pass is disabled or failed: importance-
-            # resample the best round's in-loop simulated points. These are real
-            # proposal draws, so the physical samples lie within the prior
-            # support and the flow is never sampled.
-            theta, weights = self.best_weighted
-            idx = torch.multinomial(weights, n, replacement=True)
-            latent = theta[idx]
-        elif self.best_ensemble is not None:
-            latent = self.best_ensemble.sample((n,))
-        else:
-            sampler = self.proposals[-1] if self.proposals else self.prior
-            latent = sampler.sample((n,))
-
+        latent = self._sample_latent(n)
         if hasattr(latent, "detach"):
             latent = latent.detach().cpu().numpy()
         return self._gaussian_to_physical(np.asarray(latent))
 
-    def _compute_is_diagnostics(self, new_log, cstats, log_w):
-        import torch
-        import numpy as np
-        from arviz import psislw
+    # Fallback order per `posterior_source`: the chosen source first, then the
+    # remaining ones, so a run always returns a posterior even when its
+    # preferred source is unavailable (e.g. the emulator pass was disabled).
+    _POSTERIOR_SOURCE_ORDER = {
+        "pool": ("pool", "emulator_pass", "best_flow"),
+        "emulator_pass": ("emulator_pass", "pool", "best_flow"),
+        "best_flow": ("best_flow", "pool", "emulator_pass"),
+    }
 
-        finite = torch.isfinite(log_w)
-        log_w_safe = torch.where(finite, log_w, torch.full_like(log_w, -np.inf))
-        log_w_fin = log_w[finite]
+    def _sample_latent(self, n: int):
+        """Draw ``n`` latent posterior samples from the configured source.
 
-        diag = {
-            "ess": float("nan"),
-            "efficiency": float("nan"),
-            "k_hat": float("nan"),
-            "log_Z": float("nan"),
-            "log_Z_err": float("nan"),
-            "log_w_safe": log_w_safe,
-            "finite": finite,
-            "w_norm": None,
-        }
+        Exactness vs diversity (see ``SIXSA.posterior_source``):
 
-        if len(log_w_fin) > 0:
-            w = torch.exp(log_w_fin - log_w_fin.max())
-            w_norm = w / w.sum()
-            ess = float(1.0 / (w_norm ** 2).sum().item())
-            n_total = len(log_w)
+        * ``"pool"`` -- resample the banked pooled multiple-IS draws. Most
+          exact, but the DISTINCT-row count is capped by the banked draws and
+          their pooled ESS, so a large ``num_posterior_samples`` repeats rows.
+        * ``"emulator_pass"`` -- resample the emulator pass's flow-IS weighted
+          draws: fresh surrogate samples, still importance-corrected.
+        * ``"best_flow"`` -- draw fresh from the best flow: no duplicates, but
+          no importance correction (the flow's own approximation).
+        """
+        order = self._POSTERIOR_SOURCE_ORDER[self.config.posterior_source]
+        for source in order:
+            latent = self._sample_from_source(source, n)
+            if latent is not None:
+                self.posterior_source_used = source
+                return latent
+        self.posterior_source_used = "prior"
+        return self.prior.sample((n,))
 
-            # Normalised importance weights over the finite samples, used to
-            # importance-resample the posterior (the returned, flow-free posterior).
-            diag["w_norm"] = w_norm
-            diag["ess"] = ess
-            diag["efficiency"] = 100.0 * ess / len(log_w_fin)
-            diag["log_Z"] = float((torch.logsumexp(log_w_fin, 0) - np.log(n_total)).item())
-            diag["log_Z_err"] = float(np.sqrt((n_total - ess) / (n_total * ess)))
-
-            # k_hat via arviz psislw, matching `_sixsa_dev` (which abandoned sbi's
-            # gpdfit because it reports a systematically different k_hat on
-            # identical weights, making in-loop and final k_hat non-comparable).
-            # The min-ESS guard returns k_hat=inf when there are too few effective
-            # samples for a meaningful generalized-Pareto tail fit (see _KHAT_MIN_ESS).
+    def _sample_from_source(self, source: str, n: int):
+        """Sample from one named source, or return ``None`` if unavailable."""
+        if source == "pool":
+            if self.bank is None or not len(self.bank):
+                return None
             try:
-                if not np.isfinite(ess) or ess < _KHAT_MIN_ESS:
-                    diag["k_hat"] = float("inf")
-                else:
-                    _, khat_val = psislw(log_w_fin.detach().cpu().numpy().copy())
-                    diag["k_hat"] = float(khat_val)
+                z, w = self.bank.pooled_weighted(self.prior)
             except Exception:
-                diag["k_hat"] = float("nan")
+                return None
+            return z[torch.multinomial(w, n, replacement=True)]
 
-        return diag
+        if source == "emulator_pass":
+            emu = self.emulator_pass_info
+            if emu is None or emu.get("weighted") is None:
+                return None
+            z, w = emu["weighted"]
+            return z[torch.multinomial(w, n, replacement=True)]
+
+        if source == "best_flow":
+            if self.best_ensemble is None:
+                return None
+            try:
+                return self.best_ensemble.sample((n,)).detach()
+            except Exception:
+                return None
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Simulation helpers
+    # ------------------------------------------------------------------ #
+    def _observation(self):
+        return torch.as_tensor(self.solver.observed_spectrum, dtype=torch.float32)
+
+    def _log_likelihood_latent(self, z):
+        """Exact log-likelihood ``-0.5*cstat`` for latent draws ``z``."""
+        physical = self._gaussian_to_physical(
+            z.detach().cpu().numpy() if hasattr(z, "detach") else np.asarray(z)
+        )
+        out = self.solver.simulate(physical, return_kind="cstat", progress_bar=False)
+        return torch.as_tensor(-0.5 * np.asarray(out["cstat"], dtype=np.float64))
+
+    def _simulate_latent(self, z):
+        """Fold ``z``, draw the single Poisson realization, return (x, cstat)."""
+        z_np = z.detach().cpu().numpy() if hasattr(z, "detach") else np.asarray(z)
+        physical = self._gaussian_to_physical(z_np)
+        res = self.solver.simulate(physical, return_kind="full_model_counts")
+        mean = np.asarray(res["total_model_counts"], dtype=np.float64)
+        cstat = np.asarray(res["cstat"], dtype=np.float64)
+        x_poisson = np.random.poisson(np.clip(mean, 0.0, None)).astype(np.float32)
+        self._buffer_sims += len(z_np)
+        self._sim_theta.append(np.asarray(z_np, dtype=np.float32))
+        self._sim_cstat.append(cstat)
+        return x_poisson, cstat
+
+    def _init_buffer(self, n_initial, capacity):
+        z = self._initial_latent(n_initial)
+        x, cstat = self._simulate_latent(z)
+        return TrainingBuffer(
+            z.detach().cpu().numpy(), x, cstat, capacity=capacity
+        )
 
     def _initial_latent(self, n: int) -> torch.Tensor:
-        """Draw the first round's parameters in the unit-Gaussian latent ``N(0, I)``.
-
-        With ``first_round_sampling="qmc"`` (default) this returns a Sobol-based
-        quasi-Monte-Carlo design (``MultivariateNormalQMC``), which fills the
-        latent far more evenly than i.i.d. normal draws at the same simulation
-        budget; ``"lhs"`` returns a Latin-hypercube design pushed through the
-        normal quantile function (per-marginal stratified -- composed with
-        ``from_unit_gaussian`` this is exactly `_sixsa_dev`'s box LHS);
-        ``"prior"`` restores the plain i.i.d. ``N(0, I)`` draw. The samples are
-        mapped to physical space downstream by
-        ``solver.prior.from_unit_gaussian`` (``ppf(Phi(z))`` per marginal).
-        """
+        """Round-1 design in the unit-Gaussian latent (QMC / LHS / i.i.d. prior)."""
         if self.config.first_round_sampling == "qmc":
             from scipy.stats import qmc
 
@@ -339,394 +292,199 @@ class SIXSABackend(Backend):
             return torch.as_tensor(z, dtype=torch.float32)
         return self.prior.sample((n,))
 
-    @contextlib.contextmanager
-    def _phase(self, round_number, name):
-        """Time a named per-round phase and print it (gated on ``config.trace``).
-
-        Lets you see which step between folding rounds dominates the wall time
-        (e.g. SIR proposal sampling, the IS-diagnostics log_prob loop, building
-        the next proposal, or plotting) without confusing it with NDE training.
-        Printed with ``flush=True`` so a slow/hanging phase is visible live.
-        """
-        if not self.config.trace:
-            yield
-            return
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            print(
-                f"[SIXSA r{round_number}] {name}: {time.perf_counter() - t0:.2f} s",
-                flush=True,
-            )
-
-    def inference_round(
-        self,
-        n_simulations,
-        *,
-        embedding: Embedding,
-        embedding_net=None,
-        proposal=None,
-        round_number=0,
-        training_kwargs=None,
-        is_filter_fraction=0.0,
-        previous_posteriors_list=None,
-    ):
-        # `n_simulations` is the per-round simulation budget: we draw and simulate
-        # exactly this many, then keep the top (1 - is_filter_fraction) fraction by
-        # importance weight for training (round 1 has no weights and keeps all).
-        n_pool = n_simulations
-        is_truncated_proposal = isinstance(proposal, RestrictedPrior)
-        if proposal is None:
-            phase_label = "initial sampling"
-        elif is_truncated_proposal:
-            phase_label = "proposal sampling (SIR)"
-        else:
-            phase_label = "proposal sampling (ensemble posterior)"
-        with self._phase(round_number, phase_label):
-            if proposal is None:
-                parameters_latent = self._initial_latent(n_pool)
-            elif is_truncated_proposal:
-                # Truncated mode: `proposal` is the RestrictedPrior
-                # (sample_with="sir"). Draw in smaller SIR batches (mirroring
-                # `_sixsa_dev`) so each iteration only draws
-                # `max_sampling_batch_size * 32` candidates from the ensemble
-                # posterior instead of the full `n_pool * 32` at once. Purely a
-                # performance knob -- the sampled distribution is unchanged.
-                parameters_latent = proposal.sample(
-                    (n_pool,),
-                    max_sampling_batch_size=self.config.truncated_max_sampling_batch_size,
-                )
-            else:
-                # Posterior mode: `proposal` is the previous round's
-                # EnsemblePosterior (default_x already set). No rejection is
-                # involved -- the unbounded latent has no prior box to leak out
-                # of -- so this is a plain mixture draw.
-                parameters_latent = proposal.sample((n_pool,)).detach()
-
-        with self._phase(round_number, "simulation (folding)"):
-            parameters = self.solver.prior.from_unit_gaussian(parameters_latent.numpy())
-            simulations_results = self.solver.simulate(parameters, return_kind="full_model_counts")
-            spectra = simulations_results["total_model_counts"]
-            cstats = torch.as_tensor(simulations_results["cstat"], dtype=torch.float32)
-
-        diag = None
-        selected_mask = None
-        kept_theta_latent = parameters_latent
-        kept_spectra = spectra
-        kept_cstats = cstats
-        self._last_weighted = None
-
-        if proposal is None and self.config.filter_round0_fraction > 0.0:
-            # Round-1 pre-filter (mirroring `_sixsa_dev`'s filter_round0_fraction):
-            # train the first NDEs on the best-cstat fraction only, instead of the
-            # whole prior pool. Under prior sampling the importance weight is
-            # proportional to the likelihood, so ranking by cstat IS ranking by
-            # weight -- this is the round-1 analogue of the in-loop IS filter.
-            n_keep0 = max(
-                1,
-                int(round(self.config.filter_round0_fraction * len(parameters_latent))),
-            )
-            keep_idx = torch.argsort(cstats)[:n_keep0]
-            kept_theta_latent = parameters_latent[keep_idx]
-            kept_spectra = spectra[keep_idx]
-            kept_cstats = cstats[keep_idx]
-            selected_mask = np.zeros(len(parameters_latent), dtype=bool)
-            selected_mask[keep_idx.numpy()] = True
-
-        if proposal is not None and previous_posteriors_list is not None:
-            # Timed explicitly (rather than via `self._phase`) to wrap this whole
-            # block without re-indenting it; the `log_prob` loop over the previous
-            # ensemble is the usual non-training suspect between folding rounds.
-            _t_is_diag = time.perf_counter()
-            observation = torch.from_numpy(self.solver.observed_spectrum)
-
-            # Evaluate log_q under the previous ensemble of NPE posteriors
-            log_q = torch.stack(
-                [pk.log_prob(parameters_latent, x=observation)
-                 for pk in previous_posteriors_list],
-                0,
-            )
-            log_q_mix = torch.logsumexp(log_q, dim=0) - np.log(len(previous_posteriors_list))
-
-            # log_q_mix is the proposal density in the IS weights below. In
-            # posterior mode the pool was drawn from this very mixture, so the
-            # weights (and ESS/k-hat/log_Z) are exact. In truncated mode the
-            # SIR-sampled RestrictedPrior has an intractable density and the
-            # mixture is only an approximation (see `_build_proposal`): the
-            # diagnostics steer round selection, but the final importance pass
-            # is the authoritative posterior/evidence.
-
-            # Prior density (standard-normal prior log_prob on the latent samples)
-            log_prior = self.prior.log_prob(parameters_latent)
-
-            # Raw importance log-weights: -0.5 cstat + log prior - log proposal
-            log_w = -0.5 * cstats + log_prior - log_q_mix
-
-            diag = self._compute_is_diagnostics(parameters_latent, cstats, log_w)
-
-            # Stash the importance-weighted simulated points (all finite samples)
-            # so the run can return an IS-resampled posterior from the best round.
-            if diag["w_norm"] is not None:
-                self._last_weighted = (
-                    parameters_latent[diag["finite"]].detach(),
-                    diag["w_norm"].detach(),
-                )
-            else:
-                self._last_weighted = None
-
-            # Keep the top-weight fraction as the training batch (sample weights).
-            if is_filter_fraction > 0.0:
-                n_keep = max(
-                    1,
-                    int(round((1.0 - is_filter_fraction) * len(parameters_latent))),
-                )
-                keep_idx = torch.argsort(diag["log_w_safe"], descending=True)[:n_keep]
-                kept_theta_latent = parameters_latent[keep_idx]
-                kept_spectra = spectra[keep_idx]
-                kept_cstats = cstats[keep_idx]
-                selected_mask = np.zeros(len(parameters_latent), dtype=bool)
-                selected_mask[keep_idx.numpy()] = True
-
-            if self.config.trace:
-                print(
-                    f"[SIXSA r{round_number}] IS diagnostics (log_prob over ensemble): "
-                    f"{time.perf_counter() - _t_is_diag:.2f} s",
-                    flush=True,
-                )
-
-        # Fit the (optional) pre-processor embedding on the kept spectra. The NPEs
-        # train on the raw kept spectra with their own jointly-trained embedding
-        # net, so this only matters for a trainable pre-processor embedding --
-        # skip it (and the large Poisson realization) for the identity embedding.
-        round_path = os.path.join(self.solver.outputfiles_basename, f"round_{round_number}")
-        os.makedirs(round_path, exist_ok=True)
-        if not isinstance(embedding, IdentityEmbedding):
-            noisy_spectra = np.random.poisson(kept_spectra).astype(np.float32)
-            with self._phase(round_number, "embedding fit"):
-                embedding.fit(
-                    noisy_spectra,
-                    metrics_path=os.path.join(round_path, "embedding_training.pdf"),
-                )
-
-        # Train the ensemble of NPEs on the kept (filtered) parameters. Each job
-        # returns (posterior, training_stats). Split the cores evenly across the
-        # parallel workers so torch does not oversubscribe (default: a full
-        # machine's worth of threads per worker -> n_nets x cores contention).
-        nde_kwargs = merge_nde_kwargs(self.config.nde_kwargs)
-        num_threads = max(1, available_cpu_count() // max(1, self.n_nets))
-        kept_theta_latent_np = kept_theta_latent.numpy().copy()
-        with self._phase(round_number, "training (ensemble NPE)"):
-            results = Parallel(n_jobs=-1)(
-                delayed(training_job)(
-                    i,
-                    kept_theta_latent_np,
-                    kept_spectra,
-                    embedding_net=embedding_net,
-                    round_number=round_number,
-                    output_dir=self.solver.outputfiles_basename,
-                    proposal=proposal,
-                    training_kwargs=training_kwargs,
-                    nde_kwargs=nde_kwargs,
-                    num_threads=num_threads,
-                )
-                for i in range(self.n_nets)
-            )
-
-        # Gather the posterior ensemble + per-NDE training stats
-        posteriors = [patch_sample_no_pbar(result[0]) for result in results]
-        nde_stats = [result[1] for result in results]
-        ensemble = EnsemblePosterior(posteriors)
-        ensemble.set_default_x(torch.from_numpy(self.solver.observed_spectrum))
-
-        # Per-round summary consumed by the training-history diagnostic.
-        def _diag_value(key):
-            return diag[key] if diag is not None else float("nan")
-
-        round_info = {
-            "round": round_number,
-            "n_simulations_round": n_pool,
-            "n_kept": int(len(kept_theta_latent)),
-            "proposal_mode": self.config.proposal_mode,
-            # Exact when the pool was drawn from the density used in the weights:
-            # round 1 has no weights, posterior mode samples the mixture itself;
-            # only the truncated RestrictedPrior rounds are approximate.
-            "is_weights_exact": not is_truncated_proposal,
-            "nde_stats": nde_stats,
-            "cstat_min": float(kept_cstats.min().item()),
-            "cstat_median": float(kept_cstats.median().item()),
-            "cstat_max": float(kept_cstats.max().item()),
-            "ess": _diag_value("ess"),
-            "efficiency": _diag_value("efficiency"),
-            "k_hat": _diag_value("k_hat"),
-            "log_Z": _diag_value("log_Z"),
-            "log_Z_err": _diag_value("log_Z_err"),
-        }
-
-        # Optional per-round diagnostic plots (coverage band + ensemble corner).
-        if self.config.plot_diagnostics:
-            with self._phase(round_number, "round diagnostics plotting"):
-                self._plot_round_diagnostics(
-                    spectra, selected_mask, posteriors, ensemble,
-                    round_number, round_path,
-                )
-
-        return ensemble, posteriors, round_info
-
-    def _plot_round_diagnostics(
-        self, spectra, selected_mask, posteriors, ensemble, round_number, round_path
-    ):
-        """Write the per-round coverage band and ensemble-posterior corner (best-effort)."""
-        import matplotlib.pyplot as plt
-
-        try:
-            from ...xspec import SpectrumState
-
-            state = SpectrumState(1)
-            x_sim = np.random.poisson(np.asarray(spectra)).astype(float)
-            plots.plot_round_coverage(
-                x_sim,
-                state.observed_counts,
-                state.bin_edges_1d,
-                selected_mask=selected_mask,
-                round_index=round_number,
-                outdir=round_path,
-            )
-        except Exception:
-            pass
-
-        try:
-            plots.plot_ensemble_posteriors(
-                posteriors,
-                ensemble,
-                self.solver.observed_spectrum,
-                self.solver.prior,
-                self.solver.parameter_names,
-                n_samples=self.config.ensemble_corner_samples,
-                outdir=round_path,
-                round_index=round_number,
-            )
-        except Exception:
-            pass
-
-        plt.close("all")
-
-    def _run_final_importance_pass(self):
-        """Run the final iterative IS refinement on the best ensemble posterior.
-
-        Populates ``self.final_weighted`` with the pooled, PSIS-smoothed
-        weighted latent draws (the reference's reported posterior) and returns
-        the info dict (log_Z, ESS, k_hat, round counts...). The likelihood is
-        the exact simulator: each latent draw is folded through XSPEC and
-        scored with `-0.5 * cstat` against the real observation.
-        """
-        n_per_round = self.config.final_is_n_per_round or int(
-            self.history[-1]["n_simulations_round"]
+    # ------------------------------------------------------------------ #
+    # Training and proposals
+    # ------------------------------------------------------------------ #
+    def _train_member(self, buffer, member, round_number):
+        theta, x = buffer.training_arrays()
+        posterior, stats = training_job(
+            member,
+            theta,
+            x,
+            embedding_net=self.config.embedding_net,
+            round_number=round_number,
+            training_kwargs=self._training_kwargs,
+            nde_kwargs=merge_nde_kwargs(self.config.nde_kwargs),
+            num_threads=available_cpu_count(),
         )
+        stats["cstat_ceiling"] = float(buffer.ceiling)
+        self._member_stats.append(stats)
+        posterior = patch_sample_no_pbar(posterior)
+        posterior.set_default_x(self._observation())
+        return posterior
 
-        def log_likelihood_fn(z):
-            physical = self._gaussian_to_physical(z.detach().cpu().numpy())
-            out = self.solver.simulate(
-                physical, return_kind="cstat", progress_bar=False
-            )
-            return torch.as_tensor(
-                -0.5 * np.asarray(out["cstat"], dtype=np.float64)
-            )
-
-        info = final_importance_pass(
-            proposal=self.best_ensemble,
-            latent_prior=self.prior,
-            log_likelihood_fn=log_likelihood_fn,
-            n_per_round=n_per_round,
-            target_ess=self.config.final_is_target_ess,
-            fallback_target_ess=self.config.final_is_fallback_ess,
-            max_rounds=self.config.final_is_max_rounds,
-            max_rounds_extended=self.config.final_is_max_rounds_extended,
-            trace=self.config.trace,
-        )
-        if info["pooled_weighted"] is not None:
-            self.final_weighted = info["pooled_weighted"]
-        return info
-
-    def _build_proposal(self, ens_post):
-        """Build the next round's proposal, mirroring `_sixsa_dev`'s
-        `_build_proposal` (both arms).
-
-        ``proposal_mode="posterior"`` (the reference default) returns the
-        ensemble posterior itself: the next round samples it directly, so the
-        ensemble-mixture density (`EnsemblePosterior.log_prob`) used in the
-        importance weights is exactly the sampling density -- the in-loop IS
-        diagnostics are consistent by construction.
-
-        ``proposal_mode="truncated"`` (legacy) returns a density-thresholded
-        `RestrictedPrior` over the clean prior, sampled with SIR. Each round
-        restricts the ORIGINAL prior (``self.prior``) with the current round's
-        density thresholder, so restrictions do not stack -- an early
-        over-restriction does not persist, because the next round restricts the
-        clean prior afresh with a better-trained NDE. ``ens_post`` is passed to
-        ``RestrictedPrior`` as the SIR proposal, which sbi requires for
-        ``sample_with="sir"``. CAVEAT: sbi's SIR does not actually return
-        restricted-prior (nor posterior) samples -- it softmax-picks 1 of 32
-        ensemble candidates with weights ~ e^{accept}/q, i.e. a soft
-        restriction tilted toward the low-density fringes of the ensemble
-        support, and its exact density is intractable. The in-loop IS
-        diagnostics therefore use the ensemble mixture as an approximate
-        proposal density in this mode (log_Z biased, ESS/k-hat heuristic),
-        matching the `_sixsa_dev` truncated arm; the final importance pass is
-        the authoritative posterior/evidence.
-        """
-        if self.config.proposal_mode == "posterior":
-            return ens_post
-        accept_reject_fn = get_density_thresholder(
-            ens_post,
-            quantile=self.config.truncated_quantile,
-            num_samples_to_estimate_support=(
-                self.config.truncated_num_samples_to_estimate_support
-            ),
-        )
-        return RestrictedPrior(
+    def _truncated(self, flow):
+        return build_truncated_proposal(
+            flow,
             self.prior,
-            accept_reject_fn,
-            ens_post,
-            sample_with="sir",
+            quantile=self.config.truncated_quantile,
+            n_support=self.config.truncated_num_samples_to_estimate_support,
             device=self.config.device,
+            restrict_from_prior=self.config.truncated_restrict_from_prior,
         )
 
-    def run(self) -> 'FitResults':
+    def _flat_draw(self, proposal, n):
+        return sample_flat(
+            proposal,
+            int(n),
+            oversampling_factor=self.config.truncated_oversampling_factor,
+            max_sampling_batch_size=self.config.truncated_max_sampling_batch_size,
+        )
+
+    def _sub_batch_move(self, member_flow, buffer, n_draw):
+        proposal = self._truncated(member_flow)
+        z = self._flat_draw(proposal, n_draw)
+        x, cstat = self._simulate_latent(z)
+        replaced = buffer.replace_worst(z.detach().cpu().numpy(), x, cstat)
+        return len(z), replaced
+
+    def _ensemble(self, members):
+        ens = EnsemblePosterior([m for m in members])
+        ens.set_default_x(self._observation())
+        return patch_sample_no_pbar(ens)
+
+    # ------------------------------------------------------------------ #
+    # The round loop
+    # ------------------------------------------------------------------ #
+    def run(self) -> "FitResults":
         from ...solver import FitResults
         from ...convenience import catchtime
 
-        # All run-time options are sourced from the SIXSA config so the backend
-        # can be driven by `Solver.run()`, which calls `run()` with no arguments.
-        num_simulations_per_round = self.config.num_simulations_per_round
-        embedding = self.config.embedding
-        embedding_net = self.config.embedding_net
-        training_kwargs = self.config.training_kwargs
-        max_num_epochs = self.config.max_num_epochs
-        is_filter_fraction = self.config.is_filter_fraction
-        khat_threshold = self.config.khat_threshold
-        force_last_round = self.config.force_last_round
+        cfg = self.config
+        d = self.solver.prior.ndim
+        n_initial = cfg.n_initial_per_param * d
+        n_batch_base = cfg.n_batch or cfg.n_picked_per_param * d
+        n_sub = cfg.n_sub_batch or int(math.ceil(n_batch_base / cfg.n_ensemble))
+        n_train_keep = cfg.n_train_keep or n_initial
+        round_gate_n = cfg.round_gate_n or cfg.gate_n
 
-        self.n_nets = self.config.n_ensemble
-        num_rounds = len(num_simulations_per_round)
+        def ramp(r):
+            v = cfg.n_simulate_ramp ** (r - 1)
+            if cfg.n_simulate_ramp_max is not None:
+                v = min(v, cfg.n_simulate_ramp_max)
+            return v
 
-        if training_kwargs is None:
-            # Defaults matching `_sixsa_dev`'s effective regime. Two key knobs:
-            #
-            # * `force_first_round_loss=True` keeps the simple (non-atomic) MLE
-            #   loss every round instead of the atomic SNPE-C loss. The loss is
-            #   applied to the importance-filtered current batch, which approximates
-            #   the posterior. (The unit-Gaussian latent is unbounded, so the flow
-            #   no longer needs to respect a prior box.)
-            # * `retrain_from_scratch=True` trains a FRESH net + FRESH embedding
-            #   each round on that round's kept batch ONLY. The reference does
-            #   this (a new NPE_C per round); warm-starting + accumulating earlier
-            #   rounds instead fits a blend of all proposals, so the posterior
-            #   never tightens and the Pareto k-hat will not drop.
-            training_kwargs = dict(
+        self._training_kwargs = self._build_training_kwargs()
+
+        self._log(f"SIXSA version {SIXSA_VERSION} | d={d} n_initial={n_initial} "
+                  f"n_batch_base={n_batch_base} n_sub={n_sub} n_ensemble={cfg.n_ensemble} "
+                  f"n_rounds={cfg.n_rounds} merge_mode={cfg.merge_mode}")
+
+        self.history = []
+        self._buffer_sims = 0
+        self._sim_theta = []
+        self._sim_cstat = []
+        bank = DefensiveISBank()
+        self.bank = bank
+        exited = None
+        last_members = []
+
+        with catchtime("Running SIXSA inference", print_time=False) as run_time:
+            with self._phase(0, "initial simulation"):
+                buffer = self._init_buffer(n_initial, capacity=n_train_keep)
+
+            for r in range(1, cfg.n_rounds + 1):
+                self._maybe_plot_predictive(buffer, r)
+                self._member_stats = []
+                members = []
+                passed = False
+
+                for k in range(1, cfg.n_ensemble + 1):
+                    with self._phase(r, f"train member {k}"):
+                        m = self._train_member(buffer, k, r)
+                    members.append(m)
+
+                    if k < cfg.n_ensemble or cfg.last_member_sub_batch:
+                        with self._phase(r, f"sub-batch move (member {k})"):
+                            n_draw = int(round(n_sub * ramp(r)))
+                            self._sub_batch_move(m, buffer, n_draw)
+
+                    if r >= cfg.khat_from_round:
+                        with self._phase(r, f"check (member {k})"):
+                            passed, diag = self._run_check(bank, m, r, k)
+                        if passed:
+                            if cfg.confirm_exit and k < cfg.n_ensemble:
+                                with self._phase(r, "confirmation member"):
+                                    m2 = self._train_member(buffer, k + 1, r)
+                                    members.append(m2)
+                                    self._run_check(bank, m2, r, k + 1)
+                            exited = ("check", r, k)
+                            break
+
+                last_members = members
+                if exited:
+                    self._append_round_info(r, members, buffer, bank, gated="check")
+                    break
+
+                if r >= cfg.khat_from_round and not passed:
+                    ens = self._ensemble(members)
+                    with self._phase(r, "round gate"):
+                        gate_ok, _ = self._run_gate(bank, ens, round_gate_n, "round_gate", r)
+                    if gate_ok:
+                        exited = ("round_gate", r)
+                        self._append_round_info(r, members, buffer, bank, gated="round_gate")
+                        break
+
+                self._append_round_info(r, members, buffer, bank, gated=None)
+
+                if r < cfg.n_rounds:
+                    ens = self._ensemble(members)
+                    self._maybe_plot_ensemble(members, ens, r, buffer)
+                    with self._phase(r, "between-round update"):
+                        buffer = self._between_round_update(
+                            ens, buffer, n_sub, n_batch_base, ramp(r + 1),
+                            n_train_keep,
+                        )
+
+            # FINAL GATE (skip when a round gate already covered >= gate_n draws).
+            skip_final = (
+                exited is not None
+                and exited[0] == "round_gate"
+                and round_gate_n >= cfg.gate_n
+            )
+            if not skip_final and last_members:
+                ens = self._ensemble(last_members)
+                with self._phase(0, "final gate"):
+                    self._run_gate(bank, ens, cfg.gate_n, "final_gate", exited[1] if exited else cfg.n_rounds)
+
+            self._finalize(bank, last_members)
+
+            emu_sims = 0
+            if cfg.run_emulator_pass and self.best_ensemble is not None:
+                with self._phase(0, "emulator pass"):
+                    emu_sims = self._run_emulator_pass(d)
+
+        n_evaluations = self._buffer_sims + int(sum(len(b.z) for b in bank.batches)) + emu_sims
+        self._maybe_plot_history()
+
+        log_Z = self.pool_info["log_Z"] if self.pool_info else float("nan")
+        log_Z_err = self.pool_info["log_Z_err"] if self.pool_info else float("nan")
+        best_fit, best_fit_stat = self._best_fit()
+
+        posterior = self._posterior_dataframe(
+            np.asarray(self.sample(cfg.num_posterior_samples))
+        )
+        return FitResults(
+            time=float(run_time()),
+            posterior_samples=posterior,
+            n_likelihood_evaluations=int(n_evaluations),
+            log_Z=log_Z,
+            log_Z_err=log_Z_err,
+            best_fit=best_fit,
+            best_fit_stat=best_fit_stat,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Round-loop sub-steps
+    # ------------------------------------------------------------------ #
+    def _build_training_kwargs(self):
+        cfg = self.config
+        base = cfg.training_kwargs
+        if base is None:
+            base = dict(
                 force_first_round_loss=True,
                 use_combined_loss=False,
-                retrain_from_scratch=True,   # fresh net + embedding per round (current batch only)
+                retrain_from_scratch=True,
                 discard_prior_samples=True,
                 learning_rate=1e-3,
                 stop_after_epochs=10,
@@ -734,238 +492,218 @@ class SIXSABackend(Backend):
                 validation_fraction=0.2,
                 clip_max_norm=1.0,
             )
+        return {"max_num_epochs": cfg.max_num_epochs, **dict(base)}
 
-        if isinstance(training_kwargs, list):
-            if len(training_kwargs) != num_rounds:
-                raise ValueError(
-                    "`training_kwargs` length must match `num_simulations_per_round`."
-                )
-            training_kwargs_list = training_kwargs
-        else:
-            training_kwargs_list = [training_kwargs] * num_rounds
-
-        # Cap each NDE's training length with the dedicated `max_num_epochs`
-        # config knob, while letting an explicit per-round value win. This also
-        # copies each dict so rounds don't share a mutable reference.
-        training_kwargs_list = [
-            {"max_num_epochs": max_num_epochs, **dict(round_kwargs)}
-            for round_kwargs in training_kwargs_list
-        ]
-
-        if embedding is None:
-            identity_embedding = IdentityEmbedding()
-            embedding_list = [identity_embedding] * num_rounds
-        elif isinstance(embedding, Embedding):
-            embedding_list = [embedding] * num_rounds
-        elif isinstance(embedding, list):
-            if len(embedding) != num_rounds:
-                raise ValueError("`embedding` list length must match number of rounds.")
-            embedding_list = embedding
-        else:
-            raise TypeError("`embedding` must be an Embedding, list[Embedding], or None.")
-
-        # `embedding_net` is the network trained jointly with the NPE (sbi
-        # `embedding_net`); `None` lets `training_job` use its built-in default.
-        if embedding_net is None or isinstance(embedding_net, EmbeddingNet):
-            embedding_net_list = [embedding_net] * num_rounds
-        elif isinstance(embedding_net, list):
-            if len(embedding_net) != num_rounds:
-                raise ValueError("`embedding_net` list length must match number of rounds.")
-            embedding_net_list = embedding_net
-        else:
-            raise TypeError(
-                "`embedding_net` must be an EmbeddingNet, list[EmbeddingNet], or None."
-            )
-
-        with catchtime("Running SBI inference", print_time=False) as run_time:
-            proposal = None
-            self.proposals = []
-            previous_posteriors_list = None
-
-            self.best_ensemble = None
-            self.best_round = 0
-            self.best_efficiency = -float("inf")
-            self.best_khat = float("inf")
-            self.best_log_Z = float("nan")
-            self.best_log_Z_err = float("nan")
-            self.best_weighted = None
-            self.final_weighted = None
-            self.final_is_info = None
-
-            self.history = []
-            n_sim_total = 0
-            threshold_crossed = False
-            extra_round_done = False
-
-            # Multiple round inference loop
-            for round_number, (
-                num_simulations,
-                current_embedding,
-                current_embedding_net,
-                current_training_kwargs,
-            ) in enumerate(
-                zip(num_simulations_per_round, embedding_list, embedding_net_list, training_kwargs_list),
-                start=1,
-            ):
-                proposal, previous_posteriors_list, round_info = self.inference_round(
-                    num_simulations,
-                    embedding=current_embedding,
-                    embedding_net=current_embedding_net,
-                    proposal=proposal,
-                    round_number=round_number,
-                    training_kwargs=current_training_kwargs,
-                    is_filter_fraction=is_filter_fraction,
-                    previous_posteriors_list=previous_posteriors_list,
-                )
-                self.proposals.append(proposal)
-
-                # Record the round in the run history (drives the diagnostic plots).
-                n_sim_total += round_info["n_simulations_round"]
-                round_info["n_simulations_total"] = n_sim_total
-                self.history.append(round_info)
-
-                # Best-round tracking (hierarchical: reliability gate, then quality),
-                # mirroring `_sixsa_dev`. k_hat (PSIS) is a RELIABILITY gate -- can
-                # IS be trusted here at all? -- while efficiency/ESS is the QUALITY
-                # score GIVEN reliability. A round is "reliable" iff k_hat is finite
-                # AND below khat_threshold; among reliable rounds pick the highest
-                # efficiency; if none is reliable yet, prefer the lowest finite k_hat
-                # (least-bad), falling back to efficiency only when no finite k_hat
-                # exists. Without this gate a heavy-tailed round with a spuriously
-                # high efficiency could be selected and returned as the posterior.
-                khat = round_info["k_hat"]
-                eff = round_info["efficiency"]
-                thr = khat_threshold if khat_threshold is not None else float("inf")
-                this_reliable = np.isfinite(khat) and khat < thr
-                best_reliable = np.isfinite(self.best_khat) and self.best_khat < thr
-
-                if this_reliable and best_reliable:
-                    take = np.isfinite(eff) and eff > self.best_efficiency
-                elif this_reliable and not best_reliable:
-                    take = True
-                elif (not this_reliable) and best_reliable:
-                    take = False
-                elif np.isfinite(khat):
-                    take = khat < self.best_khat
-                else:
-                    take = (
-                        not np.isfinite(self.best_khat)
-                        and np.isfinite(eff)
-                        and eff > self.best_efficiency
-                    )
-
-                if take:
-                    self.best_khat = khat if np.isfinite(khat) else self.best_khat
-                    self.best_efficiency = (
-                        eff if np.isfinite(eff) else self.best_efficiency
-                    )
-                    self.best_ensemble = proposal
-                    self.best_log_Z = round_info["log_Z"]
-                    self.best_log_Z_err = round_info["log_Z_err"]
-                    self.best_round = round_number
-                    self.best_weighted = self._last_weighted
-
-                # Early stopping based on the Pareto k-hat threshold.
-                if khat_threshold is not None and np.isfinite(round_info["k_hat"]):
-                    if not threshold_crossed and round_info["k_hat"] < khat_threshold:
-                        threshold_crossed = True
-                        if not force_last_round:
-                            break
-                    elif threshold_crossed and not extra_round_done:
-                        extra_round_done = True
-                        break
-
-                # We train a restricted proposal if not in the last round
-                if round_number < num_rounds:
-                    with self._phase(round_number, "build next proposal (density thresholder)"):
-                        proposal = self._build_proposal(proposal)
-
-            # Fallback to the final proposal if best_ensemble is not populated
-            if self.best_ensemble is None and self.proposals:
-                self.best_ensemble = self.proposals[-1]
-
-            # Final iterative importance-sampling refinement on the best
-            # ensemble: the in-loop rounds located the posterior, this pass
-            # quantifies it (returned posterior + evidence). Failures fall
-            # back to the in-loop importance-resampled posterior.
-            if self.config.final_is and self.best_ensemble is not None and self.history:
-                try:
-                    self.final_is_info = self._run_final_importance_pass()
-                except Exception as exc:
-                    warnings.warn(
-                        f"SIXSA final importance pass failed ({exc!r}); falling "
-                        f"back to the in-loop importance-resampled posterior."
-                    )
-
-        # End-of-run six-panel training-history summary.
-        if self.config.plot_diagnostics and self.history:
-            try:
-                import matplotlib.pyplot as plt
-
-                result = plots.plot_training_history(
-                    self.history,
-                    khat_threshold=khat_threshold,
-                    outdir=self.solver.outputfiles_basename,
-                )
-                if result is not None:
-                    plt.close(result[0])
-            except Exception:
-                pass
-
-        # The final pass is the authoritative posterior/evidence when it ran
-        # and its proposal covered the posterior; otherwise report the in-loop
-        # best-round estimates.
-        log_Z, log_Z_err = self.best_log_Z, self.best_log_Z_err
-        n_evaluations = n_sim_total
-        if self.final_is_info is not None:
-            n_evaluations += int(self.final_is_info["n_simulations"])
-            if self.final_weighted is not None:
-                log_Z = self.final_is_info["log_Z"]
-                log_Z_err = self.final_is_info["log_Z_err"]
-            self._write_final_is_summary()
-
-        # Build posterior samples from the best proposal/ensemble. `sample()`
-        # already returns physical-space parameters.
-        n_posterior = self.config.num_posterior_samples
-        posterior = self._posterior_dataframe(np.asarray(self.sample(n_posterior)))
-
-        return FitResults(
-            time=float(run_time()),
-            posterior_samples=posterior,
-            n_likelihood_evaluations=n_evaluations,
-            log_Z=log_Z,
-            log_Z_err=log_Z_err,
+    def _run_check(self, bank, member_flow, round_, member):
+        cfg = self.config
+        return run_check(
+            bank,
+            flow=member_flow,
+            prior=self.prior,
+            log_likelihood_fn=self._log_likelihood_latent,
+            n=cfg.early_member_n,
+            alpha=cfg.gate_alpha,
+            khat_threshold=cfg.khat_threshold,
+            min_eff=cfg.early_member_min_eff,
+            ess_mode=cfg.ess_mode,
+            ess_target=cfg.ess_target,
+            round_=round_,
+            member=member,
         )
 
-    def _write_final_is_summary(self):
-        """Best-effort dump of the final-IS scalars next to the round outputs."""
-        try:
-            import json
+    def _run_gate(self, bank, ensemble_flow, n, kind, round_):
+        cfg = self.config
+        return run_gate(
+            bank,
+            flow=ensemble_flow,
+            prior=self.prior,
+            log_likelihood_fn=self._log_likelihood_latent,
+            n=n,
+            alpha=cfg.gate_alpha,
+            khat_threshold=cfg.khat_threshold,
+            min_eff=cfg.early_member_min_eff,
+            ess_mode=cfg.ess_mode,
+            ess_target=cfg.ess_target,
+            kind=kind,
+            round_=round_,
+            member_selection=cfg.member_selection,
+        )
 
-            summary = {
-                key: value
-                for key, value in self.final_is_info.items()
-                if isinstance(value, (int, float, bool, str, list, type(None)))
-            }
-            summary["best_round"] = self.best_round
-            path = os.path.join(
-                self.solver.outputfiles_basename, "final_is_summary.json"
+    def _between_round_update(self, ens, buffer, n_sub, n_batch_base, ramp_next, n_train_keep):
+        proposal = self._truncated(ens)
+        if self.config.merge_mode == "merge":
+            n_draw = int(round(n_sub * ramp_next))
+            z = self._flat_draw(proposal, n_draw)
+            x, cstat = self._simulate_latent(z)
+            buffer.replace_worst(z.detach().cpu().numpy(), x, cstat)
+            return buffer
+        # fresh: wholesale replacement
+        n_draw = int(round(n_batch_base * ramp_next))
+        z = self._flat_draw(proposal, n_draw)
+        x, cstat = self._simulate_latent(z)
+        return TrainingBuffer(
+            z.detach().cpu().numpy(), x, cstat, capacity=n_train_keep
+        )
+
+    def _finalize(self, bank, last_members):
+        cfg = self.config
+        if len(bank):
+            self.pool_info = bank.pooled_estimate(self.prior, balance_heuristic=True)
+            best_batch = bank.best_batch(cfg.khat_threshold, cfg.early_member_min_eff)
+            if best_batch is not None:
+                self.best_ensemble = best_batch.flow
+                self.best_round = best_batch.round_
+        if self.best_ensemble is None and last_members:
+            self.best_ensemble = self._ensemble(last_members)
+
+    def _run_emulator_pass(self, d):
+        cfg = self.config
+        emu = emulator_importance_pass(
+            best_flow=self.best_ensemble,
+            prior=self.prior,
+            log_likelihood_fn=self._log_likelihood_latent,
+            n_draws=cfg.emulator_min_per_param * d,
+            num_posterior_samples=cfg.num_posterior_samples,
+        )
+        self.emulator_pass_info = emu
+        if emu is None:
+            return 0
+        # Extend the run's (theta, cstat) pool with the surrogate draws.
+        self._sim_theta.append(emu["z"].detach().cpu().numpy())
+        self._sim_cstat.append(np.asarray(emu["cstat"]))
+        self._assemble_pool()
+        if cfg.train_likelihood_emulator:
+            with self._phase(0, "train likelihood emulator"):
+                self.likelihood_emulator = train_likelihood_emulator(
+                    emu["z"].detach().cpu().numpy(),
+                    np.asarray(emu["cstat"]),
+                    emulator_kwargs=cfg.emulator_kwargs,
+                    path_results=self.solver.outputfiles_basename,
+                )
+        return int(emu["n_draws"])
+
+    def _assemble_pool(self):
+        thetas = list(self._sim_theta)
+        cstats = list(self._sim_cstat)
+        if self.bank is not None:
+            thetas += [b.z.detach().cpu().numpy() for b in self.bank.batches]
+            cstats += [(-2.0 * b.log_lik).detach().cpu().numpy() for b in self.bank.batches]
+        if thetas:
+            self.all_theta_log = np.concatenate(thetas, axis=0)
+            self.all_cstat = np.concatenate([np.asarray(c).ravel() for c in cstats])
+
+    def _best_fit(self):
+        self._assemble_pool()
+        if self.all_cstat is None or len(self.all_cstat) == 0:
+            return None, None
+        i = int(np.argmin(self.all_cstat))
+        physical = self._gaussian_to_physical(self.all_theta_log[i][None, :])[0]
+        best_fit = self._posterior_dataframe(np.asarray(physical)[None, :]).iloc[0]
+        return best_fit, float(self.all_cstat[i])
+
+    def _append_round_info(self, r, members, buffer, bank, gated):
+        cstat = buffer.cstat
+        # Round headline diagnostics: the round's most recent banked batch (gate
+        # if it ran this round, else the best member check this round).
+        round_batches = [b for b in bank.batches if b.round_ == r]
+        khat = eff = log_Z = log_Z_err = float("nan")
+        if round_batches:
+            diags = [defensive_is_diagnostics(b.log_w.cpu().numpy(), n_total=len(b.z))
+                     for b in round_batches]
+            best = min(diags, key=lambda dd: dd["khat"] if np.isfinite(dd["khat"]) else float("inf"))
+            khat, eff = best["khat"], best["efficiency"]
+            log_Z, log_Z_err = best["log_Z"], best["log_Z_err"]
+        self.history.append({
+            "round": r,
+            "nde_stats": list(self._member_stats),
+            "n_simulations_total": int(self._buffer_sims),
+            "cstat_min": float(cstat.min()),
+            "cstat_median": float(np.median(cstat)),
+            "cstat_max": float(cstat.max()),
+            "cstat_ceiling": float(buffer.ceiling),
+            "k_hat": khat,
+            "efficiency": eff,
+            "log_Z": log_Z,
+            "log_Z_err": log_Z_err,
+            "gated": gated,
+            "n_members": len(members),
+        })
+
+    # ------------------------------------------------------------------ #
+    # Diagnostics / plotting / logging
+    # ------------------------------------------------------------------ #
+    def _log(self, msg):
+        if self.config.trace:
+            print(f"[SIXSA] {msg}", flush=True)
+
+    @contextlib.contextmanager
+    def _phase(self, round_number, name):
+        if not self.config.trace:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            print(f"[SIXSA r{round_number}] {name}: {time.perf_counter() - t0:.2f} s",
+                  flush=True)
+
+    def _maybe_plot_predictive(self, buffer, round_number):
+        if not self.config.plot_diagnostics:
+            return
+        try:
+            from ...xspec import SpectrumState
+
+            state = SpectrumState(1)
+            round_path = os.path.join(
+                self.solver.outputfiles_basename, f"round_{round_number}"
             )
-            with open(path, "w") as file:
-                json.dump(summary, file, indent=2, default=float)
+            os.makedirs(round_path, exist_ok=True)
+            plots.plot_round_coverage(
+                buffer.x, state.observed_counts, state.bin_edges_1d,
+                round_index=round_number, outdir=round_path,
+            )
+        except Exception:
+            pass
+
+    def _maybe_plot_ensemble(self, members, ensemble, round_number, buffer):
+        if not self.config.plot_diagnostics:
+            return
+        try:
+            import matplotlib.pyplot as plt
+
+            round_path = os.path.join(
+                self.solver.outputfiles_basename, f"round_{round_number}"
+            )
+            os.makedirs(round_path, exist_ok=True)
+            plots.plot_ensemble_posteriors(
+                members, ensemble, self.solver.observed_spectrum,
+                self.solver.prior, self.solver.parameter_names,
+                n_samples=self.config.ensemble_corner_samples,
+                outdir=round_path, round_index=round_number,
+            )
+            plt.close("all")
+        except Exception:
+            pass
+
+    def _maybe_plot_history(self):
+        if not (self.config.plot_diagnostics and self.history):
+            return
+        try:
+            import matplotlib.pyplot as plt
+
+            result = plots.plot_training_history(
+                self.history,
+                khat_threshold=self.config.khat_threshold,
+                outdir=self.solver.outputfiles_basename,
+            )
+            if result is not None:
+                plt.close(result[0])
         except Exception:
             pass
 
     def plot_training_history(self, save=False, outdir=None, **kwargs):
-        """Build the six-panel training-history figure from ``self.history``.
-
-        Convenience for inline display after ``solver.run()``. By default the
-        figure is returned without writing a file; pass ``save=True`` (and
-        optionally ``outdir=...``) to also write ``training_history.pdf``.
-
-        Returns:
-            The matplotlib ``Figure``, or ``None`` if there is no history yet.
-        """
+        """Build the six-panel training-history figure from ``self.history``."""
         if save and outdir is None:
             outdir = self.solver.outputfiles_basename
         result = plots.plot_training_history(
@@ -976,4 +714,3 @@ class SIXSABackend(Backend):
             **kwargs,
         )
         return result[0] if result is not None else None
-

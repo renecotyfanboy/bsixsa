@@ -1,326 +1,414 @@
-"""Final iterative importance-sampling refinement for the SIXSA backend.
+"""Defensive importance sampling for the SIXSA backend (spec section 7).
 
-Port of `_sixsa_dev/src/importance_sampling.py::is_on_given_posterior` (the
-exact-simulator path; the optional Keras likelihood emulator is not ported).
-The in-loop SIXSA rounds locate the posterior; this pass quantifies it: it
-importance-samples the best round's ensemble posterior against the exact
-likelihood until the pooled effective sample size reaches a target, then the
-pooled Pareto-smoothed weights become the returned posterior and the pooled
-RAW weights the evidence estimate.
+The exactness layer of SIXSA. Every convergence CHECK and GATE draws from a
+*defensive mixture* proposal
 
-The sampling loop is hand-rolled (`proposal.sample` + `proposal.log_prob` +
-explicit weights) rather than delegated to sbi's
-`ImportanceSamplingPosterior(method="importance")`. The two are mathematically
-identical (see `sbi/samplers/importance/importance_sampling.py`); hand-rolling
-avoids the `(theta, x_o)` potential-wrapper signature constraint and keeps the
-per-sample statistics accessible.
+    q_def(z) = alpha * prior(z) + (1 - alpha) * q_flow(z)
 
-Weight conventions (mirroring the reference):
-  * RAW log-weights `log_lik + log_prior - log_q` feed the pooled ESS and the
-    evidence: `log_Z = logsumexp(log_w) - log(N)` with the error and negative
-    finite-sample bias of Dax et al. (2022), arXiv:2210.05686, Suppl. Eqs.
-    (3)/(6)/(8). N counts ALL draws (a non-finite weight is a zero-weight
-    draw, not a missing one).
-  * PSIS-smoothed log-weights (arviz `psislw`, per round) feed the returned
-    posterior resample only -- psislw normalizes its output, so smoothed
-    weights carry no evidence information.
-  * Non-finite raw weights are dropped TOGETHER with their samples before
-    smoothing/pooling, so pooled samples and pooled weights always align
-    (the reference filtered weights but indexed the unfiltered sample stack).
+with ``q_flow`` the equal-weight, leakage-corrected mixture density of the
+member posteriors at ``x_obs`` (an sbi ``EnsemblePosterior``/``DirectPosterior``
+``log_prob``). ``round(alpha*n)`` draws come from the prior and the rest from the
+flow; each is simulated exactly. The importance log-weights, in the
+unit-Gaussian latent space,
+
+    log w = log prior(z) + log L(z) - log q_def(z),   log L = -0.5 * cstat,
+
+are bounded by ``w <= L / alpha`` because ``q_def >= alpha * prior`` -- the prior
+floor guarantees finite variance by construction. Diagnostics: PSIS ``khat``
+(arviz ``psislw``) on ``log w``; ``ESS = 1 / sum(w_i^2)`` from the RAW normalized
+weights; ``efficiency = 100 * ESS / n``; ``log Z = logmeanexp(log w)`` with the
+Dax et al. (2022) error/bias.
+
+Every check/gate batch is *banked*. The headline posterior / evidence come from
+the banked pool, combined via a multiple-IS balance-heuristic estimator whose
+denominator for each pooled point is the deterministic mixture over ALL banked
+proposals -- so a prior-floor draw is scored against a denominator that
+acknowledges every batch that could have produced it, and is never underweighted
+by ``e^(thousands)``.
+
+Latent-space note: the whole computation is done in the unit-Gaussian latent.
+``log Z`` is reparameterization-invariant (``from_unit_gaussian`` pushes
+``N(0, I)`` exactly onto the physical prior), so the reported evidence needs no
+Jacobian term.
 """
 
 from __future__ import annotations
 
-import time
+import math
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import numpy as np
 import torch
 from arviz import psislw
 from scipy.special import logsumexp
 
-
-def ess_from_log_weights(log_w) -> tuple[float, float]:
-    """Effective sample size and efficiency (%) of a 1D array of log-weights."""
-    log_w = np.asarray(log_w, dtype=np.float64)
-    log_w = log_w[np.isfinite(log_w)]
-    if log_w.size == 0:
-        return 0.0, 0.0
-    w = np.exp(log_w - log_w.max())
-    w /= w.sum()
-    ess = float(1.0 / np.sum(w**2))
-    return ess, float(100.0 * ess / len(log_w))
+# Minimum effective sample size below which the Pareto k_hat fit is
+# uninformative (a too-small ESS makes psislw report a spuriously LOW k_hat on
+# a catastrophic proposal). Below this we report k_hat = inf so the batch is
+# never chosen best and never passes a gate. Mirrors `_sixsa_dev`.
+_KHAT_MIN_ESS = 10.0
 
 
-def combined_pool_evidence(log_w_raw_list) -> tuple[float, float, float, float]:
-    """Pooled ESS and log-evidence from per-round RAW log-weights.
+# --------------------------------------------------------------------------- #
+# Evidence / ESS conventions (Dax et al. 2022, arXiv:2210.05686)
+# --------------------------------------------------------------------------- #
+def compute_log_evidence(raw_log_weights) -> tuple[float, float, float]:
+    """``(log_Z, log_Z_err, log_Z_bias)`` from RAW importance log-weights.
 
-    Returns ``(ess, log_Z, log_Z_err, log_Z_bias)``. Pass RAW importance
-    weights (the psislw *input*), never the smoothed ones: psislw normalizes
-    its output, so pooling smoothed weights collapses `logsumexp(.) - log(N)`
-    to a constant `~ -log(N)` instead of an evidence.
-
-    `log_Z = logsumexp(log_w_finite) - log(N_total)` where N_total counts all
-    draws including non-finite-weight ones (they are zero-weight draws from
-    the proposal). Error and bias follow Dax et al. (2022), Suppl. Eqs.
-    (6)/(8): `err = sqrt((N - ess)/(N ess))`, `bias = -err^2/2` (negative --
-    log_Z is underestimated; assumes a mass-covering proposal, which the
-    per-round k_hat monitors).
+    ``log_Z = logsumexp(log_w) - log(N)`` where ``N`` counts ALL draws including
+    non-finite-weight ones (a non-finite weight is a zero-weight draw from the
+    proposal, not a missing one). Error and negative finite-sample bias follow
+    Dax et al. (2022), Suppl. Eqs. (6)/(8):
+    ``err = sqrt((N - ess)/(N ess))``, ``bias = -err^2 / 2``.
     """
-    log_w_all = np.concatenate(
-        [np.asarray(lw, dtype=np.float64).ravel() for lw in log_w_raw_list]
-    )
-    n_total = len(log_w_all)
-    finite = log_w_all[np.isfinite(log_w_all)]
+    log_w = np.asarray(raw_log_weights, dtype=np.float64).ravel()
+    n_total = len(log_w)
+    finite = log_w[np.isfinite(log_w)]
     if finite.size == 0 or n_total == 0:
-        return 0.0, float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     w = np.exp(finite - finite.max())
     w_norm = w / w.sum()
     ess = float(1.0 / np.sum(w_norm**2))
     log_z = float(logsumexp(finite) - np.log(n_total))
     log_z_err = float(np.sqrt((n_total - ess) / (n_total * ess)))
     log_z_bias = float(-0.5 * (n_total - ess) / (n_total * ess))
-    return ess, log_z, log_z_err, log_z_bias
+    return log_z, log_z_err, log_z_bias
 
 
-def resample_from_log_weights(
-    samples: torch.Tensor, log_w, n: int, rng: np.random.Generator | None = None
-) -> torch.Tensor:
-    """Multinomial-resample `n` rows of `samples` with probabilities ~ exp(log_w).
-
-    Non-finite log-weights are dropped together with their samples, so the
-    returned rows always come from finite-weight draws.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
+def ess_from_log_weights(log_w) -> tuple[float, float]:
+    """``(ESS, efficiency%)`` from RAW log-weights (ESS from raw normalized w)."""
     log_w = np.asarray(log_w, dtype=np.float64).ravel()
-    if len(log_w) != len(samples):
-        raise ValueError(
-            f"log_w has {len(log_w)} entries for {len(samples)} samples."
-        )
-    finite = np.isfinite(log_w)
-    if not np.any(finite):
-        raise ValueError("No finite log-weights to resample from.")
-    samples = samples[torch.as_tensor(finite)]
-    log_w = log_w[finite]
-    p = np.exp(log_w - log_w.max())
-    p /= p.sum()
-    idx = rng.choice(len(p), size=n, replace=True, p=p)
-    return samples[torch.as_tensor(idx)]
+    n_total = len(log_w)
+    finite = log_w[np.isfinite(log_w)]
+    if finite.size == 0 or n_total == 0:
+        return 0.0, 0.0
+    w = np.exp(finite - finite.max())
+    w /= w.sum()
+    ess = float(1.0 / np.sum(w**2))
+    return ess, float(100.0 * ess / n_total)
 
 
-def final_importance_pass(
-    *,
-    proposal,
-    latent_prior,
-    log_likelihood_fn,
-    n_per_round: int,
-    target_ess: float,
-    fallback_target_ess: float | None = None,
-    max_rounds: int = 10,
-    max_rounds_extended: int | None = None,
-    hopeless_khat: float = 2.0,
-    trace: bool = False,
-) -> dict:
-    """Iterative importance sampling on `proposal` until the pooled ESS target.
+def _khat(log_w_finite: np.ndarray, ess: float) -> float:
+    """PSIS k_hat with the min-ESS guard."""
+    try:
+        if not np.isfinite(ess) or ess < _KHAT_MIN_ESS:
+            return float("inf")
+        _, khat_val = psislw(np.asarray(log_w_finite, dtype=np.float64).copy())
+        return float(khat_val)
+    except Exception:
+        return float("nan")
 
-    Args:
-        proposal: the best SIXSA ensemble posterior. Must expose
-            ``sample(sample_shape)`` and ``log_prob(theta)`` evaluated at its
-            default conditioning observation -- for an sbi
-            ``EnsemblePosterior`` with ``set_default_x`` applied, ``log_prob``
-            is exactly the mixture density that ``sample`` draws from, so the
-            weights are consistent by construction.
-        latent_prior: prior over the latent space (``log_prob`` used).
-        log_likelihood_fn: callable ``theta_latent -> log-likelihood tensor``
-            (for SIXSA, ``-0.5 * cstat`` via the exact XSPEC folding).
-        n_per_round: simulations per IS round.
-        target_ess: main-loop pooled-ESS target.
-        fallback_target_ess: graceful-degradation floor. If the main loop hits
-            `max_rounds` short of `target_ess`, keep running until this lower
-            target, stopping early when the ESS gain plateaus (two consecutive
-            rounds gaining < 1% of the fallback target). None disables.
-        max_rounds: main-loop round budget.
-        max_rounds_extended: hard ceiling on total rounds (main + extension);
-            None -> ``5 * max_rounds``.
-        hopeless_khat: if after two rounds every k_hat is >= this value the
-            proposal does not cover the posterior and the pass aborts.
-        trace: print per-round progress.
 
-    Returns:
-        dict with ``pooled_weighted`` (``(samples, normalized_weights)`` over
-        the pooled finite draws, PSIS-smoothed -- ``None`` if hopeless),
-        ``log_Z``/``log_Z_err``/``log_Z_bias``/``log_Z_corrected``, ``ess``,
-        ``mean_khat``, per-round diagnostics, round/simulation counts, the
-        ``reached_target_ess``/``reached_fallback_ess``/``hopeless`` flags and
-        ``time_s``.
+def defensive_is_diagnostics(log_w, n_total: int | None = None) -> dict:
+    """Full defensive-IS diagnostics from a 1D array of RAW log-weights.
+
+    ``n_total`` defaults to ``len(log_w)`` (non-finite weights are zero-weight
+    draws and still count toward N and the efficiency denominator).
     """
-    t_start = time.time()
+    log_w = np.asarray(log_w, dtype=np.float64).ravel()
+    if n_total is None:
+        n_total = len(log_w)
+    finite = log_w[np.isfinite(log_w)]
+    out = {
+        "ess": 0.0,
+        "efficiency": 0.0,
+        "khat": float("inf"),
+        "log_Z": float("nan"),
+        "log_Z_err": float("nan"),
+        "log_Z_bias": float("nan"),
+        "n_finite": int(finite.size),
+        "n_total": int(n_total),
+    }
+    if finite.size == 0 or n_total == 0:
+        return out
+    w = np.exp(finite - finite.max())
+    w_norm = w / w.sum()
+    ess = float(1.0 / np.sum(w_norm**2))
+    out["ess"] = ess
+    out["efficiency"] = 100.0 * ess / n_total
+    out["khat"] = _khat(finite, ess)
+    out["log_Z"], out["log_Z_err"], out["log_Z_bias"] = compute_log_evidence(log_w)
+    return out
 
-    samples_per_round: list[torch.Tensor] = []
-    log_w_smoothed_per_round: list[np.ndarray] = []
-    log_w_raw_per_round: list[np.ndarray] = []
-    khat_list: list[float] = []
-    eff_list: list[float] = []
-    n_simulations = 0
-    cumulative_ess = 0.0
-    log_z = log_z_err = log_z_bias = float("nan")
-    hopeless = False
-    i_round = 0
 
-    def _print(msg):
-        if trace:
-            print(f"[SIXSA final IS] {msg}", flush=True)
+def passes_gate(diag: dict, khat_threshold, min_eff: float) -> bool:
+    """PASS iff k_hat < threshold AND efficiency >= min_eff (percent)."""
+    khat_ok = khat_threshold is None or (
+        np.isfinite(diag["khat"]) and diag["khat"] < khat_threshold
+    )
+    eff_ok = float(diag.get("efficiency", 0.0)) >= float(min_eff)
+    return bool(khat_ok and eff_ok)
 
-    def _run_one_round():
-        nonlocal n_simulations, cumulative_ess, log_z, log_z_err, log_z_bias
-        t0 = time.time()
-        with torch.no_grad():
-            z = proposal.sample((n_per_round,)).detach()
-            log_q = proposal.log_prob(z).detach().double()
-        log_lik = torch.as_tensor(log_likelihood_fn(z)).double()
-        log_prior = latent_prior.log_prob(z).double()
-        log_w_raw = (log_lik + log_prior - log_q).cpu().numpy()
-        n_simulations += int(len(z))
 
-        # Drop non-finite weights together with their samples so the pooled
-        # stacks stay aligned; the dropped draws still count in N for log_Z.
-        finite = np.isfinite(log_w_raw)
-        z_finite = z[torch.as_tensor(finite)].cpu()
-        log_w_finite = log_w_raw[finite]
+# --------------------------------------------------------------------------- #
+# The defensive-IS draw + weight primitive
+# --------------------------------------------------------------------------- #
+@dataclass
+class DefensiveISBatch:
+    """One defensive-IS batch: draws, provenance and self-consistent weights."""
 
-        if len(log_w_finite) > 0:
-            try:
-                log_w_smoothed, k_hat = psislw(log_w_finite.copy())
-                k_hat = float(k_hat)
-            except Exception:
-                log_w_smoothed, k_hat = log_w_finite, float("nan")
-        else:
-            log_w_smoothed, k_hat = log_w_finite, float("inf")
-        khat_list.append(k_hat)
+    z: torch.Tensor            # (n, d) latent draws (float32)
+    log_prior: torch.Tensor    # (n,) prior.log_prob(z), double
+    log_lik: torch.Tensor      # (n,) -0.5*cstat, double
+    log_q_def: torch.Tensor    # (n,) defensive-mixture density at z, double
+    log_w: torch.Tensor        # (n,) self-consistent log-weights, double
+    flow: Any                  # the sbi posterior this batch's flow part drew from
+    alpha: float
+    n_requested: int
+    kind: str = "check"        # "check" | "round_gate" | "final_gate" | "emulator"
+    round_: int = 0
+    member: int | None = None
+    n_prior: int = 0
+    extra: dict = field(default_factory=dict)
 
-        ess_round, eff_round = ess_from_log_weights(log_w_smoothed)
-        eff_list.append(eff_round)
 
-        samples_per_round.append(z_finite)
-        log_w_smoothed_per_round.append(np.asarray(log_w_smoothed, dtype=np.float64))
-        log_w_raw_per_round.append(log_w_raw)
+def _mixture_log_prob(flow, prior, alpha, z, *, log_prior=None):
+    """``(log q_def, log_prior, log_q_flow)`` of the defensive mixture at ``z``."""
+    if log_prior is None:
+        log_prior = prior.log_prob(z).double()
+    log_q_flow = flow.log_prob(z).double()
+    la = math.log(alpha)
+    l1a = math.log1p(-alpha)
+    log_q_def = torch.logaddexp(la + log_prior, l1a + log_q_flow)
+    return log_q_def, log_prior, log_q_flow
 
-        cumulative_ess, log_z, log_z_err, log_z_bias = combined_pool_evidence(
-            log_w_raw_per_round
-        )
-        return k_hat, ess_round, eff_round, time.time() - t0
 
-    _print(
-        f"max_rounds={max_rounds}, target_ess={target_ess:.0f}, "
-        f"n_per_round={n_per_round}"
+def _sample(dist, n):
+    if n <= 0:
+        return None
+    try:
+        s = dist.sample((n,), show_progress_bars=False)
+    except TypeError:
+        s = dist.sample((n,))
+    return s.detach()
+
+
+def defensive_is_draw_and_weight(
+    *,
+    flow,
+    prior,
+    log_likelihood_fn: Callable,
+    n: int,
+    alpha: float,
+    kind: str = "check",
+    round_: int = 0,
+    member: int | None = None,
+) -> DefensiveISBatch:
+    """Draw ``n`` defensive-mixture samples, simulate them, and weight them.
+
+    ``round(alpha*n)`` draws come from ``prior`` and the rest from ``flow``; the
+    weights use the mixture density ``q_def`` so they are self-consistent (the
+    denominator is exactly the density the batch was drawn from).
+    """
+    n_prior = int(round(alpha * n))
+    n_prior = max(0, min(n, n_prior))
+    n_flow = n - n_prior
+
+    z_prior = _sample(prior, n_prior)
+    z_flow = _sample(flow, n_flow)
+    parts = [p for p in (z_prior, z_flow) if p is not None and len(p) > 0]
+    if not parts:
+        raise ValueError("defensive_is_draw_and_weight drew zero samples.")
+    z = torch.cat([p.to(torch.float32) for p in parts], dim=0)
+
+    log_q_def, log_prior, _ = _mixture_log_prob(flow, prior, alpha, z)
+    log_lik = torch.as_tensor(log_likelihood_fn(z)).double().reshape(-1)
+    log_w = log_prior + log_lik - log_q_def
+
+    return DefensiveISBatch(
+        z=z.detach(),
+        log_prior=log_prior.detach(),
+        log_lik=log_lik.detach(),
+        log_q_def=log_q_def.detach(),
+        log_w=log_w.detach(),
+        flow=flow,
+        alpha=float(alpha),
+        n_requested=int(n),
+        kind=kind,
+        round_=round_,
+        member=member,
+        n_prior=int(n_prior),
     )
 
-    # ---- main loop: run until target_ess or max_rounds ----
-    while cumulative_ess < target_ess and i_round < max_rounds:
-        i_round += 1
-        k_hat, ess_round, eff_round, dt = _run_one_round()
-        _print(
-            f"round {i_round}/{max_rounds} ({dt:.1f}s): k_hat={k_hat:.3f}, "
-            f"round ESS={ess_round:.1f} ({eff_round:.1f}%), cumulative "
-            f"ESS={cumulative_ess:.1f}, logZ={log_z:.3f}+/-{log_z_err:.3f}"
-        )
-        # Early exit if the proposal is hopeless (k_hat stuck very high).
-        if i_round == 2 and np.min(khat_list) >= hopeless_khat:
-            _print(f"early exit: k_hat hopeless {khat_list}.")
-            hopeless = True
-            break
 
-    # ---- extension: fall back to a lower ESS target, with plateau detection ----
-    if (
-        fallback_target_ess is not None
-        and not hopeless
-        and cumulative_ess < target_ess
-        and cumulative_ess < fallback_target_ess
-    ):
-        hard_ceiling = (
-            max_rounds_extended if max_rounds_extended is not None else 5 * max_rounds
-        )
-        _print(
-            f"target ESS={target_ess:.0f} not reached in {max_rounds} rounds "
-            f"(ESS={cumulative_ess:.1f}); extending toward fallback "
-            f"ESS={fallback_target_ess:.0f} (hard cap {hard_ceiling} rounds)."
-        )
-        min_gain = 0.01 * fallback_target_ess
-        stalls = 0
-        while cumulative_ess < fallback_target_ess and i_round < hard_ceiling:
-            i_round += 1
-            ess_before = cumulative_ess
-            k_hat, ess_round, eff_round, dt = _run_one_round()
-            gain = cumulative_ess - ess_before
-            _print(
-                f"round {i_round}/{hard_ceiling} [extension] ({dt:.1f}s): "
-                f"k_hat={k_hat:.3f}, cumulative ESS={cumulative_ess:.1f} "
-                f"(+{gain:.1f})"
-            )
-            if gain < min_gain:
-                stalls += 1
-                if stalls >= 2:
-                    _print(
-                        f"extension stopped: ESS plateaued at "
-                        f"{cumulative_ess:.1f}; more rounds of this proposal "
-                        f"will not help."
-                    )
-                    break
-            else:
-                stalls = 0
+# --------------------------------------------------------------------------- #
+# The bank + pooled multiple-IS estimator
+# --------------------------------------------------------------------------- #
+class DefensiveISBank:
+    """Collects defensive-IS batches and combines them via multiple IS.
 
-    mean_khat = float(np.mean(khat_list)) if khat_list else float("nan")
-    if trace:
-        if mean_khat > 1.0:
-            _print(
-                f"PSIS k_hat = {mean_khat:.2f} >> 0.7: proposal does not "
-                f"cover the posterior; ESS is meaningless."
-            )
-        elif mean_khat > 0.7:
-            _print(f"PSIS k_hat = {mean_khat:.2f} > 0.7: IS results unreliable.")
-        elif mean_khat > 0.5:
-            _print(f"PSIS k_hat = {mean_khat:.2f} in [0.5, 0.7]: usable but degraded.")
+    The pooled estimator uses the balance heuristic: each pooled point is scored
+    against the deterministic mixture over ALL banked proposals (weighted by
+    each batch's sample count). A cheaper stratified fallback -- each point kept
+    against its own batch's mixture -- is used when the balance-heuristic cost
+    ``B * N`` exceeds ``max_bn`` (both estimators are unbiased; the balance
+    heuristic has lower variance).
+    """
+
+    def __init__(self, max_bn: int = 40_000_000):
+        self.batches: list[DefensiveISBatch] = []
+        self.max_bn = int(max_bn)
+        self._pooled_cache: dict | None = None
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def add(self, batch: DefensiveISBatch) -> None:
+        self.batches.append(batch)
+        self._pooled_cache = None  # invalidate
+
+    # -- per-batch helpers --
+    def batch_diagnostics(self, batch: DefensiveISBatch) -> dict:
+        return defensive_is_diagnostics(
+            batch.log_w.cpu().numpy(), n_total=len(batch.z)
+        )
+
+    def best_batch(self, khat_threshold, min_eff: float) -> DefensiveISBatch | None:
+        """The khat-best RELIABLE banked batch (least-bad khat if none reliable)."""
+        if not self.batches:
+            return None
+        scored = [(self.batch_diagnostics(b), b) for b in self.batches]
+        reliable = [
+            (d, b) for d, b in scored if passes_gate(d, khat_threshold, min_eff)
+        ]
+        pool = reliable if reliable else scored
+        # lowest khat, then highest efficiency
+        pool = sorted(
+            pool,
+            key=lambda db: (
+                db[0]["khat"] if np.isfinite(db[0]["khat"]) else float("inf"),
+                -db[0]["efficiency"],
+            ),
+        )
+        return pool[0][1]
+
+    def best_flow(self, khat_threshold, min_eff: float):
+        b = self.best_batch(khat_threshold, min_eff)
+        return None if b is None else b.flow
+
+    # -- pooled multiple-IS --
+    def pooled_estimate(self, prior, *, balance_heuristic: bool = True) -> dict:
+        """Combine every banked batch into a single pooled IS estimate."""
+        if not self.batches:
+            return defensive_is_diagnostics(np.array([]))
+
+        z_all = torch.cat([b.z for b in self.batches], dim=0).to(torch.float32)
+        log_prior_all = torch.cat([b.log_prior for b in self.batches]).double()
+        log_lik_all = torch.cat([b.log_lik for b in self.batches]).double()
+        counts = [len(b.z) for b in self.batches]
+        n_total = int(sum(counts))
+
+        use_balance = balance_heuristic and (len(self.batches) * n_total <= self.max_bn)
+        if use_balance:
+            # Balance heuristic: deterministic mixture over all banked proposals.
+            log_n_over_N = [math.log(c) - math.log(n_total) for c in counts]
+            comps = []
+            for b, log_frac in zip(self.batches, log_n_over_N):
+                log_q_def_b, _, _ = _mixture_log_prob(
+                    b.flow, prior, b.alpha, z_all, log_prior=log_prior_all
+                )
+                comps.append(log_frac + log_q_def_b)
+            log_q_mix = torch.logsumexp(torch.stack(comps, dim=0), dim=0)
+            log_w_pool = log_prior_all + log_lik_all - log_q_mix
+            mode = "balance_heuristic"
         else:
-            _print(f"PSIS k_hat = {mean_khat:.2f}: IS reliable.")
+            # Stratified: each point kept against its own batch's mixture.
+            log_w_pool = torch.cat([b.log_w for b in self.batches]).double()
+            mode = "stratified"
 
-    result = {
-        "pooled_weighted": None,
-        "log_Z": log_z,
-        "log_Z_err": log_z_err,
-        # Negative finite-sample bias (Dax et al. 2022, Suppl. Eq. 8);
-        # log_Z_corrected subtracts it.
-        "log_Z_bias": log_z_bias,
-        "log_Z_corrected": (
-            log_z - log_z_bias if np.isfinite(log_z_bias) else log_z
-        ),
-        "ess": cumulative_ess,
-        "mean_khat": mean_khat,
-        "mean_efficiency": float(np.mean(eff_list)) if eff_list else float("nan"),
-        "khat_per_round": khat_list,
-        "efficiency_per_round": eff_list,
-        "n_rounds": i_round,
-        "n_simulations": n_simulations,
-        "target_ess": target_ess,
-        "fallback_target_ess": fallback_target_ess,
-        "reached_target_ess": bool(cumulative_ess >= target_ess),
-        "reached_fallback_ess": (
-            None
-            if fallback_target_ess is None
-            else bool(cumulative_ess >= fallback_target_ess)
-        ),
-        "hopeless": hopeless,
-        "time_s": time.time() - t_start,
-    }
+        log_w_np = log_w_pool.cpu().numpy()
+        diag = defensive_is_diagnostics(log_w_np, n_total=n_total)
+        diag["mode"] = mode
+        diag["n_batches"] = len(self.batches)
+        self._pooled_cache = {"z": z_all.detach(), "log_w": log_w_pool.detach(), "diag": diag}
+        return diag
 
-    if hopeless or not samples_per_round:
-        return result
+    def pooled_weighted(self, prior=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(z_all, normalized_weights)`` over the pooled banked draws.
 
-    # ---- pool the PSIS-smoothed weights once; the resample happens on demand ----
-    samples_stacked = torch.cat(samples_per_round, dim=0)
-    log_w_stacked = np.concatenate(log_w_smoothed_per_round)
-    if len(log_w_stacked) == 0:
-        return result
-    w = np.exp(log_w_stacked - log_w_stacked.max())
-    w_norm = torch.as_tensor(w / w.sum(), dtype=torch.float64)
-    result["pooled_weighted"] = (samples_stacked, w_norm)
-    return result
+        Weights are the PSIS-smoothed pooled weights (smoothing stabilizes the
+        returned posterior resample; the RAW pooled weights drive the evidence).
+        """
+        if self._pooled_cache is None:
+            if prior is None:
+                raise ValueError("Call pooled_estimate(prior) first, or pass prior.")
+            self.pooled_estimate(prior)
+        z = self._pooled_cache["z"]
+        log_w = self._pooled_cache["log_w"].cpu().numpy()
+        finite = np.isfinite(log_w)
+        if not np.any(finite):
+            raise ValueError("No finite pooled weights.")
+        z_finite = z[torch.as_tensor(finite)]
+        try:
+            log_w_smoothed, _ = psislw(log_w[finite].copy())
+        except Exception:
+            log_w_smoothed = log_w[finite]
+        w = np.exp(log_w_smoothed - log_w_smoothed.max())
+        w_norm = torch.as_tensor(w / w.sum(), dtype=torch.float64)
+        return z_finite, w_norm
+
+
+# --------------------------------------------------------------------------- #
+# CHECK / GATE runners
+# --------------------------------------------------------------------------- #
+def run_check(
+    bank: DefensiveISBank,
+    *,
+    flow,
+    prior,
+    log_likelihood_fn,
+    n: int,
+    alpha: float,
+    khat_threshold,
+    min_eff: float,
+    ess_mode: str = "off",
+    ess_target: float | None = None,
+    round_: int = 0,
+    member: int | None = None,
+) -> tuple[bool, dict]:
+    """Per-member CHECK: defensive IS on a single member flow (banked, reported)."""
+    batch = defensive_is_draw_and_weight(
+        flow=flow, prior=prior, log_likelihood_fn=log_likelihood_fn,
+        n=n, alpha=alpha, kind="check", round_=round_, member=member,
+    )
+    bank.add(batch)
+    diag = bank.batch_diagnostics(batch)
+    passed = passes_gate(diag, khat_threshold, min_eff)
+    if passed and ess_mode == "floor" and ess_target is not None:
+        pooled = bank.pooled_estimate(prior)
+        passed = passed and (pooled["ess"] >= float(ess_target))
+        diag["pooled_ess"] = pooled["ess"]
+    return passed, diag
+
+
+def run_gate(
+    bank: DefensiveISBank,
+    *,
+    flow,
+    prior,
+    log_likelihood_fn,
+    n: int,
+    alpha: float,
+    khat_threshold,
+    min_eff: float,
+    ess_mode: str = "off",
+    ess_target: float | None = None,
+    kind: str = "round_gate",
+    round_: int = 0,
+    member_selection: str = "apply",
+) -> tuple[bool, dict]:
+    """ROUND/FINAL GATE: defensive IS on the full ensemble flow (banked)."""
+    batch = defensive_is_draw_and_weight(
+        flow=flow, prior=prior, log_likelihood_fn=log_likelihood_fn,
+        n=n, alpha=alpha, kind=kind, round_=round_, member=None,
+    )
+    batch.extra["member_selection"] = member_selection
+    bank.add(batch)
+    diag = bank.batch_diagnostics(batch)
+    passed = passes_gate(diag, khat_threshold, min_eff)
+    if passed and ess_mode == "floor" and ess_target is not None:
+        pooled = bank.pooled_estimate(prior)
+        passed = passed and (pooled["ess"] >= float(ess_target))
+        diag["pooled_ess"] = pooled["ess"]
+    return passed, diag
