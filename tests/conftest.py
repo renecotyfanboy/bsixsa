@@ -10,6 +10,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 LOW_RES_DATA_DIR = TESTS_DIR / "low_res_data"
 HIGH_RES_DATA_DIR = TESTS_DIR / "high_res_data"
 
+# test_xspec_template.py imports a helper (save_bare_model_template) that exists
+# in no commit; it is left untracked and kept out of collection.
+collect_ignore = ["test_xspec_template.py"]
+
 try:
     import xspec
 except ModuleNotFoundError:  # pragma: no cover - depends on local HEASoft install
