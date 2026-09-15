@@ -3,7 +3,8 @@ import hashlib
 import json
 import os
 import shutil
-from collections.abc import Iterator
+import warnings
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,7 +12,9 @@ import pandas as pd
 import xspec
 from xspec import AllModels
 
-from .priors import build_prior
+from . import _cube
+from .exceptions import BoxEdgeWarning
+from .priors import build_prior, validate_finite_support
 from .xspec import parallel_folding
 from scipy.stats import poisson
 import arviz as az
@@ -20,6 +23,32 @@ import pathos.multiprocessing as multiprocessing  # pathos
 
 @dataclass
 class FitResults:
+    """Outcome of `Solver.run`.
+
+    Attributes:
+        time: Wall-clock time of the backend run, in seconds.
+        posterior_samples: Posterior draws in physical space, one column per
+            parameter in prior order.
+        n_likelihood_evaluations: Folds spent by the backend, plus the
+            restriction folds when this solver computed the restriction for
+            this run (not on a re-run that reuses it).
+        log_Z: Log evidence under the base prior. For a backend sampling a
+            restricted box it already includes `log_Z_restriction_correction`.
+        log_Z_err: Uncertainty on `log_Z`.
+        best_fit: Best-fit parameter vector, if the backend reports one.
+        best_fit_stat: Fit statistic (cstat plus the XSPEC-convention prior
+            term of the base prior) at `best_fit`.
+        n_restriction_evaluations: Folds spent by the history-matching
+            restriction computed for this run (`0` if none, if the
+            restriction was injected, or if an earlier run already reported
+            it).
+        restriction_time: Wall-clock time of that restriction, including its
+            bounding box, in seconds.
+        log_Z_restriction_correction: Log prior mass of the restricted box
+            sampled by the backend (`0.0` without a box); added to `log_Z`
+            when that is finite.
+    """
+
     time: float
     posterior_samples: pd.DataFrame
     n_likelihood_evaluations: int
@@ -27,6 +56,9 @@ class FitResults:
     log_Z_err: float
     best_fit: pd.Series | None = None
     best_fit_stat: float | None = None
+    n_restriction_evaluations: int = 0
+    restriction_time: float = 0.0
+    log_Z_restriction_correction: float = 0.0
 
 
 def likelihood_per_bin(observed: np.ndarray, model: np.ndarray) -> np.ndarray:
@@ -269,33 +301,109 @@ def _read_background_file(spectrum):
     return None
 
 
+def _is_restriction(value) -> bool:
+    """Duck-typed test for a precomputed restriction.
+
+    Parameters:
+        value: Candidate object.
+
+    Returns:
+        `True` if *value* is an instance (not a class) exposing callable
+        `truncated_prior` and `check_fingerprint` methods, like
+        [`Restriction`][bsixsa.restriction.Restriction].
+    """
+    # The class itself has both methods too, unbound: `restrict_prior=Restriction`
+    # would only fail at `run`, after the output directory was prepared.
+    if isinstance(value, type):
+        return False
+    return callable(getattr(value, "truncated_prior", None)) and callable(
+        getattr(value, "check_fingerprint", None)
+    )
+
+
 def _check_restrict_prior_arg(restrict_prior) -> None:
     """Refuse `restrict_prior` values that no restriction step can resolve.
 
-    `None`, a `bool`, and configuration or restriction objects are accepted;
-    the objects are resolved (and checked precisely) by the restriction step.
-    Plain numbers, strings and containers are refused here so that a typo
-    such as `restrict_prior="yes"` or `restrict_prior=1` fails before the
-    output directory is touched.
+    `None`, a `bool`, a [`HistoryMatching`][bsixsa.restriction.HistoryMatching]
+    configuration and a precomputed restriction (duck-typed, see
+    `_is_restriction`) are accepted. Anything else is refused here so that a
+    typo such as `restrict_prior="yes"` or `restrict_prior=1` fails before the
+    output directory or the `xspec` session is touched.
 
     Parameters:
         restrict_prior: The value passed to `Solver`.
 
     Raises:
-        TypeError: If *restrict_prior* is a number (other than a `bool`), a
-            string, bytes, or a built-in container.
+        TypeError: If *restrict_prior* is of any other type.
     """
     if restrict_prior is None or isinstance(restrict_prior, (bool, np.bool_)):
         return
+    message = (
+        "restrict_prior must be None, a bool, a HistoryMatching configuration "
+        f"or a precomputed Restriction, got {type(restrict_prior).__name__} "
+        f"{restrict_prior!r}."
+    )
+    # Plain values are refused before the restriction package is imported.
     if isinstance(
         restrict_prior,
         (int, float, complex, str, bytes, list, tuple, dict, set, frozenset, np.number, np.ndarray),
     ):
-        raise TypeError(
-            "restrict_prior must be None, a bool, a history-matching configuration "
-            f"or a precomputed restriction, got {type(restrict_prior).__name__} "
-            f"{restrict_prior!r}."
-        )
+        raise TypeError(message)
+    if _is_restriction(restrict_prior):
+        return
+    from .restriction.config import HistoryMatching
+
+    if not isinstance(restrict_prior, HistoryMatching):
+        raise TypeError(message)
+
+
+def _resolve_restrict_prior(restrict_prior, backend, prior) -> tuple:
+    """Resolve a checked `restrict_prior` into a restriction request.
+
+    | Value | Restriction | Configuration |
+    |---|---|---|
+    | `None` | resolved as `type(backend).restrict_prior_default` | |
+    | `True` | `None` | `HistoryMatching()` |
+    | `False` | `None` | `None` |
+    | `HistoryMatching` | `None` | the value |
+    | restriction | the value (injected) | its `config` |
+
+    When a restriction is requested and the prior exposes `dists`, every
+    axis must have a finite support.
+
+    Parameters:
+        restrict_prior: Value already accepted by `_check_restrict_prior_arg`.
+        backend: Backend configuration object.
+        prior: Base prior of the solver.
+
+    Returns:
+        `(restriction, config)`: the injected restriction or `None`, and the
+        history-matching configuration or `None`.
+
+    Raises:
+        ValueError: If a restriction is requested on a prior with an infinite
+            support.
+    """
+    if restrict_prior is None:
+        default = getattr(type(backend), "restrict_prior_default", False)
+        # Only a real bool counts: a mocked config class must not opt in.
+        restrict_prior = bool(default) if isinstance(default, (bool, np.bool_)) else False
+
+    restriction, config = None, None
+    if isinstance(restrict_prior, (bool, np.bool_)):
+        if restrict_prior:
+            from .restriction.config import HistoryMatching
+
+            config = HistoryMatching()
+    elif _is_restriction(restrict_prior):
+        restriction = restrict_prior
+        config = getattr(restrict_prior, "config", None)
+    else:
+        config = restrict_prior
+
+    if (restriction is not None or config is not None) and getattr(prior, "dists", None) is not None:
+        validate_finite_support(prior)
+    return restriction, config
 
 
 def set_parameters(values, indexes, model_indexes):
@@ -324,6 +432,8 @@ class Solver(object):
     # instance: a class-level dict would be shared by every solver.
     restriction = None
     restriction_config = None
+    _restriction_injected: bool = False
+    _restriction_accounted: bool = False
     _fold_phase_name: str = "backend"
     _restrict_prior_arg = None
 
@@ -358,15 +468,24 @@ class Solver(object):
                 Linux, falling back to the full core count on macOS).
             backend: Backend configuration object. The solver infers the
                 backend at construction time from this mandatory config.
-            restrict_prior: Prior restriction request (`None`, a `bool`, a
-                history-matching configuration or a precomputed restriction).
-                Stored as given; it is resolved by the restriction step.
+            restrict_prior: Prior restriction by history matching. `None`
+                uses the backend's `restrict_prior_default` (only SIXSA
+                restricts by default), `True` a default
+                [`HistoryMatching`][bsixsa.restriction.HistoryMatching],
+                `False` none; a `HistoryMatching` sets the configuration,
+                and a precomputed
+                [`Restriction`][bsixsa.restriction.Restriction] is reused
+                as is (checked against `fingerprint()` at `run`, its folds
+                are not counted again). The restriction is computed at the
+                start of `run`, or earlier by calling `restrict`.
 
         Raises:
             TypeError: If *backend* does not define a `backend_name`, or if
-                *restrict_prior* is a plain number, string or container.
-            ValueError: If no spectrum or no model is loaded in `xspec`, or
-                if the output path exists and is not a directory.
+                *restrict_prior* is not one of the accepted types.
+            ValueError: If no spectrum or no model is loaded in `xspec`, if
+                the output path exists and is not a directory, or if a
+                restriction is requested on a prior with an infinite
+                support.
             FileExistsError: If the output directory is not empty and
                 *overwrite* is `False`. Raised before `build_prior` touches
                 the `xspec` parameters.
@@ -416,7 +535,12 @@ class Solver(object):
 
         Split from `__init__` so that subclasses can build a fully functional
         solver around an analytic forward model (see `tests/_analytic.py`).
-        The prior is stored as given: its `dists` are not inspected here.
+        The prior is stored as given: its `dists` are only inspected (for a
+        finite support) when a restriction is requested.
+
+        *restrict_prior* is resolved (see `_resolve_restrict_prior`) into
+        `restriction_config` and, for a precomputed restriction,
+        `restriction`, before the output directory is touched.
 
         Parameters:
             prior: Joint prior, typically a
@@ -429,19 +553,20 @@ class Solver(object):
             n_jobs: Worker processes for the folding pool, or `None` for the
                 number of available CPUs.
             backend: Backend configuration object.
-            restrict_prior: Prior restriction request, stored after a type
-                check (see `_check_restrict_prior_arg`).
+            restrict_prior: Prior restriction request (see `Solver`).
 
         Raises:
-            TypeError: If *restrict_prior* is a plain number, string or
-                container.
+            TypeError: If *restrict_prior* is not one of the accepted types.
+            ValueError: If a restriction is requested on a prior with an
+                infinite support, or if the output path exists and is not a
+                directory.
             FileExistsError: If the output directory is not empty and
                 *overwrite* is `False`.
-            ValueError: If the output path exists and is not a directory.
         """
         from .convenience import available_cpu_count
 
         _check_restrict_prior_arg(restrict_prior)
+        restriction, restriction_config = _resolve_restrict_prior(restrict_prior, backend, prior)
         self.outputfiles_basename = _prepare_output_directory(
             outputfiles_basename,
             overwrite=overwrite,
@@ -465,6 +590,10 @@ class Solver(object):
         self._fold_counts: dict[str, int] = {}
         self._fold_phase_name = "backend"
         self._restrict_prior_arg = restrict_prior
+        self.restriction = restriction
+        self.restriction_config = restriction_config
+        self._restriction_injected = restriction is not None
+        self._restriction_accounted = False
         # Validated last so that config checks see a fully initialised solver.
         self.backend_config.validate_for_solver(self)
 
@@ -491,10 +620,14 @@ class Solver(object):
     def pool_scope(self) -> contextlib.AbstractContextManager[None]:
         """Open a re-entrant scope sharing one folding pool.
 
-        Nested scopes (including the ones opened internally by `simulate`
-        and `log_likelihood_fn`) reuse the same pool, which is terminated when
-        the outermost scope exits. Open it around work that mixes folds with
-        torch so the pool is forked before torch spins up its threads.
+        Entering the scope does not create the pool: the first fold inside it
+        does, or `restrict` and `run`, which create it before any torch work.
+        Nested scopes (including the ones opened internally by `simulate`,
+        `log_likelihood_fn`, `restrict` and `run`) reuse that pool, which is
+        terminated when the outermost scope exits. Wrap a manual `restrict()`
+        followed by `run()` in one scope, so that `run` reuses the pool forked
+        before the history matching started torch rather than forking a new
+        one afterwards.
 
         Returns:
             A context manager; see `_pool_scope`.
@@ -711,7 +844,9 @@ class Solver(object):
         """Attribute the folds performed inside the block to phase *name*.
 
         Re-entrant: the previous phase is restored on exit, including when the
-        block raises. Folds outside any phase are counted under `"backend"`.
+        block raises. Folds outside any phase are counted under `"backend"`,
+        or under `"post"` once a `run` has returned from its backend
+        (predictive checks, `build_inference_data`, ...).
 
         Parameters:
             name: Phase label, e.g. `"restriction"` or `"post"`.
@@ -921,6 +1056,109 @@ class Solver(object):
         digest.update(counts.tobytes())
         digest.update(json.dumps(document, sort_keys=True).encode("utf-8"))
         return digest.hexdigest()
+
+    def restrict(
+        self,
+        config=None,
+        *,
+        force: bool = False,
+        log: Callable[[str], None] | None = print,
+    ):
+        r"""Restrict the prior by history matching, or return the cached result.
+
+        The history matching runs in the unit cube $u = F(\theta)$ of the
+        base prior and only asks for the cstat of each fold. Its folds are
+        counted under the `"restriction"` phase of `fold_counts` and do not
+        go through the backend's tracer. The result is written to
+        `<outputfiles_basename>/restriction/` (the bounding box is added by
+        the first `run` of a box-mode backend, which computes it) and stored
+        in `restriction`, which `run` then uses even when the solver was built
+        with `restrict_prior=False`.
+
+        The pool is forked before the history matching starts torch. Calling
+        `restrict()` and then `run()` separately closes that pool in between
+        and forks a new one after torch has run; wrap both in
+        `with solver.pool_scope():` to share one pool.
+
+        Parameters:
+            config: History-matching configuration. `None` uses
+                `restriction_config`, or a default
+                [`HistoryMatching`][bsixsa.restriction.HistoryMatching].
+            force: Recompute even if a restriction is already stored.
+            log: Receives one progress line per wave (and figure failures);
+                `None` silences the run.
+
+        Returns:
+            The [`Restriction`][bsixsa.restriction.Restriction].
+
+        Raises:
+            TypeError: If *config* is neither `None` nor a
+                [`HistoryMatching`][bsixsa.restriction.HistoryMatching].
+            ValueError: If a base prior axis has an infinite support.
+            RuntimeError: If the `xspec` session is not usable (see
+                `_check_xspec_state`).
+            FoldError: If a fold returns a NaN or $-\infty$ cstat.
+            TruncationBudgetError: If a wave cannot be drawn from the previous
+                region within `HistoryMatching.max_candidates` candidates.
+        """
+        from .restriction.config import HistoryMatching
+
+        # Checked before the cache, the xspec state and the pool fork: the
+        # constructor accepts `True`, so `restrict(True)` is an easy mistake.
+        if config is not None and not isinstance(config, HistoryMatching):
+            raise TypeError(
+                "restrict() expects None or a HistoryMatching configuration, got "
+                f"{type(config).__name__} {config!r}."
+            )
+        if (
+            not force
+            and self.restriction is not None
+            and (config is None or config == getattr(self.restriction, "config", None))
+        ):
+            return self.restriction
+
+        # Imported only when a restriction is computed: the waves pull in torch.
+        from .restriction.waves import run_history_matching
+
+        if config is not None:
+            cfg = config
+        elif self.restriction_config is not None:
+            cfg = self.restriction_config
+        else:
+            cfg = HistoryMatching()
+
+        validate_finite_support(self.base_prior)
+        base_prior = self.base_prior
+
+        def simulate_cstat(u: np.ndarray) -> np.ndarray:
+            theta = _cube.to_physical(base_prior, u)
+            with self.fold_phase("restriction"):
+                outputs = self._fold(theta, return_kind="cstat", progress_bar=False)
+            return np.asarray(outputs["cstat"], dtype=np.float64)
+
+        with self._pool_scope():
+            self._check_xspec_state()
+            # Fork the pool before the regressor spins up torch threads.
+            self._get_pool()
+            seed_seq = _cube.make_seed_sequence(cfg.seed)
+            outdir = os.path.join(self.outputfiles_basename, "restriction")
+            result = run_history_matching(
+                simulate_cstat,
+                d=self.num_parameters,
+                cfg=cfg,
+                seed_seq=seed_seq,
+                outdir=outdir,
+                fingerprint=self.fingerprint(),
+                param_names=list(self.parameter_names),
+                log=log,
+            )
+            result.save(outdir)
+
+        self.restriction = result
+        self.restriction_config = cfg
+        self._restriction_injected = False
+        self._restriction_accounted = False
+        return result
 
     def sample_parameters(
         self,
@@ -1148,16 +1386,284 @@ class Solver(object):
         return plot_predictive_coverage(self, distribution=distribution, **kwargs)
 
     def run(self) -> FitResults:
+        """Run the configured backend, restricting the prior first if requested.
+
+        Inside one pool scope (forked before any torch work): the `xspec`
+        session is checked, the restriction is computed if configured and not
+        yet available, and a stored restriction is checked against
+        `fingerprint()`. A backend whose config has
+        `restriction_mode == "box"` then samples the truncated bounding box of
+        the restriction, installed as `prior` (and as
+        `distributions["restricted_prior"]`); its evidence is corrected by the
+        box's prior mass and its best-fit statistic is reported with the base
+        prior term. A `"region"` backend keeps the base prior. The box is
+        always derived from `base_prior`, so re-running never truncates twice,
+        and it stays installed after the run so that post-run sampling of
+        point-estimate backends stays inside it. `distributions["prior"]`
+        is always the base prior.
+
+        Folds made by the backend are counted under `"backend"`; once it
+        returns, folds outside an explicit `fold_phase` are counted under
+        `"post"`. The results, the posterior and the tracer are stored before
+        any [`BoxEdgeWarning`][bsixsa.exceptions.BoxEdgeWarning] is emitted,
+        so a warnings filter that turns it into an error does not discard the
+        run.
+
+        Returns:
+            The backend's [`FitResults`][bsixsa.solver.FitResults], corrected
+            for the restriction (see `_finalise_restriction`).
+
+        Raises:
+            RuntimeError: If the `xspec` session is not usable; raised before
+                the backend is constructed.
+            ValueError: If the restriction was computed for another problem
+                (the base prior is reinstalled first), or if the backend's
+                `x0_physical` lies outside the restricted box.
+        """
         from .backend import get_backend_class
 
         with self._pool_scope():
+            self._check_xspec_state()
+            # Fork the pool before any torch work (history matching, flows).
+            self._get_pool()
+            self._fold_phase_name = "backend"
+
+            if self.restriction is None and self.restriction_config is not None:
+                self.restrict()
+            if self.restriction is not None:
+                try:
+                    self.restriction.check_fingerprint(self.fingerprint())
+                except ValueError:
+                    # A box installed by an earlier run belongs to the rejected
+                    # restriction too.
+                    self._install_base_prior()
+                    raise
+
+            mode = getattr(type(self.backend_config), "restriction_mode", "box")
+            base_prior = getattr(self, "base_prior", None)
+            if self.restriction is not None and mode == "box":
+                box_prior, log_mass = self.restriction.truncated_prior(base_prior)
+                self.prior = box_prior
+                self.distributions["restricted_prior"] = box_prior
+                try:
+                    self._check_x0_in_prior()
+                except ValueError:
+                    self._install_base_prior()
+                    raise
+                if not self._restriction_injected and callable(getattr(self.restriction, "save", None)):
+                    # restrict() saved before the box existed.
+                    self.restriction.save(os.path.join(self.outputfiles_basename, "restriction"))
+            else:
+                self._install_base_prior()
+                log_mass = 0.0
+
             backend_cls = get_backend_class(self.backend_name)
             self.backend = backend_cls(solver=self, config=self.backend_config)
-            self.fit_result = self.backend.run()
+            fit = self.backend.run()
+            self._fold_phase_name = "post"
+            self.fit_result = self._finalise_restriction(fit, mode, log_mass)
             self.posterior_samples = self.fit_result.posterior_samples
             self.distributions["posterior"] = self.backend
 
             self.backend.tracer.plot_progress()
             self.backend.tracer.save()
 
-            return self.fit_result
+            messages = []
+            if self.restriction is not None and mode == "box":
+                messages = self._box_edge_messages_safe(self.fit_result)
+
+        # Emitted last: a warnings filter set to "error" must not discard the run.
+        for message in messages:
+            warnings.warn(BoxEdgeWarning(message), stacklevel=2)
+        return self.fit_result
+
+    def _install_base_prior(self) -> None:
+        """Make the base prior the working prior and drop any restricted box."""
+        base_prior = getattr(self, "base_prior", None)
+        # Solvers built with `__new__` may only carry `prior`.
+        if base_prior is not None:
+            self.prior = base_prior
+        self.distributions.pop("restricted_prior", None)
+
+    def _check_x0_in_prior(self) -> None:
+        """Require the backend's starting point to lie inside the working prior.
+
+        Raises:
+            ValueError: If the backend config has an `x0_physical` at which
+                the working (restricted) prior has no finite log density,
+                naming the offending parameters and the box bounds.
+        """
+        x0 = getattr(self.backend_config, "x0_physical", None)
+        if x0 is None:
+            return
+        x0 = np.asarray(x0, dtype=np.float64).ravel()
+        if np.all(np.isfinite(np.asarray(self.prior.log_prob(x0), dtype=np.float64))):
+            return
+
+        names = self._axis_names(x0.size)
+        details = []
+        for j, dist in enumerate(getattr(self.prior, "dists", ())):
+            low, high = (float(bound) for bound in dist.support())
+            if j < x0.size and not low <= x0[j] <= high:
+                details.append(f"{names[j]}={x0[j]!r} outside [{low!r}, {high!r}]")
+        raise ValueError(
+            "x0_physical lies outside the restricted prior box installed by the "
+            "history-matching restriction"
+            + (f": {'; '.join(details)}" if details else "")
+            + ". Start from a point inside the box, or disable the restriction "
+            "(restrict_prior=False)."
+        )
+
+    def _axis_names(self, d: int) -> list[str]:
+        """Parameter names for messages, falling back to `axis <j>`."""
+        try:
+            names = [str(name) for name in self.parameter_names]
+        except Exception:
+            names = []
+        if len(names) != d:
+            names = [f"axis {j}" for j in range(d)]
+        return names
+
+    def _finalise_restriction(self, fit: FitResults, mode: str, log_mass: float) -> FitResults:
+        """Account for the restriction in a backend's results.
+
+        Restriction folds are added to `n_likelihood_evaluations` (and
+        reported in `n_restriction_evaluations` / `restriction_time`, which
+        includes the bounding-box computation) only when this solver computed
+        the restriction, and only in the first run that uses it: a re-run
+        spends no restriction fold. For a `"box"` backend, the box's log
+        prior mass is added to a finite `log_Z`, and `best_fit_stat` is
+        re-expressed with the base prior's XSPEC-convention term (so it is
+        comparable with an unrestricted run). Box-edge diagnostics are left
+        to `run`, which emits them once the results are stored.
+
+        Parameters:
+            fit: Results returned by the backend; modified in place.
+            mode: The backend's `restriction_mode`.
+            log_mass: Log prior mass of the installed box (`0.0` without one).
+
+        Returns:
+            *fit*.
+        """
+        restriction = self.restriction
+        if restriction is None:
+            return fit
+
+        if self._restriction_injected or self._restriction_accounted:
+            fit.n_restriction_evaluations = 0
+            fit.restriction_time = 0.0
+        else:
+            n_simulations = int(restriction.n_simulations)
+            box_info = getattr(restriction, "box_info", None)
+            box_seconds = box_info.get("seconds", 0.0) if isinstance(box_info, dict) else 0.0
+            fit.n_likelihood_evaluations += n_simulations
+            fit.n_restriction_evaluations = n_simulations
+            fit.restriction_time = float(restriction.seconds) + float(box_seconds)
+            self._restriction_accounted = True
+
+        if mode != "box":
+            return fit
+
+        log_mass = float(log_mass)
+        if np.isfinite(fit.log_Z):
+            fit.log_Z = fit.log_Z + log_mass
+        fit.log_Z_restriction_correction = log_mass
+
+        if fit.best_fit is not None and fit.best_fit_stat is not None:
+            try:
+                x = np.asarray(fit.best_fit, dtype=np.float64)
+                # Only a truncated non-uniform family (e.g. truncnorm) changes
+                # the term: its density is renormalised by the box.
+                fit.best_fit_stat = float(
+                    fit.best_fit_stat
+                    - self.prior.xspec_bayes_contribution(x)
+                    + self.base_prior.xspec_bayes_contribution(x)
+                )
+            except (AttributeError, NotImplementedError, TypeError, ValueError):
+                pass
+
+        return fit
+
+    def _box_edge_messages_safe(self, fit: FitResults) -> list[str]:
+        """Diagnose posterior mass crowding an interior face of the restricted box.
+
+        The box has a core (the bounding box of the restriction's region) and
+        a padding shell on each side. A face is interior when it is not a face
+        of the prior cube. Posterior samples are mapped to the box's own unit
+        cube; each interior face whose shell (at least `1e-3` wide) holds a
+        fraction of the samples above `max(1e-3, 5 / N_eff)`, with `N_eff`
+        the number of distinct rows, yields a message, and so does a
+        `best_fit` within `1e-3` of an interior face. `run` emits each one
+        as a [`BoxEdgeWarning`][bsixsa.exceptions.BoxEdgeWarning].
+        Diagnostics that cannot be computed are skipped: this method never
+        raises.
+
+        Parameters:
+            fit: Results of a backend that sampled the box.
+
+        Returns:
+            The warning messages, possibly empty.
+        """
+        try:
+            return self._box_edge_messages(fit)
+        except Exception:
+            return []
+
+    def _box_edge_messages(self, fit: FitResults) -> list[str]:
+        """Messages for `_box_edge_messages_safe` (see there); may raise on bad inputs."""
+        restriction = self.restriction
+        lo, hi = (np.asarray(bound, dtype=np.float64).ravel() for bound in restriction.box())
+        core_lo, core_hi = (np.asarray(bound, dtype=np.float64).ravel() for bound in restriction.box_core)
+        d = lo.size
+        lower_interior = lo > 0.0
+        upper_interior = hi < 1.0
+        if not (lower_interior.any() or upper_interior.any()):
+            return []
+
+        width = hi - lo
+        shell_lower = np.maximum((core_lo - lo) / width, 1e-3)
+        shell_upper = np.maximum((hi - core_hi) / width, 1e-3)
+        names = self._axis_names(d)
+        messages = []
+
+        samples = fit.posterior_samples
+        if samples is not None:
+            # Columns are in prior order; names are not used to index them.
+            samples = np.asarray(samples, dtype=np.float64)
+            if samples.ndim == 2 and samples.shape[1] == d:
+                samples = samples[np.all(np.isfinite(samples), axis=1)]
+            if samples.ndim == 2 and samples.shape[1] == d and len(samples) > 0:
+                u = np.asarray(self.prior.to_unit_cube(samples), dtype=np.float64)
+                n_eff = len(np.unique(samples, axis=0))
+                threshold = max(1e-3, 5.0 / n_eff)
+                for j in range(d):
+                    for interior, face, inside in (
+                        (lower_interior[j], "lower", u[:, j] <= shell_lower[j]),
+                        (upper_interior[j], "upper", u[:, j] >= 1.0 - shell_upper[j]),
+                    ):
+                        fraction = float(np.mean(inside))
+                        if interior and fraction > threshold:
+                            messages.append(
+                                f"{fraction:.2%} of the posterior samples of {names[j]} lie in "
+                                f"the padding shell of the {face} face of the restricted prior "
+                                f"box (tolerance {threshold:.2%}). The restriction may have "
+                                "cut off posterior mass: widen it (e.g. larger "
+                                "HistoryMatching.target_spans or box_padding) or run without it."
+                            )
+
+        if fit.best_fit is not None:
+            best = np.asarray(fit.best_fit, dtype=np.float64).ravel()
+            if best.size == d and np.all(np.isfinite(best)):
+                u_best = np.asarray(self.prior.to_unit_cube(best.reshape(1, d)), dtype=np.float64)[0]
+                for j in range(d):
+                    for interior, face, close in (
+                        (lower_interior[j], "lower", u_best[j] <= 1e-3),
+                        (upper_interior[j], "upper", u_best[j] >= 1.0 - 1e-3),
+                    ):
+                        if interior and close:
+                            messages.append(
+                                f"The best fit of {names[j]} ({best[j]!r}) sits on the {face} "
+                                "face of the restricted prior box. The optimum may lie outside "
+                                "the box: widen the restriction or run without it."
+                            )
+        return messages

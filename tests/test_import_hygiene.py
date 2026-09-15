@@ -26,13 +26,28 @@ XSPEC_FREE_FILES = (
     "bsixsa/_cube.py",
     "bsixsa/_torch_utils.py",
     "bsixsa/exceptions.py",
+    "bsixsa/restriction/__init__.py",
+    "bsixsa/restriction/config.py",
+    "bsixsa/restriction/rules.py",
+    "bsixsa/restriction/regressor.py",
+    "bsixsa/restriction/region.py",
+    "bsixsa/restriction/waves.py",
+    "bsixsa/restriction/plots.py",
 )
 
-# Files that may use torch only lazily (inside a function body).
+# Files that may use torch only lazily (inside a function body). Only
+# `restriction/regressor.py` imports torch at module level; the package
+# `__init__` reaches `waves` (and through it the regressor) on first access.
 TORCH_LAZY_FILES = (
     "bsixsa/_cube.py",
     "bsixsa/_torch_utils.py",
     "bsixsa/exceptions.py",
+    "bsixsa/restriction/__init__.py",
+    "bsixsa/restriction/config.py",
+    "bsixsa/restriction/rules.py",
+    "bsixsa/restriction/region.py",
+    "bsixsa/restriction/waves.py",
+    "bsixsa/restriction/plots.py",
 )
 
 FORBIDDEN_MODULES = ("xspec", "bsixsa.solver")

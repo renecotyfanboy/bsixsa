@@ -50,6 +50,8 @@ def mock_solver(tmp_path):
     solver.pool = None
     solver._pool_depth = 0
     solver._n_jobs = 1
+    # `run` forks the folding pool up front; these fakes never fold.
+    solver._get_pool = lambda: None
 
     return solver
 
@@ -451,10 +453,7 @@ def test_nautilus_backend_sizes_pool_from_config_not_cpu_count(tmp_path):
     sampler pool must be capped at the available CPU count."""
     from bsixsa.backend.nautilus import NautilusBackend
 
-    params = [SimpleNamespace(name="p1"), SimpleNamespace(name="p2")]
-
-    with patch("bsixsa.backend.nautilus.iter_thawn_parameters", return_value=params), \
-         patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
+    with patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
          patch("bsixsa.backend.nautilus.available_cpu_count", return_value=8), \
          patch("bsixsa.backend.nautilus.NestedSampler") as sampler_cls:
 

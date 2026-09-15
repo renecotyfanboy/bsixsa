@@ -21,9 +21,25 @@ MODEL_CONFIG = ConfigDict(
 
 
 class BackendConfig(BaseModel):
-    """Backend config models with shared tracing options."""
+    """Backend config models with shared tracing options.
+
+    Attributes:
+        restriction_mode: Class-level. How a prior restriction computed by the
+            solver (see `Solver(restrict_prior=...)`) reaches the backend:
+            `"box"` samples the truncated bounding-box prior, and the evidence
+            is corrected by the box's prior mass; `"region"` keeps the full
+            prior and consumes the exact region itself (SIXSA).
+        restrict_prior_default: Class-level. What `Solver(restrict_prior=None)`
+            resolves to for this backend: `True` restricts with a default
+            [`HistoryMatching`][bsixsa.restriction.HistoryMatching]. Only SIXSA
+            restricts by default.
+    """
 
     model_config = MODEL_CONFIG
+
+    restriction_mode: ClassVar[Literal["box", "region"]] = "box"
+    # Resolution of `Solver(restrict_prior=None)` for this backend.
+    restrict_prior_default: ClassVar[bool] = False
 
     trace: StrictBool = Field(
         default=True,
@@ -161,6 +177,15 @@ class Nautilus(BackendConfig):
         ),
     )
 
+    seed: Annotated[int, Field(strict=True, ge=0)] | None = Field(
+        default=None,
+        description=(
+            "Seed forwarded to the nautilus sampler and used to shuffle the "
+            "equal-weight posterior returned by `sample`. `None` draws fresh "
+            "OS entropy, so runs are not reproducible."
+        ),
+    )
+
 
 class Nessai(BackendConfig):
     """Configuration for the [`nessai`](https://nessai.readthedocs.io/en/latest/) backend."""
@@ -207,7 +232,13 @@ class Ultranest(BackendConfig):
     )
     resume: StrictBool = Field(
         default=True,
-        description="Resume a previous UltraNest run if checkpoint files exist.",
+        description=(
+            "Resume a previous UltraNest run if checkpoint files exist; `False` starts over. "
+            "A run whose prior transform changed since (a restriction installed, recomputed "
+            "with `restrict(force=True)` or another configuration, or removed) cannot resume: "
+            "UltraNest refuses it, after any restriction folds were spent, so set `False` or "
+            "use a fresh `outputfiles_basename` in that case."
+        ),
     )
     use_step_sampler: StrictBool = Field(
         default=False,

@@ -15,6 +15,7 @@ from _analytic import AnalyticSolver, AnalyticSpectrum
 import bsixsa.solver as solver_module
 from bsixsa.backend.config import BackendConfig
 from bsixsa.priors import MultipleIndependent, loguniform, uniform
+from bsixsa.restriction import HistoryMatching
 from bsixsa.solver import Solver
 
 
@@ -77,7 +78,8 @@ def test_analytic_solver_builds(tmp_path):
     assert solver.distributions == {"prior": solver.prior}
     assert solver.fold_counts == {}
     assert solver.restriction is None
-    assert solver.restriction_config is None
+    # `True` resolves to a default history-matching configuration.
+    assert solver.restriction_config == HistoryMatching()
     assert solver._restrict_prior_arg is True
     assert solver.pool is None and solver._pool_depth == 0
     assert solver._n_jobs == 1
@@ -100,8 +102,10 @@ def test_setup_validates_backend_after_full_initialisation(tmp_path):
 
 
 def test_setup_is_pure_and_does_not_touch_prior_dists(tmp_path):
+    # A prior without `dists`: the finite-support check of a requested
+    # restriction must not probe it.
     prior = SimpleNamespace(ndim=2, bounds=[(0.0, 1.0), (1.0, 2.0)])
-    sentinel = object()
+    sentinel = HistoryMatching(n_waves=2)
     solver = _bare_solver()
 
     solver._setup(
@@ -126,6 +130,7 @@ def test_setup_is_pure_and_does_not_touch_prior_dists(tmp_path):
     assert solver._fold_phase_name == "backend"
     assert solver.fold_counts == {}
     assert solver._restrict_prior_arg is sentinel
+    assert solver.restriction_config is sentinel and solver.restriction is None
     assert (tmp_path / "pure").is_dir()
 
 
@@ -498,8 +503,10 @@ def test_restrict_prior_accepts_none_and_bools(tmp_path, value):
 
 
 def test_restrict_prior_accepts_configuration_objects(tmp_path):
-    config = SimpleNamespace(kind="history-matching")
-    assert _make_solver(tmp_path, restrict_prior=config)._restrict_prior_arg is config
+    config = HistoryMatching(n_waves=2)
+    solver = _make_solver(tmp_path, restrict_prior=config)
+    assert solver._restrict_prior_arg is config
+    assert solver.restriction_config is config
 
 
 # ---------------------------------------------------------------------------

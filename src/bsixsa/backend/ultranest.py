@@ -6,7 +6,6 @@ import ultranest
 import ultranest.popstepsampler
 import ultranest.calibrator
 
-from ..convenience import iter_thawn_parameters
 from .abc import Backend
 from . import register_backend
 from .config import Ultranest
@@ -34,12 +33,13 @@ class UltranestBackend(Backend):
         os.makedirs(ultranest_output, exist_ok=True)
 
         self._reactive_sampler = ultranest.ReactiveNestedSampler(
-            [par.name for par in iter_thawn_parameters()],
+            list(self.solver.parameter_names),
             self._likelihood,
             transform=lambda cube: self._prior_transform(cube),
             log_dir=ultranest_output,
             vectorized=True,
-            resume=self.config.resume
+            # UltraNest asserts on `resume=False`; "overwrite" is its fresh start.
+            resume="resume" if self.config.resume else "overwrite",
         )
 
         if self.config.use_step_sampler:
