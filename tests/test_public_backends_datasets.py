@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from bsixsa import Nautilus, Nessai, SIXSASolver
+
+pytestmark = pytest.mark.xspec
 
 
 def test_low_resolution_nautilus_notebook_setup_builds_solver(

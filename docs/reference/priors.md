@@ -7,3 +7,5 @@
       - loguniform
       - norm
       - uniform
+      - TruncatedMarginal
+      - validate_finite_support

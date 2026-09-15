@@ -85,6 +85,13 @@ def xspec_session():
 def low_res_xspec_setup(xspec_session, low_res_data_dir: Path, monkeypatch):
     monkeypatch.chdir(low_res_data_dir)
 
+    # This optional dataset references an unbundled background. Do not let
+    # XSPEC enter its interactive missing-file prompt during automated tests.
+    from astropy.io import fits
+    background = fits.getheader(low_res_data_dir / "PN_spectrum_grp20_opt.pha", 1).get("BACKFILE", "")
+    if background and background.lower() != "none" and not (low_res_data_dir / background).exists():
+        pytest.skip(f"Optional low-resolution background is missing: {background}")
+
     observation = xspec_session.Spectrum(
         "PN_spectrum_grp20_opt.pha",
         respFile="PN.rmf",

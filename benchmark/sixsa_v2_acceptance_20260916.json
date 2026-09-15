@@ -1,0 +1,408 @@
+{
+  "runs": {
+    "nautilus_full_0": {
+      "log_Z": -1040.3094172728106,
+      "log_Z_err": 0.009970048425628457,
+      "mean": [
+        0.2044849788274026,
+        1.817936398387005,
+        0.0010113369907317395
+      ],
+      "std": [
+        0.0034119354751454434,
+        0.009707525675122832,
+        0.000009722608854194781
+      ],
+      "corr": [
+        [
+          1,
+          0.8023933352379344,
+          0.8836854217745747
+        ],
+        [
+          0.8023933352379343,
+          1,
+          0.8476216295356525
+        ],
+        [
+          0.8836854217745747,
+          0.8476216295356525,
+          0.9999999999999998
+        ]
+      ],
+      "time": 137.9942588749691,
+      "n_likelihood_evaluations": 106500,
+      "fold_counts": {
+        "backend": 106500
+      },
+      "best_fit_stat": null,
+      "restriction_time": 0,
+      "log_Z_restriction_correction": 0
+    },
+    "nautilus_full_1": {
+      "log_Z": -1040.3066430218898,
+      "log_Z_err": 0.00996471410852183,
+      "mean": [
+        0.20443804611262745,
+        1.8176841391379386,
+        0.001011206288262678
+      ],
+      "std": [
+        0.0034463092992711546,
+        0.00974382333769258,
+        0.000009889924417655603
+      ],
+      "corr": [
+        [
+          0.9999999999999999,
+          0.8051363498444569,
+          0.8870018497435821
+        ],
+        [
+          0.805136349844457,
+          0.9999999999999998,
+          0.852903533128695
+        ],
+        [
+          0.8870018497435821,
+          0.852903533128695,
+          0.9999999999999998
+        ]
+      ],
+      "time": 136.32322791597107,
+      "n_likelihood_evaluations": 106800,
+      "fold_counts": {
+        "backend": 106800
+      },
+      "best_fit_stat": null,
+      "restriction_time": 0,
+      "log_Z_restriction_correction": 0
+    },
+    "nautilus_full_2": {
+      "log_Z": -1040.319275207526,
+      "log_Z_err": 0.009960380686801714,
+      "mean": [
+        0.20444838855090708,
+        1.8176493166432874,
+        0.0010111969751479954
+      ],
+      "std": [
+        0.0034240559849639195,
+        0.00969836497878064,
+        0.000009799194568911662
+      ],
+      "corr": [
+        [
+          1,
+          0.8058945265147676,
+          0.8829087725103837
+        ],
+        [
+          0.8058945265147676,
+          1,
+          0.8566634522688089
+        ],
+        [
+          0.8829087725103837,
+          0.8566634522688088,
+          1
+        ]
+      ],
+      "time": 150.69200545799686,
+      "n_likelihood_evaluations": 105800,
+      "fold_counts": {
+        "backend": 105800
+      },
+      "best_fit_stat": null,
+      "restriction_time": 0,
+      "log_Z_restriction_correction": 0
+    },
+    "restriction": {
+      "n_likelihood_evaluations": 4500,
+      "seconds": 13.695572833996266,
+      "prior_mass": 0.0004475,
+      "threshold": 2916.400660703376,
+      "stop_reason": "acceptance"
+    },
+    "nautilus_restrict": {
+      "log_Z": -1040.3087984589954,
+      "log_Z_err": 0.009966506891282622,
+      "mean": [
+        0.20450405385482873,
+        1.8179997031591044,
+        0.0010113044320067266
+      ],
+      "std": [
+        0.003405702928334686,
+        0.00964279229023096,
+        0.0000098089199202501
+      ],
+      "corr": [
+        [
+          1,
+          0.7994898029200971,
+          0.8823714064133935
+        ],
+        [
+          0.7994898029200971,
+          0.9999999999999998,
+          0.8506286185493297
+        ],
+        [
+          0.8823714064133935,
+          0.8506286185493296,
+          0.9999999999999998
+        ]
+      ],
+      "time": 123.40384104097029,
+      "n_likelihood_evaluations": 86300,
+      "fold_counts": {
+        "backend": 86300
+      },
+      "best_fit_stat": null,
+      "restriction_time": 0,
+      "log_Z_restriction_correction": -4.574980343111555,
+      "box_edge_warning": false,
+      "warnings": [
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child."
+      ]
+    },
+    "sixsa_restrict": {
+      "log_Z": -1040.3147797591255,
+      "log_Z_err": 0.013076081793462703,
+      "mean": [
+        0.204475773216784,
+        1.8178941415131091,
+        0.001011353299660998
+      ],
+      "std": [
+        0.003410864825447312,
+        0.009603714175300008,
+        0.000009833296281020426
+      ],
+      "corr": [
+        [
+          1,
+          0.8037290730054475,
+          0.8897475803882008
+        ],
+        [
+          0.8037290730054476,
+          1,
+          0.8481185563869106
+        ],
+        [
+          0.8897475803882007,
+          0.8481185563869106,
+          1
+        ]
+      ],
+      "time": 279.5266063750023,
+      "n_likelihood_evaluations": 70779,
+      "fold_counts": {
+        "harvest": 3750,
+        "screen": 25000,
+        "gate": 5000,
+        "training": 27029,
+        "sampling": 10000
+      },
+      "best_fit_stat": 2033.7658533025624,
+      "restriction_time": 0,
+      "log_Z_restriction_correction": 0,
+      "exit_reason": "gate",
+      "certified": true,
+      "k_hat": -0.427136803624686,
+      "ess": 3686.2687514957734,
+      "n_unique": 4199,
+      "best_round": 5,
+      "log_Z_err_reliable": true,
+      "history": [
+        {
+          "round": 1,
+          "k_hat": 17.06745029424709,
+          "efficiency": 0.520091495449506,
+          "n_train": 3750,
+          "generation": 1,
+          "truncation_source": "region",
+          "truncation": null
+        },
+        {
+          "round": 2,
+          "k_hat": 4.075358403762057,
+          "efficiency": 0.5196733139954128,
+          "n_train": 4688,
+          "generation": 2,
+          "truncation_source": "region",
+          "truncation": null
+        },
+        {
+          "round": 3,
+          "k_hat": 0.9400283594452591,
+          "efficiency": 2.122628023730158,
+          "n_train": 5860,
+          "generation": 3,
+          "truncation_source": "region",
+          "truncation": null
+        },
+        {
+          "round": 4,
+          "k_hat": 0.4384959137834258,
+          "efficiency": 4.878538027457405,
+          "n_train": 7325,
+          "generation": 4,
+          "truncation_source": "round4/member4",
+          "truncation": {
+            "method": "sir",
+            "method_used": "sir",
+            "threshold": 5.329381374359131,
+            "quantile_used": 0.001,
+            "n_candidates": 292992,
+            "acceptance": 0.03125,
+            "growths": 0,
+            "fraction_outside_contour": 0.03418523372651813,
+            "fraction_outside_region": 0,
+            "growth_reasons": [],
+            "fallback": null,
+            "quantiles_tried": [
+              0.001
+            ],
+            "estimates": null,
+            "seconds": 2.6496882920037024
+          }
+        },
+        {
+          "round": 5,
+          "k_hat": -0.3085174312243756,
+          "efficiency": 38.492018937430196,
+          "n_train": 9156,
+          "generation": 5,
+          "truncation_source": null,
+          "truncation": null
+        }
+      ],
+      "box_edge_warning": false,
+      "warnings": [
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child.",
+        "This process (pid=39704) is multi-threaded, use of fork() may lead to deadlocks in the child."
+      ]
+    }
+  },
+  "reference": {
+    "log_Z": -1040.311778500742,
+    "log_Z_err": 0.02,
+    "error_method": "replicate scatter / sqrt(R), floor 0.02",
+    "best_fit_stat": 2033.7610513296127
+  },
+  "gates": {
+    "G1_logZ_sixsa": {
+      "value": 0.003001258383392269,
+      "threshold": 0.07168580916488243,
+      "passed": true
+    },
+    "G2_logZ_box": {
+      "value": 0.0029800417466958606,
+      "threshold": 0.08485281374238571,
+      "passed": true
+    },
+    "G2_box_edge": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G3_sixsa_restrict_mean": {
+      "value": 0.014658067725182872,
+      "threshold": 0.1,
+      "passed": true
+    },
+    "G3_sixsa_restrict_std": {
+      "value": 0.011758831154103144,
+      "threshold": 0.1,
+      "passed": true
+    },
+    "G3_sixsa_restrict_corr": {
+      "value": 0.005146841734763208,
+      "threshold": 0.05,
+      "passed": true
+    },
+    "G3_nautilus_restrict_mean": {
+      "value": 0.02552056972383512,
+      "threshold": 0.1,
+      "passed": true
+    },
+    "G3_nautilus_restrict_std": {
+      "value": 0.007737615896054151,
+      "threshold": 0.1,
+      "passed": true
+    },
+    "G3_nautilus_restrict_corr": {
+      "value": 0.0050308586428308155,
+      "threshold": 0.05,
+      "passed": true
+    },
+    "G4_certified": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G5_truth": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G6_best_fit": {
+      "value": 0.0048019729497355,
+      "threshold": 3,
+      "passed": true
+    },
+    "G7_nautilus_full_0_folds": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G7_nautilus_full_1_folds": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G7_nautilus_full_2_folds": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G7_nautilus_restrict_folds": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    },
+    "G7_sixsa_restrict_folds": {
+      "value": 0,
+      "threshold": 0,
+      "passed": true
+    }
+  },
+  "passed": true,
+  "audit": {
+    "date": "2026-09-16",
+    "versions": {
+      "sbi": "0.27.0",
+      "torch": "2.5.1",
+      "arviz": "0.23.4",
+      "numpy": "2.5.3",
+      "scipy": "1.18.0",
+      "joblib": "1.5.3"
+    },
+    "original_G6": {
+      "value": 13.854442325824948,
+      "threshold": 3,
+      "passed": false
+    },
+    "G6_correction": "The initial strict run compared best_fit_stat (C-stat plus the XSPEC prior term) with bare C-stat. The corrected benchmark refines the reference posterior centre under C-stat plus the same base-prior term. Only G6 was recomputed on the saved synthetic spectrum; no posterior fits were rerun.",
+    "G6_verification_folds": 399,
+    "full_suite": "748 passed, 1 skipped in 85.45 seconds, including the benchmark-convention regression test."
+  }
+}

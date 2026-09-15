@@ -7,12 +7,13 @@ at import time. The check parses the sources with `ast` instead of importing
 them: importing any `bsixsa` submodule runs the package `__init__`, which
 imports XSPEC, so a runtime check cannot see a violation there.
 
-Later phases extend the file lists below.
+Each phase extends the file lists below with its new modules.
 """
 
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,14 @@ XSPEC_FREE_FILES = (
     "bsixsa/restriction/region.py",
     "bsixsa/restriction/waves.py",
     "bsixsa/restriction/plots.py",
+    "bsixsa/backend/sixsa/budget.py",
+    "bsixsa/backend/sixsa/_simulator.py",
+    "bsixsa/backend/sixsa/compressor.py",
+    "bsixsa/backend/sixsa/_nde_worker.py",
+    "bsixsa/backend/sixsa/flows.py",
+    "bsixsa/backend/sixsa/certify.py",
+    "bsixsa/backend/sixsa/sampling.py",
+    "bsixsa/backend/sixsa/truncation.py",
 )
 
 # Files that may use torch only lazily (inside a function body). Only
@@ -48,7 +57,29 @@ TORCH_LAZY_FILES = (
     "bsixsa/restriction/region.py",
     "bsixsa/restriction/waves.py",
     "bsixsa/restriction/plots.py",
+    "bsixsa/backend/sixsa/budget.py",
+    "bsixsa/backend/sixsa/_simulator.py",
+    "bsixsa/backend/sixsa/certify.py",
+    "bsixsa/backend/sixsa/sampling.py",
+    "bsixsa/backend/sixsa/truncation.py",
 )
+
+# SIXSA modules that never touch torch, sbi or zuko, not even lazily: the
+# certificates, the final sampler and the budgets are pure numerics.
+TORCH_FREE_FILES = (
+    "bsixsa/backend/sixsa/budget.py",
+    "bsixsa/backend/sixsa/_simulator.py",
+    "bsixsa/backend/sixsa/certify.py",
+    "bsixsa/backend/sixsa/sampling.py",
+)
+TORCH_STACK = ("torch", "sbi", "zuko")
+
+# Modules restricted to the standard library.
+STDLIB_ONLY_FILES = ("bsixsa/backend/sixsa/budget.py",)
+
+# Shipped to loky workers by value: importing `bsixsa` there would run the
+# package `__init__`, and with it XSPEC, in every worker.
+BSIXSA_FREE_FILES = ("bsixsa/backend/sixsa/_nde_worker.py",)
 
 FORBIDDEN_MODULES = ("xspec", "bsixsa.solver")
 _IMPORT_FUNCTIONS = ("import_module", "__import__")
@@ -168,6 +199,30 @@ def test_module_imports_torch_only_lazily(relative_path):
     assert _violations(imports, ("torch",), module_level_only=True) == []
 
 
+@pytest.mark.parametrize("relative_path", TORCH_FREE_FILES)
+def test_module_never_imports_torch(relative_path):
+    imports = _collect_imports(_read(relative_path), relative_path)
+
+    assert _violations(imports, TORCH_STACK, module_level_only=False) == []
+
+
+@pytest.mark.parametrize("relative_path", STDLIB_ONLY_FILES)
+def test_module_imports_the_standard_library_only(relative_path):
+    imports = _collect_imports(_read(relative_path), relative_path)
+
+    outside = sorted(
+        {f"line {imp.lineno}: {imp.module}" for imp in imports if imp.module.split(".")[0] not in sys.stdlib_module_names}
+    )
+    assert outside == []
+
+
+@pytest.mark.parametrize("relative_path", BSIXSA_FREE_FILES)
+def test_worker_module_does_not_import_bsixsa(relative_path):
+    imports = _collect_imports(_read(relative_path), relative_path)
+
+    assert _violations(imports, ("bsixsa", "xspec"), module_level_only=False) == []
+
+
 # ---------------------------------------------------------------------------
 # The scanner itself: a scan that sees nothing would pass vacuously.
 # ---------------------------------------------------------------------------
@@ -222,3 +277,13 @@ def test_scanner_distinguishes_lazy_from_module_level_torch():
     assert _violations(lazy, ("torch",), module_level_only=True) == []
     assert _violations(eager, ("torch",), module_level_only=True) == ["line 1: torch.nn"]
     assert _violations(in_class, ("torch",), module_level_only=True) == ["line 2: torch"]
+
+
+def test_scanner_flags_relative_bsixsa_imports_lazy_torch_stack_and_third_party():
+    relative = _collect_imports("from ._cube import child_seed\n", "bsixsa/backend/sixsa/_nde_worker.py")
+    lazy_sbi = _collect_imports("def f():\n    from sbi.utils import BoxUniform\n", "bsixsa/backend/sixsa/certify.py")
+    mixed = _collect_imports("import math\nimport numpy as np\n", "bsixsa/backend/sixsa/budget.py")
+
+    assert _violations(relative, ("bsixsa", "xspec"), module_level_only=False)
+    assert _violations(lazy_sbi, TORCH_STACK, module_level_only=False) == ["line 2: sbi.utils", "line 2: sbi.utils.BoxUniform"]
+    assert [imp.module for imp in mixed if imp.module.split(".")[0] not in sys.stdlib_module_names] == ["numpy"]

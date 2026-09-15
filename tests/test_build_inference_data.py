@@ -67,7 +67,10 @@ def mock_solver():
     # Patch the property so it doesn't call XSPEC
     solver._parameter_names = param_names
 
-    return solver
+    # Keep these pure tests independent of whether HEASoft is activated.
+    with patch.object(Solver, "observed_spectrum", new_callable=PropertyMock,
+                      return_value=np.ones(100, dtype=np.float32)):
+        yield solver
 
 
 def _patched_parameter_names(solver):

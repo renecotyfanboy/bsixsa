@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-import xspec
 
 from bsixsa import Nessai, SIXSASolver
 
 
 @pytest.fixture
 def dummy_prior_definition():
-    xspec.AllData.nSpectra = 1
-    xspec.AllModels.sources = {1: "mock-model"}
-    return [("powerlaw", "PhoIndex", object())]
+    fake = MagicMock()
+    fake.AllData.nSpectra = 1
+    fake.AllModels.sources = {1: "mock-model"}
+    with patch("bsixsa.solver.xspec", fake), patch("bsixsa.solver.AllModels", fake.AllModels):
+        yield [("powerlaw", "PhoIndex", object())]
 
 
 def test_solver_raises_when_output_dir_not_empty(dummy_prior_definition, tmp_path):

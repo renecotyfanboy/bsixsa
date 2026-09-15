@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Pydantic-backed configuration models for bsixsa backends."""
+
+from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
@@ -348,360 +348,109 @@ class Emcee(_OptimizerInitConfig):
             )
 
 
+
+class NDEConfig(BaseModel):
+    """Neural density estimator architecture (sbi posterior_nn)."""
+
+    model_config = MODEL_CONFIG
+    model: Literal["zuko_maf", "zuko_nsf", "maf", "nsf"] = "zuko_maf"
+    hidden_features: PositiveInt = 50
+    num_transforms: PositiveInt = 5
+    num_bins: PositiveInt = 5
+    z_score_theta: Literal["independent", "structured", "none"] = "independent"
+    z_score_x: Literal["independent", "structured", "none"] = "independent"
+
+
+class TrainingConfig(BaseModel):
+    """Per-member NPE training budget; the loss is plain maximum likelihood."""
+
+    model_config = MODEL_CONFIG
+    learning_rate: PositiveFloat = 1e-3
+    training_batch_size: PositiveInt = 1024
+    validation_fraction: Annotated[float, Field(gt=0, lt=1)] = 0.2
+    stop_after_epochs: PositiveInt = 10
+    max_num_epochs: PositiveInt = 25
+    clip_max_norm: PositiveFloat = 1.0
+
+
+class CompressorConfig(BaseModel):
+    """Cash-loss autoencoder, fitted before each round's NPE ensemble."""
+
+    model_config = MODEL_CONFIG
+    latent_dim: PositiveInt | None = None
+    hidden_dims: list[PositiveInt] | None = None
+    n_layers: PositiveInt = 3
+    epochs: PositiveInt = 1000
+    batch_size: PositiveInt | Literal["auto"] = 512
+    lr: PositiveFloat = 1e-3
+    patience: PositiveInt = 20
+    val_fraction: Annotated[float, Field(gt=0, lt=1)] = 0.2
+    norm: Literal["batch", "layer", "none"] = "batch"
+    dropout_rate: Annotated[float, Field(ge=0, lt=1)] = 0.0
+    warm_start: StrictBool = True
+    device: Literal["cpu", "cuda", "mps"] = "cpu"
+    torch_threads: PositiveInt = 1
+
+
 class SIXSA(BackendConfig):
-    """Configuration for the SIXSA simulation-based inference (SBI) backend.
+    """SIXSA v2: history matching, autoencoder and certified parallel NPEs.
 
-    SIXSA fits spectra with neural posterior estimation over sequential rounds.
-    It maintains a persistent training set ``T`` refined by a monotone
-    replace-worst nested move, trains an ensemble of NPE_C flows with the plain
-    maximum-likelihood loss, and gates convergence with defensive-mixture
-    importance sampling (``q_def = alpha*prior + (1-alpha)*q_flow``). The
-    headline posterior / khat / ESS / log_Z come from a banked pooled
-    multiple-IS estimator, followed by an optional emulator pass. Everything
-    runs in the unit-Gaussian latent ``N(0, I)``; log-uniform parameters are a
-    per-parameter `loguniform` prior-object choice, mapped to physical space by
-    ``solver.prior.from_unit_gaussian``. See the
-    [SBI-with-NPE paper series](https://ui.adsabs.harvard.edu/abs/2025A%26A...699A.179D/abstract)
-    for the underlying methodology.
-
-    Implements the SIXSA specification (code version 1.11.1). Budgets scale
-    with the number of free parameters ``d``.
+    The Solver enables history matching by default. Certification and final
+    importance sampling always target its full base prior. Only one spectrum,
+    C-stat, no background and finite independent priors are supported.
+    Old ensemble/buffer/emulator configuration fields are intentionally rejected.
     """
 
     backend_name: ClassVar[str] = "sixsa"
-
-    # ----- budgets (per free parameter, scaled by d at run time) -----
-    n_initial_per_param: PositiveInt = Field(
-        default=5_000,
-        description=(
-            "Round-1 training-set size is `n_initial_per_param * d` LHS/QMC draws "
-            "from the prior box (simulated exactly). Spec production default: 5000."
-        ),
-    )
-    n_picked_per_param: PositiveInt = Field(
-        default=2_500,
-        description=(
-            "Per-round batch base is `n_batch or n_picked_per_param * d`. Spec "
-            "production default: 2500."
-        ),
-    )
-    n_batch: PositiveInt | None = Field(
-        default=None,
-        description="Absolute override for the per-round batch base `n_batch_base`.",
-    )
-    n_sub_batch: PositiveInt | None = Field(
-        default=None,
-        description=(
-            "Per-NDE sub-batch size. `None` -> `ceil(n_batch_base / n_ensemble)`. "
-            "Each ensemble member draws `n_sub * ramp(r)` flat samples from its "
-            "truncated proposal and replace-worst-merges them into `T`."
-        ),
-    )
-    n_ensemble: PositiveInt = Field(
-        default=10,
-        description=(
-            "Number of NPE_C members trained per round (spec production: 10; "
-            "5 in experiments)."
-        ),
-    )
-    n_rounds: PositiveInt = Field(
-        default=10,
-        description="Maximum number of sequential inference rounds.",
-    )
-    n_simulate_ramp: float = Field(
-        default=1.0,
-        ge=1.0,
-        description=(
-            "Geometric ramp base on the per-round sub-batch size: "
-            "`ramp(r) = min(n_simulate_ramp**(r-1), n_simulate_ramp_max)`. "
-            "1.0 keeps the sub-batch constant across rounds."
-        ),
-    )
-    n_simulate_ramp_max: PositiveFloat | None = Field(
-        default=4.0,
-        description="Cap on `ramp(r)`. `None` leaves the ramp uncapped.",
-    )
-
-    # ----- end-of-round training-set update -----
-    merge_mode: Literal["merge", "fresh"] = Field(
-        default="merge",
-        description=(
-            "Between-round update of `T`. 'merge' (default): draw "
-            "`n_sub * ramp(r+1)` flat samples from the ensemble truncated "
-            "proposal and replace-worst-merge them into `T` (size held). 'fresh': "
-            "replace `T` wholesale with `n_batch_base * ramp(r+1)` fresh draws."
-        ),
-    )
-    n_train_keep: PositiveInt | None = Field(
-        default=None,
-        description=(
-            "Held size of the training buffer `T`. `None` -> `n_initial_per_param "
-            "* d` (the round-1 size)."
-        ),
-    )
-    last_member_sub_batch: StrictBool = Field(
-        default=False,
-        description=(
-            "If True, the last ensemble member also performs a sub-batch "
-            "replace-worst move (by default only members `1..n_ensemble-1` do)."
-        ),
-    )
-
-    # ----- truncated proposal (region construction + flat sampling) -----
-    first_round_sampling: Literal["qmc", "lhs", "prior"] = Field(
-        default="qmc",
-        description=(
-            "Round-1 design in the unit-Gaussian latent N(0, I): 'qmc' draws a "
-            "Sobol-based quasi-Monte-Carlo design for even coverage; 'lhs' draws a "
-            "Latin-hypercube design pushed through the normal quantile function "
-            "(matching `_sixsa_dev`'s box LHS); 'prior' draws i.i.d. N(0, I)."
-        ),
-    )
-    truncated_quantile: PositiveFloat = Field(
-        default=1e-3,
-        description=(
-            "Density quantile of the flow over its own draws used to threshold "
-            "the highest-density region for the restricted proposal (spec: 1e-3)."
-        ),
-    )
-    truncated_num_samples_to_estimate_support: PositiveInt = Field(
-        default=10_000,
-        description="Number of samples used to estimate the restricted-proposal support.",
-    )
-    truncated_oversampling_factor: PositiveInt = Field(
-        default=2,
-        description=(
-            "SIR candidates per accepted sample for the restricted proposal "
-            "(spec value: 2). CAVEAT -- currently INERT: `RestrictedPrior.sample` "
-            "accepts `oversampling_factor` but forwards it into "
-            "`sampling_importance_resampling`, which never reads it (it is "
-            "absorbed by `**kwargs`); the effective candidate count is sbi's "
-            "hardcoded `num_candidate_samples=32`. Verified in sbi 0.25.0 and "
-            "0.26.1. Since 32 > 2, SIR is *more* thorough than configured (only "
-            "slower, not less correct), so the value is kept for spec parity. "
-            "Passing `num_candidate_samples` instead is not possible: "
-            "`RestrictedPrior.sample` has no such parameter and no `**kwargs`."
-        ),
-    )
-    truncated_restrict_from_prior: StrictBool = Field(
-        default=True,
-        description=(
-            "Restrict the CLEAN prior each round (no stacking): an early "
-            "over-restriction never persists. False restricts the previous "
-            "proposal (legacy stacking)."
-        ),
-    )
-    truncated_max_sampling_batch_size: PositiveInt = Field(
-        default=1_000,
-        description=(
-            "Batch size for SIR sampling, forwarded to "
-            "`RestrictedPrior.sample(max_sampling_batch_size=...)`. Purely a "
-            "performance/memory knob; does not change the sampled distribution."
-        ),
-    )
-
-    # ----- convergence gates / checks (defensive IS) -----
-    khat_from_round: PositiveInt = Field(
-        default=3,
-        description=(
-            "Per-member CHECKs and the ROUND GATE only run from this round on "
-            "(earlier rounds are too under-trained to gate on)."
-        ),
-    )
-    khat_threshold: float | None = Field(
-        default=0.7,
-        description=(
-            "PSIS k-hat PASS threshold for checks/gates (the standard reliability "
-            "limit). `None` disables the k-hat gate."
-        ),
-    )
-    early_member_n: PositiveInt = Field(
-        default=2_500,
-        description="Defensive-IS draws for a per-member CHECK.",
-    )
-    early_member_min_eff: float = Field(
-        default=1.0,
-        ge=0.0,
-        description="Minimum IS efficiency (percent) for a CHECK/GATE to PASS.",
-    )
-    gate_n: PositiveInt = Field(
-        default=10_000,
-        description="Defensive-IS draws for the FINAL GATE (full ensemble).",
-    )
-    round_gate_n: PositiveInt | None = Field(
-        default=None,
-        description="Defensive-IS draws for the per-round ROUND GATE. `None` -> `gate_n`.",
-    )
-    gate_alpha: float = Field(
-        default=0.05,
-        gt=0.0,
-        lt=1.0,
-        description=(
-            "Defensive prior-floor weight alpha in `q_def = alpha*prior + "
-            "(1-alpha)*q_flow`. Bounds the IS weights by `L/alpha` -> finite "
-            "variance by construction."
-        ),
-    )
-    confirm_exit: StrictBool = Field(
-        default=True,
-        description=(
-            "On the first passing CHECK (and if not the last member), train the "
-            "next member and run its check purely as confirmation (recorded, not "
-            "deciding), then exit."
-        ),
-    )
-    member_selection: Literal["report", "apply"] = Field(
-        default="apply",
-        description=(
-            "GATE behaviour. 'apply' promotes the best-scoring self-consistent "
-            "banked variant as the returned weighting; 'report' only logs. "
-            "Per-member CHECKs always use 'report'."
-        ),
-    )
-    ess_mode: Literal["off", "floor"] = Field(
-        default="off",
-        description=(
-            "If 'floor' (and `ess_target` set), a PASS additionally requires the "
-            "pooled ESS to reach `ess_target`."
-        ),
-    )
-    ess_target: PositiveFloat | None = Field(
-        default=None,
-        description="Pooled-ESS floor used when `ess_mode='floor'`.",
-    )
-
-    # ----- networks / training -----
-    embedding: Any = Field(
-        default=None,
-        description=(
-            "Diagnostic-only numpy pre-processor embedding, or `None` for the "
-            "identity embedding. Its output never feeds the NPE."
-        ),
-    )
-    embedding_net: Any = Field(
-        default=None,
-        description=(
-            "Embedding network trained jointly with the NPE via sbi's "
-            "`embedding_net`. `None` uses the default `FCEmbeddingNet()` "
-            "(an `FCEmbeddingAPD` linear pyramid compressing to `output_dim=32`)."
-        ),
-    )
-    training_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Keyword arguments forwarded to NPE_C `train`. `None` uses the spec "
-            "defaults (plain MLE loss via `force_first_round_loss=True`, "
-            "`use_combined_loss=False`, fresh weights per member, batch 512, "
-            "lr 1e-3, val fraction 0.2, patience 10, clip 1.0)."
-        ),
-    )
-    nde_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Keyword arguments forwarded to sbi's `posterior_nn`. User keys are "
-            "MERGED over the reference defaults (MAF, `hidden_features=100`, "
-            "`num_transforms=10`, independent z-scoring of theta and x)."
-        ),
-    )
-    max_num_epochs: PositiveInt = Field(
-        default=100,
-        description=(
-            "Maximum training epochs per NDE (spec production: 100). An explicit "
-            "`max_num_epochs` inside `training_kwargs` takes precedence."
-        ),
-    )
-    device: str = Field(
-        default="cpu",
-        description="Torch device used for the flows and the restricted proposal.",
-    )
-
-    # ----- emulator pass (spec section 10) -----
-    run_emulator_pass: StrictBool = Field(
-        default=True,
-        description=(
-            "After the loop, draw true surrogate samples from the best ensemble, "
-            "simulate them exactly, and run a plain flow-IS pass (no defensive "
-            "floor). Returns weighted samples and extends the (theta, cstat) pool."
-        ),
-    )
-    emulator_min_per_param: PositiveInt = Field(
-        default=5_000,
-        description="Surrogate draws for the emulator pass = `emulator_min_per_param * d`.",
-    )
-    train_likelihood_emulator: StrictBool = Field(
-        default=False,
-        description=(
-            "Train a PyTorch MLP likelihood emulator (`theta_log -> -0.5*cstat`) "
-            "on the emulator-pass samples only. Uses a pure-torch training loop "
-            "(no tensorflow); `pytorch-lightning` is used only if installed and "
-            "requested via `emulator_kwargs['use_lightning']`."
-        ),
-    )
-    emulator_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Likelihood-emulator hyperparameters: `hidden_units`, "
-            "`theta_scaler_type`, `cstat_scaler_type`, `percentage_to_remove`, "
-            "`num_epochs`, `learning_rate`, `patience`, `batch_size`, "
-            "`use_lightning`."
-        ),
-    )
-
-    # ----- diagnostics / output -----
-    plot_diagnostics: StrictBool = Field(
-        default=True,
-        description=(
-            "Write SIXSA diagnostic plots: a per-round coverage band and an "
-            "ensemble-posterior corner under each `round_<n>/` directory, plus a "
-            "`training_history.pdf` summary at the end of the run."
-        ),
-    )
-    ensemble_corner_samples: PositiveInt = Field(
-        default=2_000,
-        description=(
-            "Samples drawn from each NDE posterior when building the per-round "
-            "ensemble-posterior corner plot."
-        ),
-    )
-    num_posterior_samples: PositiveInt = Field(
-        default=10_000,
-        description="Number of posterior samples drawn into the returned results.",
-    )
-    posterior_source: Literal["pool", "best_flow", "emulator_pass"] = Field(
-        default="pool",
-        description=(
-            "Where the returned posterior samples come from -- a trade-off "
-            "between statistical exactness and sample diversity. "
-            "'pool' (default): multinomial resample of the banked pooled "
-            "multiple-IS draws. The most exact (exact-likelihood IS with the "
-            "defensive prior floor), but the number of DISTINCT rows is capped "
-            "by the banked draws and their pooled ESS, so a large "
-            "`num_posterior_samples` repeats rows. "
-            "'emulator_pass': resample the emulator pass's flow-IS weighted "
-            "draws -- fresh surrogate samples from the best flow, still "
-            "importance-corrected, usually far more distinct rows (requires "
-            "`run_emulator_pass=True`). "
-            "'best_flow': draw FRESH from the best flow -- maximum diversity "
-            "and no duplicates, but NOT importance-corrected, i.e. the flow's "
-            "own approximation of the posterior. "
-            "Each choice falls back to the next available source, so a run "
-            "always returns a posterior. The reported `log_Z` always comes "
-            "from the banked pool regardless of this setting."
-        ),
-    )
+    restriction_mode: ClassVar[Literal["box", "region"]] = "region"
+    restrict_prior_default: ClassVar[bool] = True
+    n_nde: PositiveInt = 5
+    n_rounds: PositiveInt = 20
+    khat_threshold: Annotated[float, Field(ge=0, le=1)] = 0.7
+    khat_safe: Annotated[float, Field(gt=0, le=1)] = 0.5
+    screen_tolerance: Annotated[float, Field(ge=0)] = 0.05
+    min_efficiency: Annotated[float, Field(ge=0, le=100)] = 5.0
+    check_draws: Annotated[int, Field(strict=True, ge=100)] = 1000
+    screen_members: StrictBool = True
+    truncated_quantile: Annotated[float, Field(gt=0, lt=1)] = 1e-3
+    truncated_support_draws: Annotated[int, Field(strict=True, ge=100)] = 10_000
+    truncated_sampling: Literal["sir", "auto", "ellipsoid", "flow"] = "sir"
+    truncated_max_candidates: PositiveInt = 20_000_000
+    train_ramp: Annotated[float, Field(ge=1)] = 1.25
+    train_max: PositiveInt = 50_000
+    n_training: Annotated[int, Field(strict=True, ge=20)] | None = None
+    training_set_base: PositiveFloat = 2000.0
+    training_set_min_per_param: PositiveInt = 750
+    refresh_compressor: StrictBool | Annotated[int, Field(strict=True, ge=0)] = True
+    nde: NDEConfig = Field(default_factory=NDEConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    compressor: CompressorConfig = Field(default_factory=CompressorConfig)
+    target_ess: PositiveFloat = 2000.0
+    num_posterior_samples: PositiveInt = 10_000
+    max_sampling_draws: PositiveInt = 200_000
+    fold_chunk: PositiveInt = 10_000
+    training_n_jobs: PositiveInt | None = None
+    threads_per_member: PositiveInt = 1
+    seed: Annotated[int, Field(strict=True, ge=0)] | None = None
+    plot_diagnostics: StrictBool = True
 
     @model_validator(mode="after")
-    def _validate_gates(self):
-        if self.ess_mode == "floor" and self.ess_target is None:
-            raise ValueError(
-                "`ess_target` must be set when `ess_mode='floor'`."
-            )
-        if (
-            self.n_simulate_ramp_max is not None
-            and self.n_simulate_ramp_max < 1.0
-        ):
-            raise ValueError("`n_simulate_ramp_max` must be >= 1.0.")
+    def _validate_budgets(self):
+        if self.n_training is not None and self.n_training > self.train_max:
+            raise ValueError("n_training must not exceed train_max.")
         return self
+
+    def validate_for_solver(self, solver: "Solver") -> None:
+        from ..priors import validate_finite_support
+
+        validate_finite_support(solver.base_prior)
+        constraints = solver._xspec_constraints()
+        if constraints["n_spectra"] != 1:
+            raise ValueError("SIXSA requires exactly one spectrum.")
+        if constraints["has_background"]:
+            raise ValueError("SIXSA does not support a loaded background.")
+        if constraints["stat_method"] != "cstat":
+            raise ValueError("SIXSA requires statMethod='cstat'.")
 
 
 Backend = (

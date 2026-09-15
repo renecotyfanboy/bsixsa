@@ -95,7 +95,7 @@ def _lazy_import(name: str) -> None:
         "nautilus": ".nautilus",
         "ultranest": ".ultranest",
         "levenberg_marquardt": ".levenberg_marquart",
-        "sixsa": ".sixsa",
+        "sixsa": ".sixsa._sixsa",
         "cmaes": ".cmaes",
         "iminuit": ".iminuit",
         "emcee": ".emcee"

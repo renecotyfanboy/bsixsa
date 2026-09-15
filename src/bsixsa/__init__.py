@@ -8,6 +8,7 @@ from .backend import (
     SIXSA,
     Ultranest,
 )
+from .backend.config import CompressorConfig, NDEConfig, TrainingConfig
 from .exceptions import BoxEdgeWarning, FoldError, TruncationBudgetError
 from .solver import FitResults, Solver
 
@@ -18,6 +19,9 @@ SIXSASolver = Solver
 
 __all__ = [
     "BoxEdgeWarning",
+    "CompressorConfig",
+    "NDEConfig",
+    "TrainingConfig",
     "Emcee",
     "FitResults",
     "FoldError",

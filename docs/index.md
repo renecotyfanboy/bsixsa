@@ -43,6 +43,18 @@ If you require to work with the most recent version, install it directly from th
 uv pip install git+https://github.com/renecotyfanboy/bsixsa
 ```
 
+## SIXSA v2
+
+The SIXSA backend targets SBI 0.27. It combines shared Solver-level history
+matching, a Cash-loss autoencoder and parallel NPE training with exact
+importance-sampling diagnostics. See the [usage and migration guide](reference/backend.md).
+
+Before fitting with any backend, set `xspec.Fit.bayes = "off"`; bsixsa handles
+priors itself and rejects a session that would count them twice.
+
+SIXSA requires one spectrum, C-stat, no loaded background and finite independent
+priors. History matching is optional for other samplers.
+
 ## Current limitations
 
 While we do not explicitly support multi-observation fitting and background, solvers using only the likelihood should work correctly. 

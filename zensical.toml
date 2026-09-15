@@ -57,7 +57,9 @@ nav = [
     { "Reference" = [
         {"Solver" = "reference/solver.md"},
         {"Priors" = "reference/priors.md"},
+        {"History matching" = "reference/restriction.md"},
         {"Backend" = "reference/backend.md"},
+        {"SIXSA validation" = "reference/sixsa-validation.md"},
         {"Plotter" = "reference/plotter.md"},
         {"XSPEC" = "reference/xspec.md"},
     ]},
