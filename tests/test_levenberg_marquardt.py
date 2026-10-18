@@ -548,7 +548,6 @@ def test_reparametrised_fit_leaves_the_prior_median(tmp_path):
             Spectrum(d=2),
             backend=LevenbergMarquardt(trace=False, reparametrise=reparametrise),
             outputfiles_basename=tmp_path / f"reparametrise_{reparametrise}",
-            restrict_prior=False,
         )
         fits[reparametrise] = solver.run()
 
@@ -603,7 +602,6 @@ def test_likelihood_evaluations_are_counted_without_trace(tmp_path):
         AnalyticSpectrum(d=2),
         backend=LevenbergMarquardt(trace=False),
         outputfiles_basename=tmp_path / "run",
-        restrict_prior=False,
     )
     result = solver.run()
 

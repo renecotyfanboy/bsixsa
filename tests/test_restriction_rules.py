@@ -13,7 +13,6 @@ sys.modules.setdefault("xspec", MagicMock())
 from scipy.stats import chi2
 
 from bsixsa.restriction.rules import (
-    pad_box,
     posterior_span,
     recall_check,
     stop_reason,
@@ -344,38 +343,3 @@ def test_stop_reason_n_waves():
     assert _stop(wave=5) == "n_waves"
     assert _stop(wave=4) is None
 
-
-# ------------------------------------------------------------ pad_box
-
-
-def test_pad_box_uses_the_fractional_padding_when_the_surrogate_is_accurate():
-    lo, hi = pad_box([0.4, 0.2], [0.6, 0.3], box_padding=0.1, rmse_cstat=0.0, delta=10.0)
-    np.testing.assert_allclose(lo, [0.38, 0.19])
-    np.testing.assert_allclose(hi, [0.62, 0.31])
-
-
-def test_pad_box_floor_from_the_surrogate_error():
-    # 3 * rmse / (2 * delta) = 3 * 4 / 20 = 0.6 -> pad = 0.6 * w / 2 = 0.3 w > 0.1 w
-    lo, hi = pad_box([0.4], [0.6], box_padding=0.1, rmse_cstat=4.0, delta=10.0)
-    np.testing.assert_allclose(lo, [0.34])
-    np.testing.assert_allclose(hi, [0.66])
-
-
-def test_pad_box_clips_to_the_cube():
-    lo, hi = pad_box([0.01, 0.2], [0.5, 0.99], box_padding=0.5, rmse_cstat=0.0, delta=1.0)
-    np.testing.assert_allclose(lo, [0.0, 0.0])
-    np.testing.assert_allclose(hi, [0.745, 1.0])
-    assert lo.dtype == np.float64 and hi.dtype == np.float64
-
-
-def test_pad_box_survives_a_zero_delta():
-    lo, hi = pad_box([0.4], [0.6], box_padding=0.1, rmse_cstat=1.0, delta=0.0)
-    np.testing.assert_array_equal(lo, [0.0])
-    np.testing.assert_array_equal(hi, [1.0])
-
-
-def test_pad_box_refuses_inverted_or_mismatched_corners():
-    with pytest.raises(ValueError):
-        pad_box([0.6], [0.4], box_padding=0.1, rmse_cstat=0.0, delta=1.0)
-    with pytest.raises(ValueError):
-        pad_box([0.1, 0.2], [0.4], box_padding=0.1, rmse_cstat=0.0, delta=1.0)

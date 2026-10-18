@@ -17,7 +17,6 @@ import bsixsa.solver as solver_module
 import bsixsa.xspec as xspec_module
 from bsixsa.backend.config import BackendConfig, Nessai
 from bsixsa.priors import MultipleIndependent, loguniform, uniform
-from bsixsa.restriction import HistoryMatching
 from bsixsa.solver import Solver
 
 
@@ -36,7 +35,7 @@ class _RecordingConfig(BackendConfig):
             "num_parameters": solver.num_parameters,
             "fold_counts": solver.fold_counts,
             "has_pool_attr": hasattr(solver, "pool"),
-            "prior_is_base": solver.prior is solver.base_prior,
+            "has_prior": hasattr(solver, "prior"),
         }
 
 
@@ -69,7 +68,7 @@ def _bare_solver():
 
 
 def test_analytic_solver_builds(tmp_path):
-    solver = _make_solver(tmp_path, restrict_prior=True)
+    solver = _make_solver(tmp_path)
 
     assert solver.num_parameters == 2
     assert solver.parameter_names == ["Gamma", "norm"]
@@ -77,12 +76,8 @@ def test_analytic_solver_builds(tmp_path):
     assert solver.model_names == ["analytic"] * 2 and solver.model_indexes is solver.model_names
     assert solver.n_bins == 64
     assert solver.backend_name == "dummy"
-    assert solver.base_prior is solver.prior
     assert solver.distributions == {"prior": solver.prior}
     assert solver.fold_counts == {}
-    assert solver.restriction is None
-    # `True` resolves to a default history-matching configuration.
-    assert solver.restriction_config == HistoryMatching()
     assert solver.fit_result is None and solver.posterior_samples is None
     assert solver.pool is None and solver._pool_depth == 0
     assert solver._n_jobs == 1
@@ -102,13 +97,12 @@ def test_setup_validates_backend_after_full_initialisation(tmp_path):
         "num_parameters": 2,
         "fold_counts": {},
         "has_pool_attr": True,
-        "prior_is_base": True,
+        "has_prior": True,
     }
 
 
 def test_setup_initialises_every_attribute_without_xspec(tmp_path):
     prior = MultipleIndependent([uniform(0.0, 1.0), uniform(1.0, 2.0)])
-    sentinel = HistoryMatching(n_waves=2)
     solver = _bare_solver()
 
     solver._setup(
@@ -120,12 +114,11 @@ def test_setup_initialises_every_attribute_without_xspec(tmp_path):
         overwrite=False,
         n_jobs=None,
         backend=_config(),
-        restrict_prior=sentinel,
     )
 
     from bsixsa.convenience import available_cpu_count
 
-    assert solver.base_prior is prior and solver.prior is prior
+    assert solver.prior is prior
     assert solver.distributions == {"prior": prior}
     assert solver.parameter_indices == [1, 2] and solver.model_names == ["m", "m"]
     assert solver.parameter_names == ["a", "b"]
@@ -134,7 +127,6 @@ def test_setup_initialises_every_attribute_without_xspec(tmp_path):
     assert solver._n_jobs == available_cpu_count()
     assert solver._fold_phase_name == "backend"
     assert solver.fold_counts == {}
-    assert solver.restriction_config is sentinel and solver.restriction is None
     assert (tmp_path / "pure").is_dir()
 
 
@@ -311,7 +303,7 @@ def test_log_prob_fn_combines_likelihood_and_prior(tmp_path):
     np.testing.assert_array_equal(solver.log_likelihood_fn(theta), -0.5 * solver.spectrum.cstat(theta))
 
 
-def test_log_prior_fn_reads_working_prior(tmp_path):
+def test_log_prior_fn_reads_the_prior_attribute(tmp_path):
     solver = _make_solver(tmp_path)
     theta = np.array([[1.5, 1.0], [1.9, 0.5]])
     narrower = MultipleIndependent([uniform(1.0, 2.0), loguniform(0.2, 5.0)])
@@ -320,7 +312,6 @@ def test_log_prior_fn_reads_working_prior(tmp_path):
 
     np.testing.assert_allclose(solver.log_prior_fn(theta, None), narrower.log_prob(theta))
     assert not np.allclose(solver.log_prior_fn(theta, None), solver.distributions["prior"].log_prob(theta))
-    assert solver.distributions["prior"] is solver.base_prior
 
 
 # ---------------------------------------------------------------------------
@@ -490,11 +481,8 @@ def test_constructor_checks_the_output_directory_before_build_prior(tmp_path, lo
             Solver([], outputfiles_basename=str(busy), backend=_config())
         with pytest.raises(ValueError, match="not a directory"):
             Solver([], outputfiles_basename=str(not_a_dir), backend=_config())
-        with pytest.raises(TypeError, match="restrict_prior"):
-            Solver([], outputfiles_basename=str(tmp_path / "new"), backend=_config(), restrict_prior="yes")
     build_prior.assert_not_called()
     assert (busy / "file.txt").exists()
-    assert not (tmp_path / "new").exists()
 
 
 def test_parameter_names_are_read_once_at_construction(tmp_path, loaded_fake_xspec):
@@ -539,31 +527,6 @@ def test_constructor_explains_an_empty_xspec_session(tmp_path, loaded_fake_xspec
 
     with pytest.raises(ValueError, match=message):
         Solver([], outputfiles_basename=str(tmp_path / "run"), backend=_config())
-
-
-@pytest.mark.parametrize("value", ["yes", 1, 0, 0.5, [True], {"n": 1}, np.float64(1.0)])
-def test_restrict_prior_rejects_plain_values_before_touching_the_directory(tmp_path, value):
-    target = tmp_path / "out"
-    target.mkdir()
-    (target / "keep.txt").write_text("x")
-
-    with pytest.raises(TypeError, match="restrict_prior"):
-        _make_solver(tmp_path, overwrite=True, restrict_prior=value)
-    assert (target / "keep.txt").exists()
-
-
-@pytest.mark.parametrize(("value", "restricted"), [(None, False), (True, True), (False, False), (np.True_, True)])
-def test_restrict_prior_accepts_none_and_bools(tmp_path, value, restricted):
-    solver = _make_solver(tmp_path, restrict_prior=value)
-
-    assert solver.restriction is None
-    assert solver.restriction_config == (HistoryMatching() if restricted else None)
-
-
-def test_restrict_prior_accepts_configuration_objects(tmp_path):
-    config = HistoryMatching(n_waves=2)
-    solver = _make_solver(tmp_path, restrict_prior=config)
-    assert solver.restriction_config is config
 
 
 # ---------------------------------------------------------------------------

@@ -18,8 +18,6 @@ import pytest
 sys.modules.setdefault("xspec", MagicMock())
 torch = pytest.importorskip("torch")
 
-from scipy.stats import chi2
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _analytic import QuadCstat  # noqa: E402
@@ -66,8 +64,6 @@ def _small_config(**overrides) -> HistoryMatching:
         hidden=32,
         blocks=2,
         mass_probe=20_000,
-        box_samples=5_000,
-        plot=False,
     )
     kwargs.update(overrides)
     return HistoryMatching(**kwargs)
@@ -333,48 +329,25 @@ def test_later_waves_are_drawn_inside_the_previous_region(run):
         assert row["purity"] == pytest.approx(np.mean(run.cstat[run.wave == w] <= prev_thr))
 
 
-def test_box_contains_the_posterior_level_set(run, quad):
-    lo, hi = run.box()
-    draws = quad.posterior_sample(50_000, rng=np.random.default_rng(2))
-    level = quad.cstat(draws) <= quad.c0 + chi2.ppf(0.999, 2)
-    inner = draws[level]
-    assert np.all(inner >= lo) and np.all(inner <= hi)
-    assert run.box_info["sampling"] == "ok"
-    assert np.all((lo >= 0.0) & (hi <= 1.0) & (hi > lo))
-
-
 def test_run_is_deterministic_given_the_seed(run, quad):
     again = run_history_matching(quad.cstat, 2, _small_config(seed=2026))
     assert again.threshold == run.threshold
     np.testing.assert_array_equal(again.u, run.u)
     np.testing.assert_array_equal(again.cstat, run.cstat)
-    np.testing.assert_array_equal(again.box()[0], run.box()[0])
     assert [row["wall"] for row in again.history] == [row["wall"] for row in run.history]
 
 
-def test_plots_are_written_per_wave(quad, tmp_path):
+def test_one_log_line_per_wave_and_the_parameter_names_are_kept(quad):
     lines: list[str] = []
     res = run_history_matching(
         quad.cstat,
         2,
-        _small_config(n_waves=2, plot=True, seed=5),
-        outdir=str(tmp_path),
+        _small_config(n_waves=2, seed=5),
         param_names=["nH", "norm"],
         log=lines.append,
     )
-    for w in range(1, len(res.history) + 1):
-        path = tmp_path / f"restriction_wave_{w}.pdf"
-        assert path.is_file() and path.stat().st_size > 1000
-    assert not any("failed" in line for line in lines)
     assert sum(line.startswith(f"[restriction] wave {w}/") for w in (1, 2) for line in lines) == len(res.history)
     assert res.param_names == ["nH", "norm"]
-
-
-def test_no_plots_when_plot_is_disabled(quad, tmp_path):
-    run_history_matching(
-        quad.cstat, 2, _small_config(n_waves=1, seed=1), outdir=str(tmp_path)
-    )
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_infinite_cstat_is_a_valid_zero_likelihood(quad):
@@ -399,7 +372,7 @@ def test_a_first_wave_without_two_finite_cstat_values_is_explained(bad_value):
 
     with pytest.raises(ValueError, match="first wave") as err:
         run_history_matching(simulate, 2, _small_config(n_waves=1, seed=0))
-    assert "only 1 of 300 folds" in str(err.value) and "restrict_prior=False" in str(err.value)
+    assert "only 1 of 300 folds" in str(err.value) and "history_matching=None" in str(err.value)
 
 
 def test_argument_validation(quad):

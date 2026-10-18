@@ -1,9 +1,9 @@
 """A mini SIXSA round wired by hand from the modules, on the analytic 64-channel spectrum (d = 2).
 
 Latin-hypercube harvest through `Solver.simulate`, compressor, two flows,
-screen with the pooled mixture, ranking, gate certificate on fresh draws, SIR
-training draws inside the winner's highest-density region, a warm compressor
-refit, a second round, and the final importance sample checked against grid
+gate certificate of their equal-weight mixture, SIR training draws inside the
+mixture's highest-density region, a warm compressor refit, a second round,
+ranking of the gates, and the final importance sample checked against grid
 quadrature. It runs once per module (a few seconds) and several tests read its
 artefacts.
 """
@@ -38,12 +38,12 @@ CHECK_DRAWS = 1000
 N_MEMBERS = 2
 N_HARVEST = 1500
 N_TRUNCATED = 2000
-NDE = {"model": "zuko_maf", "hidden_features": 32, "num_transforms": 3}
-TRAINING = {"max_num_epochs": 20, "training_batch_size": 256, "stop_after_epochs": 5}
+FLOW = {"hidden_features": 32, "num_transforms": 3, "max_num_epochs": 20, "training_batch_size": 256,
+        "stop_after_epochs": 5}
 
 
 def _round(state, r: int, u: np.ndarray, counts: np.ndarray, workdir) -> SimpleNamespace:
-    """Encode, train the members, screen with the pooled mixture, rank, gate."""
+    """Encode, train the members, and certify their equal-weight mixture."""
     solver, comp, rng = state.solver, state.compressor, state.rng
     generation = comp.generation
     z_train = comp.encode(counts)
@@ -51,24 +51,18 @@ def _round(state, r: int, u: np.ndarray, counts: np.ndarray, workdir) -> SimpleN
 
     flows, infos = [], []
     for k in range(N_MEMBERS):
-        estimator, info = train_flow(u, z_train, nde=NDE, training=TRAINING, seed=int(rng.integers(2**31)),
+        estimator, info = train_flow(u, z_train, **FLOW, seed=int(rng.integers(2**31)),
                                      log_dir=workdir / f"round_{r}" / f"member_{k}")
         flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
         infos.append(info)
     mixture = MixtureProposal(flows, name=f"round{r}/mixture")
 
-    before = solver.fold_counts.get("screen", 0)
-    with solver.fold_phase("screen"):
-        screens = certify(flows, CHECK_DRAWS, state.cstat, rng=rng, round_index=r, mixture=mixture, **GATE)
-    screen_folds = solver.fold_counts["screen"] - before
-    selected = rank(screens)
     before = solver.fold_counts.get("gate", 0)
     with solver.fold_phase("gate"):
-        gate = certify([screens[selected].proposal], CHECK_DRAWS, state.cstat, rng=rng, round_index=r, **GATE)[0]
+        gate = certify(mixture, CHECK_DRAWS, state.cstat, rng=rng, round_index=r, **GATE)
     gate_folds = solver.fold_counts["gate"] - before
     return SimpleNamespace(z_train=z_train, z_obs=z_obs, generation=generation, infos=infos, flows=flows,
-                           mixture=mixture, screens=screens, screen_folds=screen_folds, selected=selected,
-                           gate=gate, gate_folds=gate_folds)
+                           mixture=mixture, gate=gate, gate_folds=gate_folds)
 
 
 def run_mini_round(seed: int, workdir) -> SimpleNamespace:
@@ -99,9 +93,8 @@ def run_mini_round(seed: int, workdir) -> SimpleNamespace:
     state.compressor.fit(state.counts_harvest)
 
     state.round0 = _round(state, 0, state.u_harvest, state.counts_harvest, workdir)
-    state.winner0 = state.round0.screens[state.round0.selected].proposal
     state.u_train1, state.info_truncation = sample_truncated(
-        state.winner0, n=N_TRUNCATED, quantile=1e-3, n_support=10_000, oversampling=16, rng=rng,
+        state.round0.mixture, n=N_TRUNCATED, quantile=1e-3, n_support=10_000, oversampling=16, rng=rng,
     )
     with solver.fold_phase("training"):
         _, state.counts_train1 = training_data(state.u_train1)
@@ -147,16 +140,10 @@ def test_members_are_real_flows_logged_per_round(mini_round):
                        for p in (mini_round.workdir / f"round_{r}" / f"member_{k}").iterdir())
 
 
-def test_screen_pools_member_draws_into_the_mixture_without_extra_folds(mini_round):
+def test_gate_certifies_the_mixture_of_the_members(mini_round):
     for rnd in (mini_round.round0, mini_round.round1):
-        *members, mix = rnd.screens
-        assert [c.proposal for c in members] == rnd.flows and mix.proposal is rnd.mixture
-        assert [c.n_raw for c in rnd.screens] == [CHECK_DRAWS, CHECK_DRAWS, N_MEMBERS * CHECK_DRAWS]
-        np.testing.assert_array_equal(mix.u, np.concatenate([c.u for c in members]))
-        np.testing.assert_array_equal(mix.cstat, np.concatenate([c.cstat for c in members]))
-        assert rnd.screen_folds == sum(c.n_in for c in members) == mix.n_in
+        assert rnd.gate.proposal is rnd.mixture
         assert rnd.gate_folds == rnd.gate.n_in and rnd.gate.n_raw == CHECK_DRAWS
-        assert rnd.gate.proposal is rnd.screens[rnd.selected].proposal
         assert np.isfinite(rnd.gate.log_z) and np.isfinite(rnd.gate.log_z_err)
 
 
@@ -164,7 +151,7 @@ def test_truncated_draws_are_foldable_training_points(mini_round):
     state = mini_round
     u, info = state.u_train1, state.info_truncation
     assert u.shape == (N_TRUNCATED, 2) and u.dtype == np.float64 and np.all(in_cube(u))
-    assert np.all(state.winner0.log_prob_raw(u) > info["threshold"])
+    assert np.all(state.round0.mixture.log_prob_raw(u) > info["threshold"])
     assert info["n_candidates"] == 16 * N_TRUNCATED
     assert 0.0 < info["acceptance"] <= 1.0 and 1 < info["n_unique"] <= N_TRUNCATED
     assert state.solver.fold_counts["training"] == N_TRUNCATED
@@ -184,7 +171,7 @@ def test_final_sample_recovers_the_grid_truth(mini_round):
 
 def test_fold_accounting(mini_round):
     state = mini_round
-    expected = (N_HARVEST + sum(rnd.screen_folds + rnd.gate_folds for rnd in (state.round0, state.round1))
+    expected = (N_HARVEST + sum(rnd.gate_folds for rnd in (state.round0, state.round1))
                 + N_TRUNCATED + state.posterior.n_in)
     assert sum(state.solver.fold_counts.values()) == expected
-    assert set(state.solver.fold_counts) == {"harvest", "screen", "gate", "training", "sampling"}
+    assert set(state.solver.fold_counts) == {"harvest", "gate", "training", "sampling"}

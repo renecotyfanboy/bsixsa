@@ -25,10 +25,8 @@ from bsixsa.backend.sixsa.flows import FlowProposal, MixtureProposal, train_flow
 
 D = 2
 N_TRAIN = 1500
-# The full NDEConfig dict, num_bins included: sbi accepts it on an affine flow and ignores it.
-NDE = {"model": "zuko_maf", "hidden_features": 16, "num_transforms": 2, "num_bins": 5,
-       "z_score_theta": "independent", "z_score_x": "independent"}
-TRAINING = {"max_num_epochs": 5, "training_batch_size": 256}
+FLOW = {"hidden_features": 16, "num_transforms": 2, "training_batch_size": 256, "max_num_epochs": 5,
+        "stop_after_epochs": 10}
 
 
 def _dataset(n: int = N_TRAIN, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -55,7 +53,7 @@ def _grid_log_probs(estimator) -> np.ndarray:
 def trained(tmp_path_factory):
     theta, z = _dataset()
     log_dir = tmp_path_factory.mktemp("member") / "round_1" / "member_0"
-    estimator, info = train_flow(theta, z, nde=NDE, training=TRAINING, seed=3, log_dir=log_dir)
+    estimator, info = train_flow(theta, z, **FLOW, seed=3, log_dir=log_dir)
     return estimator, info, log_dir
 
 
@@ -80,8 +78,8 @@ def test_train_flow_returns_an_estimator_and_logs_to_tensorboard(trained):
 
 def test_train_flow_is_deterministic_in_its_seed(trained, tmp_path):
     theta, z = _dataset()
-    again, _ = train_flow(theta, z, nde=NDE, training=TRAINING, seed=3, log_dir=tmp_path / "again")
-    other, _ = train_flow(theta, z, nde=NDE, training=TRAINING, seed=4, log_dir=tmp_path / "other")
+    again, _ = train_flow(theta, z, **FLOW, seed=3, log_dir=tmp_path / "again")
+    other, _ = train_flow(theta, z, **FLOW, seed=4, log_dir=tmp_path / "other")
     np.testing.assert_array_equal(_grid_log_probs(trained[0]), _grid_log_probs(again))
     assert np.max(np.abs(_grid_log_probs(trained[0]) - _grid_log_probs(other))) > 1e-3
 

@@ -1,8 +1,5 @@
-"""Plotting functions to inspect spectra, models and predictive checks."""
+"""Predictive checks of the fitted spectra."""
 
-from .plotting import plot_data, plot_predictive_coverage
+from .plotting import plot_predictive_coverage
 
-__all__ = [
-    "plot_data",
-    "plot_predictive_coverage",
-]
+__all__ = ["plot_predictive_coverage"]

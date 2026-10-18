@@ -5,18 +5,13 @@ from __future__ import annotations
 import json
 import math
 import os
-import time
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NoReturn
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 from .._cube import in_cube
 from .config import HistoryMatching
-from .rules import pad_box
-
-if TYPE_CHECKING:
-    from ..priors import MultipleIndependent
 
 __all__ = ["Region", "Restriction"]
 
@@ -100,33 +95,12 @@ class Region:
         n = int(n)
         if n < 0:
             raise ValueError(f"sample expects n >= 0, got {n}.")
-        draws, drawn = self._sample_within(
-            n, rng, max_candidates=max_candidates, batch=batch, give_up_early=True
-        )
-        if len(draws) < n:
-            self._raise_budget(n, len(draws), drawn, int(max_candidates))
-        return draws
-
-    def _sample_within(
-        self,
-        n: int,
-        rng: np.random.Generator,
-        *,
-        max_candidates: int,
-        batch: int = _DEFAULT_BATCH,
-        give_up_early: bool = False,
-    ) -> tuple[np.ndarray, int]:
-        """Draw up to *n* region points within the candidate budget; return ``(draws, n_candidates)``.
-
-        A shortfall is not an error here. With *give_up_early*, stop as soon as
-        the observed acceptance shows the budget cannot fill *n* draws.
-        """
-        n, budget, batch = max(int(n), 0), max(int(max_candidates), 0), max(1, int(batch))
+        budget, batch = max(int(max_candidates), 0), max(1, int(batch))
         kept: list[np.ndarray] = []
         got = drawn = 0
         while got < n and drawn < budget:
-            if give_up_early and drawn > 0:
-                # Even an optimistic (about 5-sigma) acceptance cannot fill n draws.
+            if drawn > 0:
+                # Give up once even an optimistic (about 5-sigma) acceptance cannot fill n draws.
                 p_high = (got + 5.0 * math.sqrt(got + 1.0) + 5.0) / drawn
                 if drawn + (n - got) / p_high > budget:
                     break
@@ -136,19 +110,17 @@ class Region:
             accepted = candidates[self.accepts(candidates)][: n - got]
             kept.append(accepted)
             got += len(accepted)
-        draws = np.concatenate(kept, axis=0) if kept else np.empty((0, self.d), dtype=np.float64)
-        return draws, drawn
-
-    def _raise_budget(self, n: int, got: int, drawn: int, max_candidates: int) -> NoReturn:
-        rate = got / drawn if drawn else 0.0
-        need = f"about {n / rate:,.0f}" if rate > 0 else "an unknown number of"
-        raise RuntimeError(
-            f"Sampling {n:,} points from the region (threshold {self.threshold:.6g}) needs {need} "
-            f"uniform candidates, over the budget of {max_candidates:,}: {got:,} accepted from "
-            f"{drawn:,} candidates (acceptance {rate:.3g}). The region is too small for rejection "
-            "from the cube; widen it (larger HistoryMatching.target_spans) or raise "
-            "HistoryMatching.max_candidates."
-        )
+        if got < n:
+            rate = got / drawn if drawn else 0.0
+            need = f"about {n / rate:,.0f}" if rate > 0 else "an unknown number of"
+            raise RuntimeError(
+                f"Sampling {n:,} points from the region (threshold {self.threshold:.6g}) needs {need} "
+                f"uniform candidates, over the budget of {int(max_candidates):,}: {got:,} accepted from "
+                f"{drawn:,} candidates (acceptance {rate:.3g}). The region is too small for rejection "
+                "from the cube; widen it (larger HistoryMatching.target_spans) or raise "
+                "HistoryMatching.max_candidates."
+            )
+        return np.concatenate(kept, axis=0) if kept else np.empty((0, self.d), dtype=np.float64)
 
     def prior_mass(
         self,
@@ -250,9 +222,7 @@ class Restriction:
         n_simulations: Number of exact folds spent.
         seconds: Wall time of the run.
         config: Settings of the run.
-        param_names: Parameter names, for reports and plots.
-        box_info: Diagnostics of the bounding box, filled by
-            [`box`][bsixsa.restriction.region.Restriction.box].
+        param_names: Parameter names, for reports.
     """
 
     region: Region
@@ -270,10 +240,6 @@ class Restriction:
     seconds: float
     config: HistoryMatching
     param_names: list[str] | None = None
-    box_info: dict = field(default_factory=dict, init=False)
-    _box: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False)
-    _box_core: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False)
-    _truncated: dict = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self.u = np.asarray(self.u, dtype=np.float64)
@@ -297,114 +263,9 @@ class Restriction:
         """Dimension of the cube."""
         return int(self.u.shape[1])
 
-    @property
-    def _inside(self) -> np.ndarray:
-        return self.cstat <= self.threshold
-
-    @property
-    def u_in(self) -> np.ndarray:
-        """Folded points whose exact C-stat is at most the threshold, shape ``(n, d)``."""
-        return self.u[self._inside]
-
-    @property
-    def cstat_in(self) -> np.ndarray:
-        """Exact C-stat of [`u_in`][bsixsa.restriction.region.Restriction.u_in], shape ``(n,)``."""
-        return self.cstat[self._inside]
-
-    def _compute_box(self) -> None:
-        start = time.perf_counter()
-        cfg, d = self.config, self.d
-        u_in = self.u_in
-        folded_accepted = self.u[self.region.accepts(self.u)]
-        info: dict[str, Any] = {
-            "n_exact_inside": len(u_in),
-            "n_folded_accepted": len(folded_accepted),
-            "n_region_samples": 0,
-            "n_candidates": 0,
-            "sampling": "skipped",
-        }
-        draws = np.empty((0, d))
-        if cfg.box_samples > 0:
-            budget = cfg.box_candidate_budget
-            rng = np.random.default_rng(cfg.seed)
-            draws, n_candidates = self.region._sample_within(cfg.box_samples, rng, max_candidates=budget)
-            info.update(
-                n_region_samples=len(draws),
-                n_candidates=n_candidates,
-                candidate_budget=budget,
-                sampling="ok" if len(draws) == cfg.box_samples else "partial",
-            )
-        points = np.concatenate([u_in, folded_accepted, draws], axis=0)
-        info["n_points"] = len(points)
-
-        if len(points) < 2:
-            # Nothing to bound: keep the whole cube.
-            core = box = (np.zeros(d), np.ones(d))
-            info["full_cube"] = True
-        else:
-            core = (points.min(axis=0), points.max(axis=0))
-            lo, hi = pad_box(
-                *core, box_padding=cfg.box_padding, rmse_cstat=self.rmse_cstat, delta=self.threshold - self.best
-            )
-            # A zero-width axis cannot be padded proportionally: keep the whole axis.
-            flat = (hi - lo) < 1e-9
-            lo[flat], hi[flat] = 0.0, 1.0
-            box = (lo, hi)
-            info.update(full_cube=False, full_axes=np.flatnonzero(flat).tolist())
-        info["seconds"] = time.perf_counter() - start
-        self._box_core, self._box, self.box_info = core, box, info
-
-    def box(self) -> tuple[np.ndarray, np.ndarray]:
-        """Padded unit-cube bounding box of the region, computed once.
-
-        The box encloses the folds below the threshold, the folds the region
-        accepts and up to ``config.box_samples`` region draws, padded by
-        [`pad_box`][bsixsa.restriction.rules.pad_box]; with fewer than 2 points
-        it is the whole cube.
-
-        Returns:
-            ``(lo, hi)`` float64 copies of shape ``(d,)``.
-        """
-        if self._box is None:
-            self._compute_box()
-        return self._box[0].copy(), self._box[1].copy()
-
-    @property
-    def box_core(self) -> tuple[np.ndarray, np.ndarray]:
-        """Unpadded bounding box ``(lo, hi)`` behind [`box`][bsixsa.restriction.region.Restriction.box]."""
-        if self._box_core is None:
-            self._compute_box()
-        return self._box_core[0].copy(), self._box_core[1].copy()
-
-    def truncated_prior(self, base_prior: MultipleIndependent) -> tuple[MultipleIndependent, float]:
-        r"""Truncate a prior to the bounding box, cached per prior object.
-
-        Parameters:
-            base_prior: The untruncated prior whose unit cube the restriction lives in.
-
-        Returns:
-            ``(prior, log_mass)``, where ``log_mass`` is $\log M_B$, the evidence correction.
-        """
-        key = id(base_prior)
-        if key not in self._truncated:
-            # The entry keeps base_prior alive, so its id cannot be reused while cached.
-            self._truncated[key] = (base_prior, base_prior.truncated(*self.box()))
-        return self._truncated[key][1]
-
     def save(self, directory: str) -> None:
-        """Write ``restriction.npz`` and ``history.json`` to *directory*.
-
-        The bounding box is written only if it has already been computed.
-        """
+        """Write ``restriction.npz`` and ``history.json`` to *directory*."""
         os.makedirs(directory, exist_ok=True)
-        arrays: dict[str, Any] = {}
-        if self._box is not None:
-            arrays = {
-                "box_lo": self._box[0],
-                "box_hi": self._box[1],
-                "box_core_lo": self._box_core[0],
-                "box_core_hi": self._box_core[1],
-            }
         np.savez(
             os.path.join(directory, "restriction.npz"),
             u=self.u,
@@ -415,7 +276,6 @@ class Restriction:
             span=self.span,
             prior_mass=self.prior_mass,
             rmse_cstat=self.rmse_cstat,
-            **arrays,
         )
         payload = {
             "history": self.history,
@@ -424,13 +284,12 @@ class Restriction:
             "seconds": self.seconds,
             "config": self.config.model_dump(),
             "param_names": self.param_names,
-            "box_info": self.box_info,
         }
         with open(os.path.join(directory, "history.json"), "w", encoding="utf-8") as handle:
             json.dump(_to_jsonable(payload), handle, indent=2)
 
     def report(self) -> str:
-        """Human-readable summary of the waves (and of the box, if already computed)."""
+        """Human-readable summary of the waves."""
 
         def fmt(value: Any, spec: str) -> str:
             if value is None or (isinstance(value, float) and not math.isfinite(value)):
@@ -454,16 +313,4 @@ class Restriction:
                 f"{fmt(row.get('prior_mass'), '10.4g')} {fmt(row.get('purity'), '7.3f')} "
                 f"{fmt(row.get('recall'), '7.3f')} {fmt(row.get('rmse_cstat'), '9.4g')}  {row.get('wall', '')}"
             )
-        if self._box is not None:
-            lo, hi = self._box
-            names = self.param_names or [f"u{j}" for j in range(self.d)]
-            lines += ["", f"Bounding box (unit cube), log M_B = {float(np.sum(np.log(hi - lo))):.4g}:"]
-            width = max(len(str(name)) for name in names)
-            for name, a, b in zip(names, lo, hi):
-                lines.append(f"  {str(name):<{width}}  [{a:.4f}, {b:.4f}]")
-            if self.box_info.get("sampling") == "partial":
-                lines.append(
-                    f"  ({self.box_info.get('n_region_samples', 0):,} of {self.config.box_samples:,} region "
-                    "draws: candidate budget reached)"
-                )
         return "\n".join(lines)

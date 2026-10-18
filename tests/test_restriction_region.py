@@ -1,8 +1,8 @@
 """Tests for `bsixsa.restriction.region` (and its configuration) with analytic surrogates.
 
 The surrogate is replaced by the exact quadratic C-stat of `tests/_analytic.QuadCstat`,
-so the region is an ellipse whose volume, moments and bounding box are known in
-closed form. No torch is needed.
+so the region is an ellipse whose volume and moments are known in closed form.
+No torch is needed.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -24,9 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _analytic import QuadCstat  # noqa: E402
 
-from bsixsa.priors import MultipleIndependent, loguniform, uniform  # noqa: E402
 from bsixsa.restriction import HistoryMatching, Region, Restriction  # noqa: E402
-from bsixsa.restriction.rules import pad_box, posterior_span  # noqa: E402
+from bsixsa.restriction.rules import posterior_span  # noqa: E402
 
 _COV = np.array([[0.01, 0.004], [0.004, 0.02]])
 _MU = np.array([0.45, 0.55])
@@ -83,11 +82,10 @@ def test_history_matching_defaults():
     assert (cfg.hidden, cfg.blocks, cfg.epochs, cfg.patience) == (128, 3, 1000, 20)
     assert (cfg.learning_rate, cfg.batch_size, cfg.validation_fraction) == (1e-3, 256, 0.2)
     assert (cfg.focus_weight, cfg.focus_factor) == (10.0, 3.0)
-    assert (cfg.mass_probe, cfg.box_samples, cfg.box_padding) == (50_000, 50_000, 0.1)
+    assert cfg.mass_probe == 50_000
     assert cfg.max_candidates == 2_000_000_000
     assert cfg.torch_threads == 1
     assert cfg.seed is None
-    assert cfg.plot is True
 
 
 def test_history_matching_compares_by_value():
@@ -105,10 +103,8 @@ def test_history_matching_compares_by_value():
         {"stop_when_acceptance": 0.0},
         {"stop_when_acceptance": 1.0},
         {"validation_fraction": 1.0},
-        {"box_samples": -1},
         {"max_candidates": 2.5e9 + 0.5},  # whole numbers written as floats (2e9) are accepted
         {"torch_threads": 0},
-        {"plot": "yes"},
         {"n_waves": True},
         {"unknown": 1},
     ],
@@ -122,13 +118,13 @@ def test_history_matching_budgets_are_derived_not_stored():
     cfg = HistoryMatching()
     dumped = cfg.model_dump()
     # history.json stores model_dump(), and HistoryMatching(**dumped) must round-trip.
-    assert "mass_probe_budget" not in dumped and "box_candidate_budget" not in dumped
+    assert "mass_probe_budget" not in dumped
     assert HistoryMatching(**dumped) == cfg
 
 
-def test_history_matching_accepts_none_threads_and_zero_box_samples():
-    cfg = HistoryMatching(torch_threads=None, box_samples=0, seed=7, target_spans=2)
-    assert cfg.torch_threads is None and cfg.box_samples == 0 and cfg.target_spans == 2.0
+def test_history_matching_accepts_none_threads():
+    cfg = HistoryMatching(torch_threads=None, seed=7, target_spans=2)
+    assert cfg.torch_threads is None and cfg.target_spans == 2.0
 
 
 # ------------------------------------------------------------ Region.accepts
@@ -333,7 +329,7 @@ def _restriction(quad, *, r2=4.0, n=3000, seed=123, rmse=0.5, **cfg_kwargs):
     u = rng.random((n, 2))
     cstat = quad.cstat(u)
     threshold = quad.c0 + r2
-    cfg = HistoryMatching(box_samples=cfg_kwargs.pop("box_samples", 5_000), seed=seed, **cfg_kwargs)
+    cfg = HistoryMatching(seed=seed, **cfg_kwargs)
     history = [
         {
             "wave": 1,
@@ -369,13 +365,8 @@ def _restriction(quad, *, r2=4.0, n=3000, seed=123, rmse=0.5, **cfg_kwargs):
     )
 
 
-def test_restriction_inside_points(quad):
-    res = _restriction(quad)
-    inside = res.cstat <= res.threshold
-    np.testing.assert_array_equal(res.u_in, res.u[inside])
-    np.testing.assert_array_equal(res.cstat_in, res.cstat[inside])
-    assert np.all(res.cstat_in <= res.threshold)
-    assert res.d == 2
+def test_restriction_dimension(quad):
+    assert _restriction(quad).d == 2
 
 
 def test_restriction_validates_shapes(quad):
@@ -415,175 +406,14 @@ def test_restriction_optional_fields_default_to_none(quad):
         stop_reason="n_waves",
         n_simulations=10,
         seconds=0.0,
-        config=HistoryMatching(box_samples=10),
+        config=HistoryMatching(),
     )
     assert res.param_names is None
-
-
-def test_box_contains_every_inside_point_and_is_padded(quad):
-    res = _restriction(quad)
-    lo, hi = res.box()
-    core_lo, core_hi = res.box_core
-
-    assert np.all(lo <= res.u_in.min(axis=0)) and np.all(hi >= res.u_in.max(axis=0))
-    assert np.all(core_lo <= res.u_in.min(axis=0)) and np.all(core_hi >= res.u_in.max(axis=0))
-    width = core_hi - core_lo
-    np.testing.assert_allclose(core_lo - lo, 0.1 * width)
-    np.testing.assert_allclose(hi - core_hi, 0.1 * width)
-    assert np.all((lo >= 0.0) & (hi <= 1.0))
-    assert res.box_info["sampling"] == "ok"
-    assert res.box_info["n_region_samples"] == 5_000
-
-
-def test_box_contains_the_analytic_level_set(quad):
-    res = _restriction(quad)
-    lo, hi = res.box()
-    true_lo, true_hi = quad.aabb(res.threshold)
-    assert np.all(lo <= true_lo) and np.all(hi >= true_hi)
-    # and the unpadded core converges to it from inside
-    core_lo, core_hi = res.box_core
-    np.testing.assert_allclose(core_lo, true_lo, atol=0.01)
-    np.testing.assert_allclose(core_hi, true_hi, atol=0.01)
-
-
-def test_box_padding_follows_the_surrogate_error(quad):
-    res = _restriction(quad, rmse=1.0)  # 3 * 1 / (2 * ~4) * w / 2 ~ 0.19 w > 0.1 w
-    lo, hi = res.box()
-    core_lo, core_hi = res.box_core
-    delta = res.threshold - res.best
-    expected_lo, expected_hi = pad_box(core_lo, core_hi, box_padding=0.1, rmse_cstat=1.0, delta=delta)
-    np.testing.assert_array_equal(lo, expected_lo)
-    np.testing.assert_array_equal(hi, expected_hi)
-    width = core_hi - core_lo
-    np.testing.assert_allclose(core_lo - lo, 3.0 / (2.0 * delta) * width / 2.0)
-    assert np.all(core_lo - lo > 0.1 * width)
-
-
-def test_box_is_cached_and_returns_copies(quad):
-    res = _restriction(quad)
-    with patch.object(res.region, "_sample_within", wraps=res.region._sample_within) as spy:
-        first = res.box()
-        first[0][:] = -1.0
-        second = res.box()
-        _ = res.box_core
-        assert spy.call_count == 1
-    assert np.all(second[0] >= 0.0)
-
-
-def test_box_is_deterministic_given_the_seed(quad):
-    a = _restriction(quad, seed=5).box()
-    b = _restriction(quad, seed=5).box()
-    c = _restriction(quad, seed=6).box()
-    np.testing.assert_array_equal(a[0], b[0])
-    np.testing.assert_array_equal(a[1], b[1])
-    assert not np.array_equal(a[0], c[0])
-
-
-def test_box_keeps_the_draws_its_candidate_budget_yields(quad):
-    res = _restriction(quad, max_candidates=10)
-    lo, hi = res.box()
-    assert res.box_info["sampling"] == "partial"
-    assert res.box_info["n_candidates"] == res.box_info["candidate_budget"] == 10
-    assert res.box_info["n_region_samples"] <= 10
-    assert np.all(lo <= res.u_in.min(axis=0)) and np.all(hi >= res.u_in.max(axis=0))
-    assert "candidate budget" in res.report()
-
-
-def test_box_candidate_budget_is_about_one_mass_probe():
-    assert HistoryMatching().box_candidate_budget == 2_500_000
-    assert HistoryMatching(mass_probe=1_000, box_samples=4_000).box_candidate_budget == 200_000
-    assert HistoryMatching(max_candidates=123).box_candidate_budget == 123
-
-
-def test_box_of_a_small_region_spends_its_budget_not_max_candidates(quad):
-    # mass ~ 1e-3: 5 000 draws would need ~5M candidates, as many surrogate
-    # evaluations as max_candidates allows; the box stops at 50 * box_samples.
-    res = _restriction(quad, r2=0.025, box_samples=5_000, mass_probe=1_000)
-    budget = res.config.box_candidate_budget
-    assert budget == 250_000 < res.config.max_candidates
-    res.region.model.rows_seen = 0
-    lo, hi = res.box()
-    info = res.box_info
-    assert info["sampling"] == "partial" and info["n_candidates"] == budget
-    assert 0 < info["n_region_samples"] < 5_000
-    # the folded-point acceptance test plus the draws: never max_candidates evaluations
-    assert res.region.model.rows_seen == len(res.u) + budget
-    assert info["seconds"] >= 0.0
-    true_lo, true_hi = quad.aabb(res.threshold)
-    assert np.all(lo <= true_lo) and np.all(hi >= true_hi)
-
-
-def test_sample_within_returns_partial_uniform_draws(quad):
-    region = _ellipse_region(quad, 1.0)  # mass ~ 0.043
-    draws, spent = region._sample_within(10_000, np.random.default_rng(0), max_candidates=20_000, batch=3_000)
-    assert spent == 20_000 and region.model.rows_seen == 20_000
-    assert 0 < len(draws) < 10_000 and region.accepts(draws).all()
-    full, spent = region._sample_within(100, np.random.default_rng(0), max_candidates=10_000_000, batch=1_000)
-    assert full.shape == (100, 2) and spent < 10_000_000
-    empty, spent = Region(ConstantModel(np.inf), 1.0)._sample_within(5, np.random.default_rng(0), max_candidates=0)
-    assert empty.shape == (0, 2) and spent == 0
-
-
-def test_box_skips_region_draws_when_box_samples_is_zero(quad):
-    res = _restriction(quad, box_samples=0)
-    with patch.object(res.region, "_sample_within") as spy:
-        res.box()
-    spy.assert_not_called()
-    assert res.box_info["sampling"] == "skipped"
-
-
-def test_box_is_the_full_cube_with_fewer_than_two_points(quad):
-    res = _restriction(quad, box_samples=0)
-    res.threshold = quad.c0 - 1.0  # nothing inside, and the region accepts nothing
-    res.region = Region(QuadModel(quad), quad.c0 - 1.0)
-    lo, hi = res.box()
-    np.testing.assert_array_equal(lo, [0.0, 0.0])
-    np.testing.assert_array_equal(hi, [1.0, 1.0])
-    assert res.box_info["full_cube"] is True
-
-
-def test_truncated_prior_uses_base_prior_truncated_and_caches(quad):
-    res = _restriction(quad)
-    base = MagicMock()
-    sentinel = (object(), -1.25)
-    base.truncated.return_value = sentinel
-
-    assert res.truncated_prior(base) is sentinel
-    assert res.truncated_prior(base) is sentinel
-    base.truncated.assert_called_once()
-    args = base.truncated.call_args.args
-    lo, hi = res.box()
-    np.testing.assert_array_equal(args[0], lo)
-    np.testing.assert_array_equal(args[1], hi)
-
-    other = MagicMock()
-    other.truncated.return_value = (object(), 0.0)
-    assert res.truncated_prior(other) is other.truncated.return_value
-    other.truncated.assert_called_once()
-
-
-def test_truncated_prior_with_a_real_prior(quad):
-    res = _restriction(quad)
-    base = MultipleIndependent([uniform(0.0, 0.5), loguniform(1e-5, 1e-2)])
-    prior, log_mass = res.truncated_prior(base)
-    lo, hi = res.box()
-    assert log_mass == pytest.approx(np.sum(np.log(hi - lo)))
-    np.testing.assert_allclose(prior.to_unit_cube(base.from_unit_cube(lo[None]))[0], [0.0, 0.0], atol=1e-7)
-    assert res.truncated_prior(base)[0] is prior
 
 
 def test_save_writes_the_arrays_and_the_history(quad, tmp_path):
     res = _restriction(quad)
     target = tmp_path / "nested" / "restriction"
-    with patch.object(res.region, "_sample_within", wraps=res.region._sample_within) as spy:
-        res.save(str(target))
-    # Saving never spends region draws: the box is recorded once computed.
-    spy.assert_not_called()
-    with np.load(target / "restriction.npz") as data:
-        assert "box_lo" not in data.files and "box_core_hi" not in data.files
-    assert json.loads((target / "history.json").read_text())["box_info"] == {}
-
-    lo, hi = res.box()
     res.save(str(target))
     with np.load(target / "restriction.npz") as data:
         np.testing.assert_array_equal(data["u"], res.u)
@@ -593,11 +423,6 @@ def test_save_writes_the_arrays_and_the_history(quad, tmp_path):
         assert float(data["best"]) == res.best
         assert float(data["span"]) == res.span
         assert float(data["prior_mass"]) == res.prior_mass
-        np.testing.assert_array_equal(data["box_lo"], lo)
-        np.testing.assert_array_equal(data["box_hi"], hi)
-        core_lo, core_hi = res.box_core
-        np.testing.assert_array_equal(data["box_core_lo"], core_lo)
-        np.testing.assert_array_equal(data["box_core_hi"], core_hi)
 
     payload = json.loads((target / "history.json").read_text())
     assert payload["stop_reason"] == "n_waves"
@@ -614,8 +439,4 @@ def test_report_summarises_the_waves(quad):
     text = res.report()
     assert "'n_waves'" in text
     assert "request" in text
-    assert "Bounding box" not in text  # the report never spends region draws
-    res.box()
-    text = res.report()
-    assert "Bounding box" in text and "nH" in text and "norm" in text
     assert "Restriction(d=2" in repr(res)

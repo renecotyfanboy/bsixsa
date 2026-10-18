@@ -1,21 +1,19 @@
 # History matching
 
-`Solver(..., restrict_prior=True)` enables history matching for any backend.
-Pass `HistoryMatching(...)` for explicit settings, or `False` to disable it.
-With `None` (the default), only SIXSA enables it.
+SIXSA starts with history matching, which shrinks the prior to the region
+worth sampling. Pass `SIXSA(history_matching=HistoryMatching(...))` for
+explicit settings, or `history_matching=None` to skip it.
 
 ```python
-from bsixsa import HistoryMatching, Nautilus, Solver
+from bsixsa import SIXSA, HistoryMatching, Solver
 
 solver = Solver(
-    prior, backend=Nautilus(seed=42),
-    restrict_prior=HistoryMatching(seed=42, target_spans=3.0),
-    outputfiles_basename="fit-nautilus",
+    prior,
+    backend=SIXSA(seed=42, history_matching=HistoryMatching(seed=42, target_spans=3.0)),
+    outputfiles_basename="fit-sixsa",
 )
-with solver.pool_scope():  # share the XSPEC worker pool across both steps
-    restriction = solver.restrict()  # optional: run() computes it if needed
-    result = solver.run()
-print(restriction.report())
+result = solver.run()
+print(solver.backend.restriction.report())
 ```
 
 ::: bsixsa.restriction
@@ -26,27 +24,13 @@ print(restriction.report())
 ## How the result is used
 
 History matching returns a [`Restriction`][bsixsa.restriction.Restriction],
-kept in memory as `solver.restriction`; its folds and per-wave history are
-written to `<outputfiles_basename>/restriction/`. The surrogate itself is not saved,
-so a restriction cannot be reloaded from disk; `restrict(force=True)`
-recomputes it.
+kept in memory as `solver.backend.restriction`; its folds and per-wave history
+are written to `<outputfiles_basename>/sixsa/restriction/`. The surrogate itself
+is not saved, so a restriction cannot be reloaded from disk.
 
 SIXSA draws its training data inside the region and keeps the full prior for
-its importance weights. The other backends sample the padded bounding box as
-a truncated prior, which keeps the family of each marginal where possible
-(`solver.prior` and `distributions["restricted_prior"]`; the original prior
-stays at `solver.base_prior` and `distributions["prior"]`). The Solver adds
-the log prior mass of the box to their evidence (`log_Z_restriction_correction`).
-**This corrects the prior normalisation, not excluded posterior mass**: the
-result equals the full evidence only when the posterior mass outside the box
-is negligible. A `UserWarning` flags posterior points crowding an edge of the
-box; the absence of this warning cannot exclude a missed separate mode.
-
-A computed `Restriction` can be passed as `restrict_prior=` to another Solver
-for the same problem, e.g. to compare backends on the same region; the reused
-folds are not counted again. It is not checked: reuse it only with the same
-spectrum, responses, model and priors, and recompute it after any change. For UltraNest, use a fresh output directory when recomputing
-the region: a run cannot resume with a different prior box.
+its importance weights. Its folds count in `FitResults.n_likelihood_evaluations`,
+under the `"restriction"` phase of `solver.fold_counts`.
 
 ## Configuration and results
 
@@ -85,4 +69,3 @@ the region: a run cannot resume with a different prior box.
       - threshold_rule
       - recall_check
       - stop_reason
-      - pad_box

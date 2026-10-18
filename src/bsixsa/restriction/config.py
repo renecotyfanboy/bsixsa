@@ -1,11 +1,11 @@
-"""Configuration of the history-matching prior restriction."""
+"""Configuration of SIXSA's history matching."""
 
 from __future__ import annotations
 
 import math
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field
 
 from .._config_types import NonNegativeInt, PositiveFloat, PositiveInt
 
@@ -108,14 +108,6 @@ class HistoryMatching(BaseModel):
         default=50_000,
         description="Size of the uniform prior samples used to measure the region's prior mass.",
     )
-    box_samples: NonNegativeInt = Field(
-        default=50_000,
-        description="Region draws added to the folds when computing the bounding box (0 skips them).",
-    )
-    box_padding: NonNegativeFloat = Field(
-        default=0.1,
-        description="Minimum padding of the bounding box on each side, as a fraction of its width.",
-    )
     max_candidates: PositiveInt = Field(
         default=2_000_000_000,
         description="Maximum number of uniform trial points per rejection draw from the region.",
@@ -130,18 +122,9 @@ class HistoryMatching(BaseModel):
         default=None,
         description="Random seed for reproducible runs; `None` draws fresh entropy.",
     )
-    plot: StrictBool = Field(
-        default=True,
-        description="Write one diagnostic PDF per wave when an output directory is given.",
-    )
 
     @property
     def mass_probe_budget(self) -> int:
         """Largest number of uniform points one prior-mass measurement may use."""
         resolve_stop = math.ceil(400.0 / self.stop_when_acceptance)
         return min(self.max_candidates, max(50 * self.mass_probe, resolve_stop))
-
-    @property
-    def box_candidate_budget(self) -> int:
-        """Largest number of uniform candidates spent on the bounding-box draws."""
-        return min(self.max_candidates, 50 * max(self.mass_probe, self.box_samples))

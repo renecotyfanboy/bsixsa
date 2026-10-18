@@ -241,25 +241,17 @@ class Compressor:
 
     def encode(self, counts: Any, *, batch: int = 8192) -> np.ndarray:
         """Codes ``(n, latent_dim)`` of the spectra."""
-        return self._forward(counts, batch=batch, encode_only=True)
-
-    def reconstruct(self, counts: Any, *, batch: int = 8192) -> np.ndarray:
-        """Reconstructed expected counts ``(n, n_bins)``."""
-        return self._forward(counts, batch=batch, encode_only=False)
-
-    def _forward(self, counts: Any, *, batch: int, encode_only: bool) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("the compressor has not been fitted.")
         x = np.require(counts, dtype=np.float32, requirements=["C", "W"])
         if x.ndim == 1:
             x = x.reshape(1, -1)
-        out = np.empty((x.shape[0], self.latent_dim if encode_only else self.n_bins), dtype=np.float32)
+        out = np.empty((x.shape[0], self.latent_dim), dtype=np.float32)
         self.model.eval()
         with torch.no_grad():
             for lo in range(0, x.shape[0], int(batch)):
                 chunk = torch.as_tensor(x[lo : lo + int(batch)]).to(self.device)
-                result = self.model.encode(chunk) if encode_only else self.model(chunk)
-                out[lo : lo + chunk.shape[0]] = result.detach().cpu().numpy()
+                out[lo : lo + chunk.shape[0]] = self.model.encode(chunk).detach().cpu().numpy()
         return out
 
 

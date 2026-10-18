@@ -40,10 +40,18 @@ def test_real_fold_counts_and_cash_are_consistent(fake_solver):
 
 
 def test_real_history_matching_uses_solver_folds(fake_solver):
+    from bsixsa._cube import to_physical
+    from bsixsa.restriction import run_history_matching
+
+    solver = fake_solver
     cfg = HistoryMatching(n_waves=2, simulations_per_parameter=100, hidden=32,
-                          blocks=2, epochs=100, patience=10, mass_probe=2000,
-                          box_samples=2000, seed=0, plot=False)
-    restriction = fake_solver.restrict(cfg)
-    assert restriction.n_simulations == fake_solver.fold_counts["restriction"]
+                          blocks=2, epochs=100, patience=10, mass_probe=2000, seed=0)
+
+    def cstat(u):
+        return solver.simulate(to_physical(solver.prior, u), return_kind="cstat", progress_bar=False)["cstat"]
+
+    with solver.pool_scope():
+        solver._get_pool()  # fork the workers before the surrogate loads torch
+        restriction = run_history_matching(cstat, solver.num_parameters, cfg)
+    assert restriction.n_simulations == sum(solver.fold_counts.values())
     assert restriction.region.accepts(restriction.u[np.argmin(restriction.cstat)]).item()
-    assert fake_solver.restrict(cfg) is restriction

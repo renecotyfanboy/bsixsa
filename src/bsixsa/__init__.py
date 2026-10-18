@@ -4,7 +4,7 @@ Load a spectrum and a model in PyXspec, build a [`Solver`][bsixsa.solver.Solver]
 from a prior (see [`bsixsa.priors`][bsixsa.priors]) and a backend configuration
 (`Nautilus`, `Nessai`, `Ultranest`, `Emcee`, `Iminuit`, `LevenbergMarquardt` or
 `SIXSA`), and call `run()`. [`HistoryMatching`][bsixsa.restriction.HistoryMatching]
-configures the optional prior restriction, and
+configures the history matching that SIXSA runs first, and
 [`export_xspec_chain`][bsixsa.export.export_xspec_chain] writes the posterior as
 an XSPEC chain file.
 """
@@ -19,7 +19,7 @@ from .backend import (
     Nessai,
     Ultranest,
 )
-from .backend.config import CompressorConfig, NDEConfig, TrainingConfig
+from .backend.config import CompressorConfig, FlowConfig
 from .export import export_xspec_chain
 from .restriction import HistoryMatching
 from .solver import FitResults, Solver
@@ -30,14 +30,13 @@ __all__ = [
     "CompressorConfig",
     "Emcee",
     "FitResults",
+    "FlowConfig",
     "HistoryMatching",
     "Iminuit",
     "LevenbergMarquardt",
-    "NDEConfig",
     "Nautilus",
     "Nessai",
     "Solver",
-    "TrainingConfig",
     "Ultranest",
     "export_xspec_chain",
 ]

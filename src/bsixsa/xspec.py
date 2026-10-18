@@ -68,8 +68,7 @@ class SpectrumState:
         except Exception:  # PyXspec: "No response is assigned to source ..."
             return False
 
-    @property
-    def component_counts(self) -> dict[str, np.ndarray]:
+    def _plotted_component_counts(self) -> dict[str, np.ndarray]:
         """Counts per channel of each additive component, keyed `"<model name>_<component name>"`.
 
         Keys look like `"_powerlaw_3"` or `"nxb_bbodyrad"`. Models with a single
@@ -77,18 +76,13 @@ class SpectrumState:
         for them); their counts are in
         [`model_counts`][bsixsa.xspec.SpectrumState.model_counts].
 
-        Read from XSPEC's plot (sets `Plot.device = "/null"` and
-        `Plot.add = True`), which must keep XSPEC's default settings: one plot
-        group per spectrum, no `Plot.setRebin`, `Plot.area` off.
+        Read from the plot drawn by `_counts_plot`, which must keep XSPEC's
+        default settings: one plot group per spectrum, no `Plot.setRebin`,
+        `Plot.area` off.
 
         Raises:
             RuntimeError: If the plot does not show the expected components.
         """
-        with _counts_plot():
-            return self._plotted_component_counts()
-
-    def _plotted_component_counts(self) -> dict[str, np.ndarray]:
-        """Read `component_counts` from the plot drawn by `_counts_plot`."""
         data_group = self.spectrum.dataGroup
         component_counts = {}
         # XSPEC numbers the components of a plot group consecutively across its models.

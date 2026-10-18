@@ -8,6 +8,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from .._config_types import Integer, NonNegativeInt, PositiveFloat, PositiveInt
+from ..restriction.config import HistoryMatching
 
 if TYPE_CHECKING:
     from ..solver import Solver
@@ -29,13 +30,6 @@ class BackendConfig(BaseModel):
     Attributes:
         backend_name: Class-level. Key of the backend in
             `bsixsa.backend.BACKEND_REGISTRY`, e.g. `"nautilus"`.
-        restriction_mode: Class-level. How a prior restriction
-            (`Solver(restrict_prior=...)`) is used: `"box"` samples the
-            bounding-box prior and corrects the evidence by its prior mass;
-            `"region"` lets the backend use the exact region (SIXSA).
-        restrict_prior_default: Class-level. Whether `Solver(restrict_prior=None)`
-            restricts with a default
-            [`HistoryMatching`][bsixsa.restriction.HistoryMatching] (SIXSA only).
         required_package: Class-level. `(module, pip name)` of the sampler
             package the backend needs, or `None`.
     """
@@ -43,8 +37,6 @@ class BackendConfig(BaseModel):
     model_config = MODEL_CONFIG
 
     backend_name: ClassVar[str]
-    restriction_mode: ClassVar[Literal["box", "region"]] = "box"
-    restrict_prior_default: ClassVar[bool] = False
     required_package: ClassVar[tuple[str, str] | None] = None
 
     trace: StrictBool = Field(
@@ -208,10 +200,7 @@ class Ultranest(BackendConfig):
     )
     resume: StrictBool = Field(
         default=True,
-        description=(
-            "Resume a previous run from its checkpoints; this fails if the prior "
-            "restriction changed, in which case set `False` or use a new `outputfiles_basename`."
-        ),
+        description="Resume a previous run from its checkpoints.",
     )
     use_step_sampler: StrictBool = Field(
         default=False,
@@ -327,46 +316,19 @@ class Emcee(_StartingPointConfig):
             )
 
 
-class NDEConfig(BaseModel):
-    """Architecture of each SIXSA flow, passed to sbi's `posterior_nn`."""
+class FlowConfig(BaseModel):
+    """Size and training budget of each SIXSA flow (a masked autoregressive flow trained with sbi)."""
 
     model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
-    model: Literal["zuko_maf", "zuko_nsf", "maf", "nsf"] = Field(
-        default="zuko_maf",
-        description="Flow family: masked autoregressive (`maf`, `zuko_maf`) or neural spline (`nsf`, `zuko_nsf`).",
-    )
     hidden_features: PositiveInt = Field(default=50, description="Width of the hidden layers.")
     num_transforms: PositiveInt = Field(default=5, description="Number of stacked transforms.")
-    num_bins: PositiveInt = Field(default=5, description="Spline bins (spline flows only; ignored by `maf`).")
-    z_score_theta: Literal["independent", "structured", "none"] = Field(
-        default="independent",
-        description="Standardisation of the parameters before training.",
-    )
-    z_score_x: Literal["independent", "structured", "none"] = Field(
-        default="independent",
-        description="Standardisation of the compressed spectra (codes) before training.",
-    )
-
-
-class TrainingConfig(BaseModel):
-    """Training loop of each SIXSA flow (sbi's `train()` arguments)."""
-
-    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
-
-    learning_rate: PositiveFloat = Field(default=1e-3, description="Adam learning rate.")
     training_batch_size: PositiveInt = Field(default=1024, description="Training pairs per gradient step.")
-    validation_fraction: float = Field(
-        default=0.2,
-        gt=0, lt=1,
-        description="Fraction of the training set held out for early stopping.",
-    )
+    max_num_epochs: PositiveInt = Field(default=25, description="Maximum number of epochs.")
     stop_after_epochs: PositiveInt = Field(
         default=10,
         description="Epochs without validation improvement before stopping (patience).",
     )
-    max_num_epochs: PositiveInt = Field(default=25, description="Maximum number of epochs.")
-    clip_max_norm: PositiveFloat = Field(default=1.0, description="Gradient clipping norm.")
 
 
 class CompressorConfig(BaseModel):
@@ -402,12 +364,14 @@ class CompressorConfig(BaseModel):
 class SIXSA(BackendConfig):
     """SIXSA: history matching, a Cash-loss autoencoder and certified NPE proposals.
 
-    Each round trains `n_nde` flows, keeps the best proposal on exact folds,
-    and certifies it by importance sampling (Pareto k-hat below
-    `khat_threshold`, efficiency at least `min_efficiency`). Until one passes,
-    the next training set is drawn inside the proposal's highest-density
-    region, intersected with the history-matching region. SIXSA fits one
-    spectrum with the C-statistic, without background, and finite priors.
+    History matching first restricts the prior to the region worth
+    sampling. Each round then trains `n_nde` flows and certifies their
+    equal-weight mixture by importance sampling on exact folds (Pareto k-hat
+    below `khat_threshold`, efficiency at least `min_efficiency`). Until one
+    passes, the next training set is drawn inside the proposal's
+    highest-density region, intersected with the history-matching region.
+    SIXSA fits one spectrum with the C-statistic, without background, and
+    finite priors.
 
     `FitResults` holds equal-weight posterior samples, `log_Z`, and the best
     fold as `best_fit`.
@@ -416,12 +380,17 @@ class SIXSA(BackendConfig):
     model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
     backend_name: ClassVar[str] = "sixsa"
-    restriction_mode: ClassVar[Literal["box", "region"]] = "region"
-    restrict_prior_default: ClassVar[bool] = True
 
+    history_matching: HistoryMatching | None = Field(
+        default_factory=HistoryMatching,
+        description=(
+            "History matching run before the first round; the training sets are drawn in its "
+            "region. `None` skips it."
+        ),
+    )
     n_nde: PositiveInt = Field(
         default=5,
-        description="Flows trained per round from different seeds; the best of them and their mixture is kept.",
+        description="Flows trained per round from different seeds; their equal-weight mixture is the round's proposal.",
     )
     n_rounds: PositiveInt = Field(
         default=20,
@@ -430,7 +399,7 @@ class SIXSA(BackendConfig):
     check_draws: Integer = Field(
         default=1000,
         ge=100,
-        description="Proposal draws (one exact fold each) per candidate and per round.",
+        description="Proposal draws (one exact fold each) that certify the proposal of each round.",
     )
     khat_threshold: float = Field(
         default=0.7,
@@ -470,8 +439,7 @@ class SIXSA(BackendConfig):
         default=True,
         description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
     )
-    nde: NDEConfig = Field(default_factory=NDEConfig, description="Flow architecture.")
-    training: TrainingConfig = Field(default_factory=TrainingConfig, description="Flow training loop.")
+    flow: FlowConfig = Field(default_factory=FlowConfig, description="Size and training budget of the flows.")
     compressor: CompressorConfig = Field(default_factory=CompressorConfig, description="Spectrum autoencoder.")
     target_ess: PositiveFloat = Field(
         default=2000.0,
@@ -487,11 +455,7 @@ class SIXSA(BackendConfig):
     )
     seed: NonNegativeInt | None = Field(
         default=None,
-        description="Seed of every random draw of the run; `None` is not reproducible.",
-    )
-    plot_diagnostics: StrictBool = Field(
-        default=True,
-        description="Write diagnostic figures to `<outputfiles_basename>/sixsa/`.",
+        description="Seed of every random draw of the run, except history matching's; `None` is not reproducible.",
     )
 
     @model_validator(mode="after")
@@ -510,7 +474,7 @@ class SIXSA(BackendConfig):
         """
         from ..priors import validate_finite_support
 
-        validate_finite_support(solver.base_prior)
+        validate_finite_support(solver.prior)
         constraints = solver._xspec_constraints()
         n_spectra = constraints["n_spectra"]
         if n_spectra is None:

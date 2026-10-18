@@ -43,9 +43,6 @@ expensive step, so the solver runs them in a pool of worker processes
 - If the backend needs a sampler package that is not installed, `Solver(...)`
   raises `ImportError` with the `pip install` command, before anything is
   written.
-- `restrict_prior=True` (or `HistoryMatching(...)`) first shrinks the prior to
-  the region where the model can fit the data, for any backend. SIXSA does it
-  by default. See [History matching](restriction.md).
 - `Solver(...)` changes the prior parameters in the XSPEC session (start
   values, limits, frozen and linked states); see
   [what the Solver changes in XSPEC](priors.md#what-the-solver-changes-in-xspec).
@@ -68,19 +65,16 @@ as `solver.fit_result`.
   differs from $-2$ times the full Poisson log-likelihood by a constant that
   depends only on the data, so `log_Z` compares models fitted to the same
   spectrum with the same binning: the difference of two `log_Z` is the log
-  Bayes factor. It is NaN for Emcee, Iminuit and LevenbergMarquardt. When the
-  backend sampled a restricted prior box, `log_Z` already includes
-  `log_Z_restriction_correction`.
+  Bayes factor. It is NaN for Emcee, Iminuit and LevenbergMarquardt.
 - `best_fit` is the best parameter vector (optimisers and SIXSA; `None` for
   the nested samplers and Emcee). `best_fit_stat` is its C-stat plus the
   prior term XSPEC adds when `Fit.bayes = "on"` (0 for a uniform prior,
   $2 \ln x$ for a log-uniform one): compare it with `xspec.Fit.statistic` of a
   bayes-on XSPEC fit with `cons` and `jeffreys` priors, not with a bare cstat
   fit.
-- `n_likelihood_evaluations` counts the folds of the backend, plus those of a
-  history-matching restriction computed for this run
-  (`n_restriction_evaluations`); `time` and `restriction_time` are wall-clock
-  seconds.
+- `n_likelihood_evaluations` counts the folds of the backend (for SIXSA,
+  history matching included); `time` is the wall-clock time of the backend
+  run, in seconds.
 
 After the run, `build_dataframe` and `build_inference_data` draw from the
 prior or the posterior (an ArviZ `InferenceData` for diagnostics and model
@@ -105,7 +99,6 @@ scripts.
       - posterior_samples
       - backend_name
       - run
-      - restrict
       - sample_parameters
       - build_dataframe
       - export_xspec_chain

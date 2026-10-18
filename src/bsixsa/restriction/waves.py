@@ -62,7 +62,6 @@ def run_history_matching(
     d: int,
     cfg: HistoryMatching,
     *,
-    outdir: str | None = None,
     param_names: list[str] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> Restriction:
@@ -86,8 +85,7 @@ def run_history_matching(
             ``(n,)``, finite or ``+inf``.
         d: Dimension of the cube.
         cfg: History-matching settings.
-        outdir: Directory of the per-wave PDFs; ``None`` writes nothing.
-        param_names: Parameter names for logs and plots.
+        param_names: Parameter names, stored in the result for its reports.
         log: Receives one summary line per wave; silent by default.
 
     Returns:
@@ -141,7 +139,7 @@ def run_history_matching(
                         "returned a finite C-stat, too few to train the C-stat surrogate (it needs at "
                         "least 2). An infinite C-stat means the model predicts zero counts in a bin "
                         "where counts were observed; check the prior ranges and the model set-up, or "
-                        "run without the restriction (restrict_prior=False)."
+                        "run without history matching (SIXSA(history_matching=None))."
                     )
 
             purity = None if prev_threshold is None else float(np.mean(cstat <= prev_threshold))
@@ -201,7 +199,7 @@ def run_history_matching(
             truly = cstat_all <= threshold
             recall = float(np.mean(pred_all[truly] <= threshold)) if truly.any() else None
 
-            # 5. Record, plot, decide whether to stop.
+            # 5. Record, decide whether to stop.
             row = {
                 "wave": w,
                 "n": int(len(u)),
@@ -224,18 +222,6 @@ def run_history_matching(
                 "seconds": 0.0,
             }
             history.append(row)
-
-            if cfg.plot and outdir:
-                try:
-                    from .plots import plot_wave
-
-                    path = plot_wave(
-                        history, u_all, cstat_all, pred_all, probe, pred_probe, span, outdir,
-                        param_names=param_names,
-                    )
-                    log(f"[restriction] wave {w} figure: {path}")
-                except Exception as exc:  # a figure must never end a run
-                    log(f"[restriction] wave {w} figure failed: {type(exc).__name__}: {exc}")
 
             stop = stop_reason(
                 wave=w,

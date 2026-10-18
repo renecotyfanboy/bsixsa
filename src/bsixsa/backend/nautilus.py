@@ -27,7 +27,6 @@ class NautilusBackend(Backend):
     def __init__(self, *, solver: Solver, config: Nautilus) -> None:
         super().__init__(solver=solver, config=config)
         self._prior = Prior()
-        # The solver's working prior, which a restriction may have boxed.
         for name, dist in zip(solver.parameter_names, solver.prior.dists):
             self._prior.add_parameter(name, dist)
         self._nested_sampler = None

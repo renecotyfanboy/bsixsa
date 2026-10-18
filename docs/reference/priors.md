@@ -107,18 +107,12 @@ does (`powerlaw_3`), prefixed by the model name for a named model.
 
 ## The joint prior
 
-`solver.base_prior` and `solver.prior` are
-[`MultipleIndependent`][bsixsa.priors.MultipleIndependent] priors: one
+`solver.prior` is a
+[`MultipleIndependent`][bsixsa.priors.MultipleIndependent] prior: one
 independent marginal per fitted parameter, with the maps to and from the unit
 cube that samplers use.
 
 ::: bsixsa.priors.MultipleIndependent
-    options:
-      show_root_heading: true
-      show_root_full_path: false
-      heading_level: 3
-
-::: bsixsa.priors.TruncatedMarginal
     options:
       show_root_heading: true
       show_root_full_path: false

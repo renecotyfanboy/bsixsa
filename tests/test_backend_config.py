@@ -51,13 +51,11 @@ def mock_solver(tmp_path):
 
     solver.backend_config = Nessai(trace=False)
     solver.outputfiles_basename = str(tmp_path)
-    solver.prior = solver.base_prior = MultipleIndependent([uniform(0.0, 1.0), uniform(0.0, 1.0)])
+    solver.prior = MultipleIndependent([uniform(0.0, 1.0), uniform(0.0, 1.0)])
     solver.distributions = {}
     solver.parameter_indices = [1, 2]
     solver._parameter_names = ["par_a", "par_b"]
     solver.fit_result = None
-    solver.restriction = solver.restriction_config = None
-    solver._restriction_injected = solver._restriction_folds_reported = False
     solver._fold_counts = collections.Counter()
     solver._fold_phase_name = "backend"
     solver.pool = None
@@ -398,7 +396,7 @@ def _sixsa_solver(**constraints):
 
     values = {"n_spectra": 1, "stat_method": "cstat", "has_background": False, **constraints}
     return SimpleNamespace(
-        base_prior=MultipleIndependent([uniform(0.0, 1.0)]),
+        prior=MultipleIndependent([uniform(0.0, 1.0)]),
         _xspec_constraints=lambda: values,
     )
 
@@ -489,7 +487,6 @@ def test_missing_sampler_package_is_reported_by_run_when_the_config_was_replaced
         (SIXSA, "refresh_compressor", 2.0, 2),
         (HistoryMatching, "simulations_per_parameter", 1e3, 1000),
         (HistoryMatching, "max_candidates", 2e9, 2_000_000_000),
-        (HistoryMatching, "box_samples", 0.0, 0),
         (HistoryMatching, "seed", np.int64(7), 7),
     ],
 )

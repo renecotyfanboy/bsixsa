@@ -3,7 +3,7 @@
 - [`uniform`][bsixsa.priors.uniform], [`loguniform`][bsixsa.priors.loguniform]
   and [`norm`][bsixsa.priors.norm] build 1-D priors (frozen SciPy distributions).
 - [`MultipleIndependent`][bsixsa.priors.MultipleIndependent] is the joint
-  prior of independent marginals, with its unit-cube maps and truncation.
+  prior of independent marginals, with its unit-cube maps.
 - [`build_prior`][bsixsa.priors.build_prior] matches a prior list to the
   parameters of the loaded XSPEC model(s).
 """
@@ -13,7 +13,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
-from numpy.typing import ArrayLike
 from scipy import stats
 from xspec import AllModels
 
@@ -29,7 +28,6 @@ from .xspec import set_parameters
 
 __all__ = [
     'MultipleIndependent',
-    'TruncatedMarginal',
     'build_prior',
     'loguniform',
     'norm',
@@ -97,234 +95,6 @@ def norm(loc: float, scale: float, low: float, high: float) -> Distribution:
     # SciPy's truncnorm takes the bounds in units of standard deviations from loc.
     a, b = (low - loc) / scale, (high - loc) / scale
     return stats.truncnorm(a, b, loc=loc, scale=scale)
-
-
-def _scalar_or_array(values: np.ndarray) -> np.ndarray | float:
-    """Return a NumPy scalar for 0-d input and the array otherwise (SciPy's convention)."""
-    return values[()]
-
-
-class _TruncatedFamily:
-    """Family descriptor of a ``TruncatedMarginal``: ``dist.dist.name == "truncated"``."""
-
-    name = "truncated"
-
-    def __repr__(self) -> str:
-        return "_TruncatedFamily()"
-
-
-class TruncatedMarginal:
-    r"""Generic truncation of a 1-D distribution to a unit-cube interval.
-
-    Given a base distribution with CDF $F$ and an interval
-    $[u_{lo}, u_{hi}] \subseteq [0, 1]$ of its unit cube $u = F(\theta)$, this
-    is the base restricted to $[a, b] = [F^{-1}(u_{lo}), F^{-1}(u_{hi})]$ and
-    renormalised by the mass $u_{hi} - u_{lo}$:
-
-    $$\pi_B(\theta) = \frac{\pi(\theta)}{u_{hi} - u_{lo}}, \qquad
-    F_B(\theta) = \frac{F(\theta) - u_{lo}}{u_{hi} - u_{lo}}.$$
-
-    Used by
-    [`MultipleIndependent.truncated`][bsixsa.priors.MultipleIndependent.truncated]
-    for families without a closed-form truncation. It behaves like a frozen
-    SciPy distribution.
-
-    Attributes:
-        base: Wrapped distribution.
-        lo_u: Lower bound of the interval in the base unit cube.
-        hi_u: Upper bound of the interval in the base unit cube.
-        a: Lower physical bound, ``base.ppf(lo_u)``.
-        b: Upper physical bound, ``base.ppf(hi_u)``.
-    """
-
-    def __init__(self, base: Distribution, lo_u: float, hi_u: float):
-        """Wrap ``base`` restricted to ``[base.ppf(lo_u), base.ppf(hi_u)]``.
-
-        Raises:
-            ValueError: If ``0 <= lo_u < hi_u <= 1`` fails or the interval collapses to a point.
-        """
-        lo_u, hi_u = float(lo_u), float(hi_u)
-        if not (0.0 <= lo_u < hi_u <= 1.0):
-            raise ValueError(
-                f"TruncatedMarginal needs 0 <= lo_u < hi_u <= 1, got [{lo_u}, {hi_u}]."
-            )
-        a, b = float(base.ppf(lo_u)), float(base.ppf(hi_u))
-        support = getattr(base, "support", None)
-        if callable(support):
-            # An interior ppf can round an ulp past the base support; the
-            # truncated support must never leave the original one.
-            base_low, base_high = (float(bound) for bound in support())
-            a = min(max(a, base_low), base_high)
-            b = min(max(b, base_low), base_high)
-        if not a < b:
-            raise ValueError(_collapse_message(base, lo_u, hi_u, a, b))
-        self.base = base
-        self.lo_u = lo_u
-        self.hi_u = hi_u
-        self.a = a
-        self.b = b
-        self.dist = _TruncatedFamily()
-        self.args = ()
-        self.kwds = {}
-
-    @property
-    def _width(self) -> float:
-        return self.hi_u - self.lo_u
-
-    def __repr__(self) -> str:
-        return f"TruncatedMarginal({self.base!r}, lo_u={self.lo_u!r}, hi_u={self.hi_u!r})"
-
-    def support(self) -> tuple[float, float]:
-        """Physical support ``(a, b)`` of the truncated distribution."""
-        return self.a, self.b
-
-    def cdf(self, x: ArrayLike) -> np.ndarray | float:
-        """Cumulative distribution function $(F(x) - u_{lo}) / (u_{hi} - u_{lo})$, clipped to ``[0, 1]``."""
-        base_cdf = np.asarray(self.base.cdf(np.asarray(x, dtype=float)), dtype=float)
-        return _scalar_or_array(np.clip((base_cdf - self.lo_u) / self._width, 0.0, 1.0))
-
-    def sf(self, x: ArrayLike) -> np.ndarray | float:
-        """Survival function $(u_{hi} - F(x)) / (u_{hi} - u_{lo})$, clipped to ``[0, 1]``."""
-        base_cdf = np.asarray(self.base.cdf(np.asarray(x, dtype=float)), dtype=float)
-        return _scalar_or_array(np.clip((self.hi_u - base_cdf) / self._width, 0.0, 1.0))
-
-    def ppf(self, q: ArrayLike) -> np.ndarray | float:
-        """Inverse CDF, ``base.ppf(lo_u + q * (hi_u - lo_u))``; ``nan`` outside ``[0, 1]``."""
-        q = np.asarray(q, dtype=float)
-        inside = (q >= 0.0) & (q <= 1.0)
-        # Clip in both spaces: roundoff in lo + q*width must never step outside
-        # the box, otherwise ppf(1) could land an ulp beyond b.
-        u = np.clip(self.lo_u + np.where(inside, q, 0.0) * self._width, self.lo_u, self.hi_u)
-        x = np.clip(np.asarray(self.base.ppf(u), dtype=float), self.a, self.b)
-        return _scalar_or_array(np.where(inside, x, np.nan))
-
-    def isf(self, q: ArrayLike) -> np.ndarray | float:
-        """Inverse survival function, ``ppf(1 - q)``."""
-        return self.ppf(1.0 - np.asarray(q, dtype=float))
-
-    def logpdf(self, x: ArrayLike) -> np.ndarray | float:
-        """Log-density ``base.logpdf(x) - log(hi_u - lo_u)`` on ``[a, b]``, ``-inf`` outside."""
-        x = np.asarray(x, dtype=float)
-        inside = (x >= self.a) & (x <= self.b)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            log_pdf = np.asarray(self.base.logpdf(x), dtype=float) - np.log(self._width)
-        out = np.where(inside, log_pdf, -np.inf)
-        return _scalar_or_array(np.where(np.isnan(x), np.nan, out))
-
-    def pdf(self, x: ArrayLike) -> np.ndarray | float:
-        """Probability density, ``exp(logpdf(x))``."""
-        return _scalar_or_array(np.exp(np.asarray(self.logpdf(x), dtype=float)))
-
-    def rvs(
-        self,
-        size: int | tuple[int, ...] | None = None,
-        random_state: int | np.random.Generator | np.random.RandomState | None = None,
-    ) -> np.ndarray | float:
-        """Draw samples by inverse-CDF sampling."""
-        if isinstance(random_state, np.random.RandomState):
-            u = random_state.uniform(size=size)
-        else:
-            u = np.random.default_rng(random_state).uniform(size=size)
-        return self.ppf(u)
-
-
-def _validate_unit_box(lower_u, upper_u, ndim: int, min_width: float) -> tuple[np.ndarray, np.ndarray]:
-    """Check a unit-cube box and return its bounds as float arrays of shape ``(ndim,)``."""
-    lo = np.asarray(lower_u, dtype=float)
-    hi = np.asarray(upper_u, dtype=float)
-    if lo.shape != (ndim,) or hi.shape != (ndim,):
-        raise ValueError(
-            f"Box bounds must have shape ({ndim},), got {lo.shape} and {hi.shape}."
-        )
-    problems = []
-    for j in range(ndim):
-        if not (np.isfinite(lo[j]) and np.isfinite(hi[j])):
-            problems.append(f"axis {j}: non-finite bounds [{lo[j]}, {hi[j]}]")
-        elif not (0.0 <= lo[j] < hi[j] <= 1.0):
-            problems.append(f"axis {j}: [{lo[j]}, {hi[j]}] violates 0 <= lo < hi <= 1")
-        elif hi[j] - lo[j] < min_width:
-            problems.append(f"axis {j}: width {hi[j] - lo[j]:.3e} < min_width {min_width:.3e}")
-    if problems:
-        raise ValueError("Invalid unit-cube box: " + "; ".join(problems) + ".")
-    return lo, hi
-
-
-def _collapse_message(dist, lo_u: float, hi_u: float, low: float, high: float) -> str:
-    """Error message for a unit-cube interval with an empty physical image."""
-    return (
-        f"Unit-cube interval [{lo_u}, {hi_u}] of {dist!r} collapses to "
-        f"[{low}, {high}] in physical space; widen the box."
-    )
-
-
-def _rebuild_inside(make, lo_param: float, hi_param: float, outer_low: float, outer_high: float):
-    """Build ``make(lo_param, hi_param)`` with its support inside ``[outer_low, outer_high]``.
-
-    Rebuilding a family rounds its bounds again, so a face can land one ulp
-    outside the original support, where the prior density is ``-inf``. Such a
-    bound is nudged inward by doubling ulp steps.
-    """
-    first_step = float(np.spacing(max(abs(lo_param), abs(hi_param))))
-    step_lo = step_hi = 0.0
-    for _ in range(64):
-        new = make(lo_param, hi_param)
-        new_low, new_high = (float(bound) for bound in new.support())
-        low_ok, high_ok = new_low >= outer_low, new_high <= outer_high
-        if low_ok and high_ok:
-            if new_low < new_high:
-                return new
-            break
-        if not low_ok:
-            step_lo = max(2.0 * step_lo, first_step)
-            lo_param += step_lo
-        if not high_ok:
-            step_hi = max(2.0 * step_hi, first_step)
-            hi_param -= step_hi
-        if not lo_param < hi_param:
-            break
-    raise ValueError(
-        f"Cannot rebuild a truncated {new.dist.name} inside the original support "
-        f"[{outer_low}, {outer_high}]: the box is too narrow, widen it."
-    )
-
-
-def _truncate_marginal(dist, lo_u: float, hi_u: float):
-    """Restrict one marginal to ``[dist.ppf(lo_u), dist.ppf(hi_u)]``, in the same family when possible."""
-    if isinstance(dist, TruncatedMarginal):
-        # Compose in the base cube instead of nesting wrappers. An untouched
-        # face keeps its exact bound: lo + 1.0 * width can round past hi_u.
-        width = dist.hi_u - dist.lo_u
-        new_lo = dist.lo_u if lo_u == 0.0 else min(dist.lo_u + lo_u * width, dist.hi_u)
-        new_hi = dist.hi_u if hi_u == 1.0 else min(dist.lo_u + hi_u * width, dist.hi_u)
-        return TruncatedMarginal(dist.base, new_lo, new_hi)
-
-    family = getattr(dist, "dist", None)
-    name = getattr(family, "name", None)
-    if name not in ("uniform", "loguniform", "reciprocal", "truncnorm"):
-        return TruncatedMarginal(dist, lo_u, hi_u)
-
-    low, high = float(dist.ppf(lo_u)), float(dist.ppf(hi_u))
-    if not low < high:
-        raise ValueError(_collapse_message(dist, lo_u, hi_u, low, high))
-    outer_low, outer_high = (float(bound) for bound in dist.support())
-    # _parse_args normalises positional and keyword loc/scale alike.
-    shapes, loc, scale = family._parse_args(*dist.args, **dist.kwds)
-    if name == "uniform":
-        return _rebuild_inside(uniform, low, high, outer_low, outer_high)
-    if name == "truncnorm":
-        loc, scale = float(loc), float(scale)
-        # Standardised bounds, as in norm(); an untouched face reuses the
-        # original one so that it stays bit-identical to the original support.
-        a = float(shapes[0]) if lo_u == 0.0 else (low - loc) / scale
-        b = float(shapes[1]) if hi_u == 1.0 else (high - loc) / scale
-        return _rebuild_inside(
-            lambda a_, b_: stats.truncnorm(a_, b_, loc=loc, scale=scale), a, b, outer_low, outer_high
-        )
-    if loc == 0:
-        # A pure rescale of a log-uniform is still log-uniform on [low, high].
-        return _rebuild_inside(loguniform, low, high, outer_low, outer_high)
-    # A shifted log-uniform has no closed form in this family.
-    return TruncatedMarginal(dist, lo_u, hi_u)
 
 
 def validate_finite_support(prior: "MultipleIndependent") -> None:
@@ -440,46 +210,6 @@ class MultipleIndependent:
                 contribution -= 2.0 * np.asarray(dist.logpdf(rows[:, j]), dtype=float)
         return float(contribution[0]) if x.ndim == 1 else contribution
 
-    def truncated(
-        self, lower_u: np.ndarray, upper_u: np.ndarray, *, min_width: float = 1e-9
-    ) -> tuple["MultipleIndependent", float]:
-        r"""Restrict the prior to a box of its unit cube $u = F(\theta)$.
-
-        Each marginal is restricted to
-        $[F_j^{-1}(u^{lo}_j), F_j^{-1}(u^{hi}_j)]$ and renormalised, so the
-        returned prior $\pi_B$ satisfies
-        $\pi_B(\theta) = \pi(\theta) / M_B$ inside the box, with prior mass
-        $M_B = \prod_j (u^{hi}_j - u^{lo}_j)$, and its unit cube is the affine
-        rescaling $F_{B,j}(\theta_j) = (F_j(\theta_j) - u^{lo}_j) / (u^{hi}_j - u^{lo}_j)$.
-        An evidence computed under $\pi_B$ is therefore corrected with
-        $\log Z = \log Z_B + \log M_B$.
-
-        ``uniform``, ``loguniform`` and ``norm`` marginals stay in their SciPy
-        family; others are wrapped in a
-        [`TruncatedMarginal`][bsixsa.priors.TruncatedMarginal]. Truncated
-        supports always lie inside the original ones.
-
-        Parameters:
-            lower_u: Lower box bounds in the unit cube, shape ``(ndim,)``.
-            upper_u: Upper box bounds in the unit cube, shape ``(ndim,)``.
-            min_width: Smallest accepted width on any axis.
-
-        Returns:
-            ``(prior, log_mass)``: the truncated prior and $\log M_B$.
-
-        Raises:
-            ValueError: If the box is invalid, too narrow, or collapses to a point.
-        """
-        lo, hi = _validate_unit_box(lower_u, upper_u, self.ndim, min_width)
-        dists = [
-            dist if (lo[j] == 0.0 and hi[j] == 1.0)
-            else _truncate_marginal(dist, float(lo[j]), float(hi[j]))
-            for j, dist in enumerate(self.dists)
-        ]
-        # Under the prior each u_j is independent U(0, 1): the box mass is exact.
-        log_mass = float(np.sum(np.log(hi - lo)))
-        return MultipleIndependent(dists), log_mass
-
     def max_log_pdf_per_axis(self) -> np.ndarray:
         """Per-axis maximum of ``logpdf`` over the support (``uniform``, ``loguniform`` and ``norm`` only).
 
@@ -499,13 +229,6 @@ class MultipleIndependent:
                 # dist.kwds would miss (silently clamping the mode to 0).
                 _, loc, _ = dist.dist._parse_args(*dist.args, **dist.kwds)
                 out[j] = float(dist.logpdf(min(max(float(loc), lo), hi)))
-            elif name == "truncated":
-                raise NotImplementedError(
-                    f"max_log_pdf is not implemented for axis {j}, a TruncatedMarginal "
-                    f"over {dist.base!r}: its maximum depends on the wrapped family. "
-                    "Only uniform, loguniform, and truncnorm priors (truncated or "
-                    "not) are supported."
-                )
             else:
                 raise NotImplementedError(
                     f"max_log_pdf is not implemented for {name!r}; "

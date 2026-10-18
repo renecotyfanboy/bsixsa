@@ -1,4 +1,4 @@
-r"""Decision rules of the history-matching waves: threshold, recall check, stop and box padding.
+r"""Decision rules of the history-matching waves: threshold, recall check and stop.
 
 Notation: ``best`` is the smallest exact C-stat folded so far, ``span`` the
 posterior span $\chi^2_d(0.999)$ and ``rmse_cstat`` ($\sigma_C$) the
@@ -13,7 +13,6 @@ import numpy as np
 from scipy.stats import chi2
 
 __all__ = [
-    "pad_box",
     "posterior_span",
     "recall_check",
     "stop_reason",
@@ -231,42 +230,3 @@ def stop_reason(
         return "n_waves"
     return None
 
-
-def pad_box(
-    lo: np.ndarray,
-    hi: np.ndarray,
-    *,
-    box_padding: float,
-    rmse_cstat: float,
-    delta: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    r"""Pad a unit-cube bounding box and clip it to $[0, 1]^d$.
-
-    Each side of an axis of width $w$ grows by
-    $\max(\text{box\_padding}\cdot w,\; \tfrac{3\,\sigma_C}{2\Delta}\cdot\tfrac{w}{2})$,
-    the second term being how far a $3\sigma_C$ surrogate error moves the
-    boundary of a quadratic C-stat bowl.
-
-    Parameters:
-        lo: Lower corner, shape ``(d,)``.
-        hi: Upper corner, shape ``(d,)``, with ``hi >= lo``.
-        box_padding: Minimum padding as a fraction of the width.
-        rmse_cstat: The surrogate's C-stat error.
-        delta: Threshold minus best C-stat.
-
-    Returns:
-        ``(lo, hi)`` padded and clipped to $[0, 1]$.
-
-    Raises:
-        ValueError: If the corners have different shapes or ``hi < lo``.
-    """
-    lo = np.asarray(lo, dtype=np.float64).reshape(-1)
-    hi = np.asarray(hi, dtype=np.float64).reshape(-1)
-    if lo.shape != hi.shape:
-        raise ValueError(f"lo and hi must have the same shape, got {lo.shape} and {hi.shape}.")
-    if np.any(hi < lo):
-        raise ValueError("pad_box expects hi >= lo on every axis.")
-    width = hi - lo
-    surrogate = 3.0 * float(rmse_cstat) / (2.0 * max(float(delta), 1e-12))
-    pad = np.maximum(float(box_padding) * width, surrogate * width / 2.0)
-    return np.clip(lo - pad, 0.0, 1.0), np.clip(hi + pad, 0.0, 1.0)

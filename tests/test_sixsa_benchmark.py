@@ -15,7 +15,7 @@ def test_reference_refinement_includes_the_xspec_prior_term():
     spec.loader.exec_module(benchmark)
 
     class Solver:
-        base_prior = MultipleIndependent([loguniform(1e-4, 1e-2)])
+        prior = MultipleIndependent([loguniform(1e-4, 1e-2)])
         num_parameters = 1
 
         def simulate(self, theta, **kwargs):

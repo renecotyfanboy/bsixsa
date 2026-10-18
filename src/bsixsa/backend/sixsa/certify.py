@@ -44,7 +44,7 @@ __all__ = [
 
 # Below this k-hat the weight variance is finite and efficiencies compare.
 KHAT_SAFE = 0.5
-# k-hat differences within this band are noise at the screening sample size.
+# k-hat differences within this band are noise at the gate's sample size.
 KHAT_TOLERANCE = 0.05
 # PSIS needs a handful of tail points to fit a generalised Pareto at all.
 _MIN_PSIS_WEIGHTS = 5
@@ -235,7 +235,7 @@ def build_certificate(
 
 
 def certify(
-    proposals: Sequence[Proposal],
+    proposal: Proposal,
     n: int,
     cstat_fn: CstatFn,
     *,
@@ -243,28 +243,13 @@ def certify(
     round_index: int | None,
     khat_threshold: float,
     min_efficiency: float,
-    mixture: Proposal | None = None,
-) -> list[Certificate]:
-    """Certify each proposal on `n` of its own draws.
-
-    An optional equal-weight `mixture` of these proposals is certified on
-    their pooled draws, which are a sample of the mixture, at no extra fold.
-    """
-    n = int(n)
-    draws = [np.asarray(p.sample_raw(n, rng), dtype=np.float64) for p in proposals]
-    pooled = np.concatenate(draws, axis=0)
-    cstat = np.asarray(cstat_fn(pooled), dtype=np.float64).ravel()
-    thresholds = dict(round_index=round_index, khat_threshold=khat_threshold, min_efficiency=min_efficiency)
-    certificates = [
-        build_certificate(p.name, u, cstat[k * n : (k + 1) * n], p.log_prob_raw(u), proposal=p, **thresholds)
-        for k, (p, u) in enumerate(zip(proposals, draws))
-    ]
-    if mixture is not None:
-        certificates.append(
-            build_certificate(mixture.name, pooled, cstat, mixture.log_prob_raw(pooled), proposal=mixture,
-                              **thresholds)
-        )
-    return certificates
+) -> Certificate:
+    """Certify a proposal on `n` of its own draws."""
+    u = np.asarray(proposal.sample_raw(int(n), rng), dtype=np.float64)
+    return build_certificate(
+        proposal.name, u, cstat_fn(u), proposal.log_prob_raw(u), proposal=proposal, round_index=round_index,
+        khat_threshold=khat_threshold, min_efficiency=min_efficiency,
+    )
 
 
 def _tier(cert: Certificate) -> int:

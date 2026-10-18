@@ -116,7 +116,7 @@ def face_truth(quad: QuadCstat) -> float:
 
 
 def certify_one(proposal, n, sim, *, seed, round_index=0) -> Certificate:
-    return certify([proposal], n, sim, rng=np.random.default_rng(seed), round_index=round_index, **GATE)[0]
+    return certify(proposal, n, sim, rng=np.random.default_rng(seed), round_index=round_index, **GATE)
 
 
 # ---------------------------------------------------------------------------
@@ -254,20 +254,18 @@ def _mixture_setup():
     return quad, heavy, light, EqualMixture([heavy, light])
 
 
-def test_mixture_certificate_is_unbiased_under_unequal_leakage_with_no_extra_fold():
+def test_mixture_certificate_is_unbiased_under_unequal_leakage():
     quad, heavy, light, mixture = _mixture_setup()
     assert heavy.leakage() > 0.4 and light.leakage() < 0.06
     truth = face_truth(quad)
     sim = FakeSimulator(quad)
 
-    certs = certify([heavy, light], 20_000, sim, rng=np.random.default_rng(2), round_index=1, mixture=mixture, **GATE)
+    certs = [certify_one(proposal, 20_000, sim, seed=2, round_index=1) for proposal in (heavy, light, mixture)]
 
     assert [c.name for c in certs] == ["leaky", "tight", "mixture"]
-    assert sim.calls == 1 and sim.rows == 40_000
-    member_a, member_b, pooled = certs
-    assert pooled.n_raw == 40_000 and pooled.proposal is mixture
-    np.testing.assert_array_equal(pooled.u, np.concatenate([member_a.u, member_b.u]))
-    np.testing.assert_array_equal(pooled.cstat, np.concatenate([member_a.cstat, member_b.cstat]))
+    assert sim.calls == 3
+    pooled = certs[-1]
+    assert pooled.n_raw == 20_000 and pooled.proposal is mixture
     for cert in certs:
         assert abs(cert.log_z - truth) < 4.0 * cert.log_z_err
     finite = np.isfinite(pooled.log_w)
@@ -280,8 +278,7 @@ def test_mixture_certificate_evidence_is_unbiased_over_repeats():
     truth = face_truth(quad)
     sim = FakeSimulator(quad)
     ratios = np.array([
-        math.exp(certify([heavy, light], 2000, sim, rng=np.random.default_rng(100 + repeat), round_index=0,
-                         mixture=mixture, **GATE)[-1].log_z - truth)
+        math.exp(certify_one(mixture, 4000, sim, seed=100 + repeat).log_z - truth)
         for repeat in range(200)
     ])
     # Z itself (not log Z) is the unbiased quantity.

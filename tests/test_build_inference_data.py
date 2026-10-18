@@ -42,7 +42,6 @@ def _solver_without_xspec(tmp_path, posterior_sample):
         overwrite=False,
         n_jobs=1,
         backend=Nessai(trace=False),
-        restrict_prior=False,
     )
     solver.distributions["posterior"] = fake_posterior
     solver.backend = fake_posterior

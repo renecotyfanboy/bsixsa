@@ -1,4 +1,4 @@
-r"""History matching: shrink the prior to the region worth sampling, before the main inference.
+r"""History matching: SIXSA's first step, which shrinks the prior to the region worth sampling.
 
 - **fold**: one exact C-stat evaluation at a parameter point (the expensive step).
 - **surrogate**: a small neural network trained on the folds to predict the C-stat.
@@ -11,8 +11,6 @@ r"""History matching: shrink the prior to the region worth sampling, before the 
   would be discarded.
 - **region**: the parameter values whose predicted C-stat is below the threshold
   ([`Region`][bsixsa.restriction.Region]); SIXSA draws its training data in it.
-- **bounding box**: the padded box around the region. Other backends sample it as a
-  truncated prior and their evidence is corrected by its log prior mass $\log M_B$.
 
 Everything is done on the unit cube $u = F(\theta)$ (prior CDF per parameter), so the
 volume of a region is its prior mass.

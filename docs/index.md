@@ -196,9 +196,7 @@ $Z = \int L(\theta)\, \pi(\theta)\, d\theta$, with $L = e^{-C/2}$ as in XSPEC.
 This $-C/2$ differs from the full Poisson log-likelihood by a constant that
 depends only on the data, so `log_Z` values can be compared only between models fitted
 to the same spectrum, with the same binning and energy range. Their difference is
-the log Bayes factor of the two models. When the backend sampled a prior
-narrowed by history matching, `log_Z` still refers to your full prior: the
-correction (`log_Z_restriction_correction`) is already included.
+the log Bayes factor of the two models.
 
 **`best_fit_stat`** is the C-statistic at `best_fit` plus the prior term XSPEC
 adds with `Fit.bayes = "on"` (0 for `uniform`, $2 \ln x$ for `loguniform`).
@@ -229,10 +227,9 @@ To go further:
 - **Unit cube**: the parameters mapped to $[0, 1]$ by the cumulative distribution
   of their priors, where the prior is uniform. Samplers and SIXSA work there;
   results are always given in physical units.
-- **History matching**: an optional first step that folds parameter values spread
+- **History matching**: SIXSA's first step, which folds parameter values spread
   over the prior and rules out the regions where the model cannot fit the data,
-  so that the backend only explores the plausible region. SIXSA uses it by
-  default, the other backends with `restrict_prior=True`. See
+  so that SIXSA only learns in the plausible region. See
   [History matching](reference/restriction.md).
 - **Importance sampling**: drawing parameters from an approximate distribution
   (the proposal) and giving each draw a weight, its posterior density over its

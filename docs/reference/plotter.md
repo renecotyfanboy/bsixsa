@@ -1,10 +1,7 @@
 # Plotting
 
 ```python
-from bsixsa.analysis import plot_data
-
-fig = plot_data(min_counts=20)  # the data and the current XSPEC model, before fitting
-fig = solver.plot_predictive_coverage("prior")  # prior predictive check
+fig = solver.plot_predictive_coverage("prior")  # prior predictive check, before fitting
 result = solver.run()
 fig = solver.plot_predictive_coverage()  # posterior predictive check
 ```
@@ -24,6 +21,5 @@ fig = solver.plot_predictive_coverage(spectra=[1, 3], plot_components=[""])  # c
     options:
       show_root_heading: false
       members:
-      - plot_data
       - plot_predictive_coverage
       - poisson_error_bars

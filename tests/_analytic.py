@@ -252,7 +252,6 @@ class AnalyticSolver(Solver):
         outputfiles_basename: Output directory.
         overwrite: Whether a non-empty output directory may be cleared.
         n_jobs: Nominal pool size (no pool is ever created).
-        restrict_prior: Forwarded to `Solver._setup`.
     """
 
     def __init__(
@@ -263,7 +262,6 @@ class AnalyticSolver(Solver):
         outputfiles_basename,
         overwrite: bool = True,
         n_jobs: int = 1,
-        restrict_prior=None,
     ):
         self.spectrum = spectrum
         self.n_pool_requests = 0
@@ -278,7 +276,6 @@ class AnalyticSolver(Solver):
             overwrite=overwrite,
             n_jobs=n_jobs,
             backend=backend,
-            restrict_prior=restrict_prior,
         )
 
     @property

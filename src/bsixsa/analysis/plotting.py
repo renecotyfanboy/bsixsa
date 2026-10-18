@@ -1,10 +1,8 @@
-"""Plots of the spectra loaded in XSPEC: the data, the current model and predictive checks.
+"""Predictive checks of the spectra loaded in XSPEC.
 
-[`plot_data`][bsixsa.analysis.plotting.plot_data] shows the data and the
-current XSPEC model;
 [`plot_predictive_coverage`][bsixsa.analysis.plotting.plot_predictive_coverage]
 compares the data with spectra simulated from the prior or the posterior of a
-[`Solver`][bsixsa.solver.Solver]. Both draw one column per spectrum: the
+[`Solver`][bsixsa.solver.Solver]. It draws one column per spectrum: the
 spectrum above its residuals. `min_counts` and `grouping` merge channels for
 the figure only, never for the fit.
 """
@@ -260,19 +258,14 @@ def _curve_styles(curve_ids: Iterable[tuple[str, str]]) -> dict[tuple[str, str],
     return styles
 
 
-def _make_figure(
-    n_columns: int, figsize: tuple[float, float] | None, draw_residuals: bool
-) -> tuple[Figure, list[Axes], list[Axes | None]]:
-    """Return the figure, the spectrum axes and the residual axes (`None` without residuals), one per column."""
+def _make_figure(n_columns: int, figsize: tuple[float, float] | None) -> tuple[Figure, list[Axes], list[Axes]]:
+    """Return the figure, the spectrum axes and the residual axes, one per column."""
     if figsize is None:
         figsize = _SINGLE_FIGSIZE if n_columns == 1 else (_PANEL_SIZE[0] * n_columns, _PANEL_SIZE[1])
-    if draw_residuals:
-        fig, axes = plt.subplots(
-            nrows=2, ncols=n_columns, figsize=figsize, sharex="col", height_ratios=[4, 1], squeeze=False
-        )
-        return fig, list(axes[0]), list(axes[1])
-    fig, axes = plt.subplots(ncols=n_columns, figsize=figsize, squeeze=False)
-    return fig, list(axes[0]), [None] * n_columns
+    fig, axes = plt.subplots(
+        nrows=2, ncols=n_columns, figsize=figsize, sharex="col", height_ratios=[4, 1], squeeze=False
+    )
+    return fig, list(axes[0]), list(axes[1])
 
 
 def _panel_title(state: SpectrumState) -> str:
@@ -390,137 +383,6 @@ def _finish_spectrum_panel(
         shared.xaxis.set_minor_formatter(_EnergyFormatter())
 
 
-def plot_data(
-    *,
-    plot_model: bool = True,
-    plot_components: bool | str | Sequence[str] = True,
-    show_residuals: bool = True,
-    x_lim: tuple[float, float] | None = None,
-    y_lim: tuple[float, float] | None = None,
-    figsize: tuple[float, float] | None = None,
-    min_counts: int | None = None,
-    grouping: int | None = None,
-    legend: bool = True,
-    spectra: int | Sequence[int] | None = None,
-) -> Figure:
-    r"""Plot the observed spectra and the model currently loaded in XSPEC.
-
-    A quick look without any inference: the model is folded at its current
-    XSPEC parameter values. Each spectrum gets a column with the data and the
-    error bars of
-    [`poisson_error_bars`][bsixsa.analysis.plotting.poisson_error_bars], the
-    total model, one curve per model folded into the spectrum and per
-    additive component, and the Pearson residuals $(D - M)/\sqrt{M}$. Ignored
-    energy ranges are left empty, and backgrounds are not plotted.
-
-    Parameters:
-        plot_model: Overlay the model. Defaults to `True`.
-        plot_components: Draw the additive components of every model (`True`),
-            of none (`False`), or of the models named in a list (`''` for the
-            unnamed model). Defaults to `True`.
-        show_residuals: Add the residual panels (with `plot_model`). Defaults to `True`.
-        x_lim: Energy range in keV. Defaults to that of the noticed channels.
-        y_lim: y-axis limits of the spectrum panels, in counts per keV.
-        figsize: Figure size in inches. Defaults to `(12, 6)` for one
-            spectrum and 6 by 6 inches per spectrum otherwise.
-        min_counts: Merge adjacent channels until each displayed bin holds at
-            least this many counts. Exclusive with `grouping`.
-        grouping: Merge every `grouping` adjacent channels. Exclusive with `min_counts`.
-        legend: Show the legends. Defaults to `True`.
-        spectra: XSPEC index (or list of indices) of the spectra to plot.
-            Defaults to every loaded spectrum.
-
-    Returns:
-        The figure.
-
-    Raises:
-        ValueError: If both `min_counts` and `grouping` are given, if
-            `grouping` is below 1, or if `spectra` or `plot_components` names
-            something that is not loaded.
-    """
-    _check_regrouping(min_counts, grouping)
-    _, states = _plotted_spectra(spectra)
-    components = _component_selection(plot_components, states) if plot_model else False
-    draw_residuals = show_residuals and plot_model
-
-    panels = []
-    for state in states:
-        bins = _DisplayBins(state.bin_energies, state.observed_counts, min_counts, grouping)
-        model_counts = state.model_counts if plot_model else {}
-        component_counts = state.component_counts if components else {}
-        curves = list(_model_curves(model_counts, component_counts, list(model_counts), True, components))
-        panels.append((state, bins, model_counts, curves))
-    styles = _curve_styles(curve_id for *_, curves in panels for curve_id, _, _ in curves)
-
-    fig, spectrum_axes, residual_axes = _make_figure(len(panels), figsize, draw_residuals)
-    for column, ((state, bins, model_counts, curves), ax_spec, ax_res) in enumerate(
-        zip(panels, spectrum_axes, residual_axes)
-    ):
-        observed_counts = bins.sum(state.observed_counts)
-        handles = [_draw_observed_spectrum(ax_spec, bins, observed_counts)]
-        labels = ["Observed Spectrum"]
-
-        if plot_model:
-            total_model_counts = bins.sum(sum(model_counts.values(), np.zeros(len(state.observed_counts))))
-            handles.append(
-                ax_spec.stairs(
-                    bins.stairs(total_model_counts / bins.width),
-                    edges=bins.edges,
-                    color=_TOTAL_MODEL_COLOR,
-                    alpha=_MEDIAN_ALPHA,
-                    zorder=100,
-                    linestyle="solid",
-                )
-            )
-            labels.append("Total model")
-
-            for curve_id, label, counts in curves:
-                color, hatch = styles[curve_id]
-                per_kev = bins.stairs(bins.sum(counts) / bins.width)
-                if hatch is None:  # a model
-                    line = ax_spec.stairs(
-                        per_kev, edges=bins.edges, color=color, alpha=_MEDIAN_ALPHA, zorder=90, linestyle="dashed"
-                    )
-                else:  # an additive component: dotted line over a hatched fill
-                    line = ax_spec.stairs(
-                        per_kev, edges=bins.edges, color=color, alpha=_MEDIAN_ALPHA, zorder=80, linestyle="dotted"
-                    )
-                    ax_spec.stairs(
-                        per_kev,
-                        edges=bins.edges,
-                        baseline=0,
-                        fill=True,
-                        alpha=0.08,
-                        color=color,
-                        zorder=60,
-                        hatch=hatch,
-                        edgecolor=_COMPONENT_EDGE_COLOR,
-                    )
-                handles.append(line)
-                labels.append(label)
-
-            if draw_residuals:
-                safe_model = np.where(total_model_counts > 0, total_model_counts, 1.0)
-                residuals = (observed_counts - total_model_counts) / np.sqrt(safe_model)
-                ax_res.stairs(bins.stairs(residuals), edges=bins.edges, color=_TOTAL_MODEL_COLOR, alpha=_MEDIAN_ALPHA)
-                _finish_residual_panel(
-                    ax_res,
-                    np.max(np.abs(residuals)),
-                    r"$\frac{D - M}{\sqrt{M}}$" if column == 0 else None,
-                    in_sigma_units=True,
-                )
-
-        _finish_spectrum_panel(ax_spec, bins, x_lim, y_lim, with_ylabel=column == 0)
-        if not draw_residuals:
-            ax_spec.set_xlabel("Energy [keV]")
-        if len(panels) > 1:
-            ax_spec.set_title(_panel_title(state))
-        if legend:
-            ax_spec.legend(handles, labels, loc="upper right", fontsize="small" if len(panels) > 1 else None)
-    fig.align_ylabels()
-    return fig
-
-
 def plot_predictive_coverage(
     solver: "Solver",
     distribution: str = "posterior",
@@ -575,7 +437,7 @@ def plot_predictive_coverage(
 
     Parameters:
         solver: The solver whose prior or posterior is checked.
-        distribution: `"prior"`, `"restricted_prior"` or `"posterior"`; see
+        distribution: `"prior"` or `"posterior"`; see
             [`Solver.sample_parameters`][bsixsa.solver.Solver.sample_parameters].
             Defaults to `"posterior"`.
         x_lim: Energy range in keV. Defaults to that of the noticed channels.
@@ -634,7 +496,7 @@ def plot_predictive_coverage(
         panels.append((state, segment, curves))
     styles = _curve_styles(curve_id for *_, curves in panels for curve_id, _, _ in curves)
 
-    fig, spectrum_axes, residual_axes = _make_figure(len(panels), figsize, draw_residuals=True)
+    fig, spectrum_axes, residual_axes = _make_figure(len(panels), figsize)
     component_style = {"alpha_68": 0.1, "alpha_95": 0.05, "hatch_linewidth": 1, "edgecolor": _COMPONENT_EDGE_COLOR}
     for column, ((state, segment, curves), ax_spec, ax_res) in enumerate(zip(panels, spectrum_axes, residual_axes)):
         bins = _DisplayBins(state.bin_energies, state.observed_counts, min_counts, grouping)

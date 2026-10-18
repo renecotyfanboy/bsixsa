@@ -51,8 +51,7 @@ xspec.Fit.bayes = "off"
 # Load one spectrum, its response and model, then define your prior as usual.
 solver = Solver(
     prior,
-    backend=SIXSA(seed=42, n_nde=5),
-    restrict_prior=HistoryMatching(seed=42),
+    backend=SIXSA(seed=42, n_nde=5, history_matching=HistoryMatching(seed=42)),
     outputfiles_basename="fit-sixsa",
 )
 result = solver.run()
@@ -61,8 +60,8 @@ print(solver.backend.posterior.passed, solver.backend.posterior.k_hat)
 ```
 
 The backend logs each round through the `bsixsa` logger: attach a handler (or
-`logging.basicConfig(level=logging.INFO)`) to follow the compressor fits, the
-screening, the k-hat trajectory and the truncation.
+`logging.basicConfig(level=logging.INFO)`) to follow the history-matching
+waves, the compressor fits, the k-hat trajectory and the truncation.
 
 SIXSA requires one spectrum, the C-statistic, no loaded background and finite
 priors; `Solver(...)` checks this.
@@ -73,8 +72,9 @@ priors; `Solver(...)` checks this.
       C-stat $C$ of a parameter vector.
     - **unit cube**: each parameter mapped through its prior CDF,
       $u = F(\theta)$, so the prior is uniform on $[0, 1]^d$.
-    - **proposal**: a density $q$ over the parameters, given by a flow at the
-      observed spectrum, cheap to sample and to evaluate.
+    - **proposal**: a density $q$ over the parameters, the equal-weight
+      mixture of the round's flows at the observed spectrum, cheap to sample
+      and to evaluate.
     - **importance weight**: $w = e^{-C/2} / q$ for a draw of the proposal; the
       weighted draws are a posterior sample, and the mean weight estimates the
       evidence.
@@ -96,24 +96,24 @@ priors; `Solver(...)` checks this.
 ### What the run does
 
 1. [History matching](restriction.md) learns a generous plausible region from
-   exact C-stat evaluations; it is enabled by default for this backend.
+   exact C-stat evaluations; `history_matching=None` skips it.
 2. A training set is simulated flat on that region (or on a Latin hypercube of
-   the full prior with `restrict_prior=False`). Parameters live in the prior's
+   the full prior without history matching). Parameters live in the prior's
    unit cube throughout, where the prior density is one.
 3. A Cash-loss autoencoder maps counts to latent codes. It is refitted at the
    start of each round, warm-started from the previous fit (see
    `refresh_compressor` to refit only in the first rounds); the training
    spectra and the observation are then both encoded with the current fit.
-4. `n_nde` flows are trained on the (parameters, code) pairs with sbi's
-   `NPE_C` and the plain maximum-likelihood loss. Each flow is screened on
-   `check_draws` draws (each one inside the prior bounds costs an exact fold), and their equal-weight mixture on the pooled
-   draws at no extra fold (no screening when `n_nde=1`).
-5. The best candidate is certified on `check_draws` **fresh** draws. The gate
+4. `n_nde` flows are trained from different seeds on the (parameters, code)
+   pairs with sbi's `NPE_C` and the plain maximum-likelihood loss; their
+   equal-weight mixture is the round's proposal.
+5. The proposal is certified on `check_draws` draws (each one inside the prior
+   bounds costs an exact fold). The gate
    is k-hat below `khat_threshold` (0.7) and an efficiency of at least
    `min_efficiency` (5%), with more than ⌈3√n⌉ + 4 positive weights (at least
    100 of the default 1000 draws) so that k-hat can be fitted at all.
 6. Unless the gate passed or the rounds ran out, the next training set (`train_ramp` times larger,
-   capped at `train_max`) is drawn approximately uniformly inside the winner's
+   capped at `train_max`) is drawn approximately uniformly inside the proposal's
    highest-density region $\{u : \log q(u) > t\}$, which holds
    1 - `truncated_quantile` of its in-cube mass (99.9% by default), intersected
    with the history-matching region, by sampling importance resampling with
@@ -156,7 +156,10 @@ XSPEC-convention prior term. `solver.backend` keeps:
   plus the certificate itself under `certificate` (left out of
   `summary.json`), the compressor fit, the flows' training records and the
   truncation diagnostics;
-- `certificates`, every screen and gate certificate of the run;
+- `certificates`, the gate certificate of every round;
+- `restriction`, the history-matching
+  [`Restriction`][bsixsa.restriction.Restriction], or `None` without history
+  matching;
 - `best_round` and `exit_reason` (`"gate"` or `"n_rounds"`).
 
 ```python
@@ -167,21 +170,21 @@ idata = solver.build_inference_data(num_samples=1000)
 
 Under `fit-sixsa/sixsa/`: `summary.json` (the scalars above, per round, plus
 the configuration), `posterior.npz` (the weighted draws), one TensorBoard
-directory per trained flow in `round_<r>/member_<k>/`, and the convergence,
-compressor and weight figures when `plot_diagnostics` is on. Restriction
-diagnostics live in `fit-sixsa/restriction/`.
+directory per trained flow in `round_<r>/member_<k>/`, and the history-matching
+folds and per-wave history in `restriction/`.
 
 The evidence uses XSPEC's `exp(-C/2)` convention. Raw flow draws outside the
 unit cube receive zero weight and stay in the denominator, so certification
-targets the full base prior without any leakage estimate.
+targets the full prior without any leakage estimate.
 
 ### Certificates
 
 A certificate weighs `n` raw draws of a proposal against the exact statistic,
 `log w = -C/2 - log q`, and reports the Pareto-smoothed importance sampling
 diagnostics (Vehtari et al.): k-hat, the effective sample size, the efficiency
-and `log Z = logsumexp(log w) - log n`. k-hat gates and efficiency ranks: a
-passing certificate beats the others; among the rest, those with k-hat below
+and `log Z = logsumexp(log w) - log n`. When no round passes the gate, the
+best-ranked certificate gives the final proposal. k-hat gates and efficiency
+ranks: a passing certificate beats the others; among the rest, those with k-hat below
 0.5 (finite weight variance) compare on efficiency, and otherwise the lowest
 k-hat (within 0.05) decides, again on efficiency. A certificate whose weights
 cannot support a tail fit is never selected over one that can.
@@ -215,13 +218,7 @@ available.
       show_root_full_path: false
       heading_level: 4
 
-::: bsixsa.backend.config.NDEConfig
-    options:
-      show_root_heading: true
-      show_root_full_path: false
-      heading_level: 4
-
-::: bsixsa.backend.config.TrainingConfig
+::: bsixsa.backend.config.FlowConfig
     options:
       show_root_heading: true
       show_root_full_path: false

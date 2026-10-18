@@ -20,6 +20,11 @@ from .certify import Proposal
 
 __all__ = ["FlowProposal", "MixtureProposal", "train_flow"]
 
+# Training settings of every flow; the configurable ones are in `FlowConfig`.
+_LEARNING_RATE = 1e-3
+_VALIDATION_FRACTION = 0.2
+_CLIP_MAX_NORM = 1.0
+
 
 class FlowProposal:
     """A trained conditional estimator evaluated at the observation's code."""
@@ -85,9 +90,19 @@ class MixtureProposal:
         return logsumexp(log_q, axis=0) - np.log(len(self.members))
 
 
-def train_flow(u: np.ndarray, z: np.ndarray, *, nde: dict, training: dict, seed: int,
-               log_dir: str | Path) -> tuple[Any, dict]:
-    """Train one NPE on ``(u, z)`` pairs; return the estimator and its training record.
+def train_flow(
+    u: np.ndarray,
+    z: np.ndarray,
+    *,
+    hidden_features: int,
+    num_transforms: int,
+    training_batch_size: int,
+    max_num_epochs: int,
+    stop_after_epochs: int,
+    seed: int,
+    log_dir: str | Path,
+) -> tuple[Any, dict]:
+    """Train one masked autoregressive flow on ``(u, z)`` pairs; return the estimator and its training record.
 
     Training curves are written to *log_dir* for TensorBoard.
     """
@@ -104,12 +119,17 @@ def train_flow(u: np.ndarray, z: np.ndarray, *, nde: dict, training: dict, seed:
     torch.manual_seed(int(seed))
     writer = SummaryWriter(log_dir=str(log_dir))
     try:
+        estimator_builder = posterior_nn("zuko_maf", hidden_features=hidden_features, num_transforms=num_transforms)
         inference = NPE_C(
-            prior=BoxUniform(torch.zeros(d), torch.ones(d)), density_estimator=posterior_nn(**nde),
+            prior=BoxUniform(torch.zeros(d), torch.ones(d)), density_estimator=estimator_builder,
             show_progress_bars=False, tracker=TensorBoardTracker(writer),
         )
         # Training draws are flat on their region, so the plain maximum-likelihood loss applies.
-        estimator = inference.append_simulations(theta, x).train(force_first_round_loss=True, **training)
+        estimator = inference.append_simulations(theta, x).train(
+            force_first_round_loss=True, training_batch_size=training_batch_size, max_num_epochs=max_num_epochs,
+            stop_after_epochs=stop_after_epochs, learning_rate=_LEARNING_RATE,
+            validation_fraction=_VALIDATION_FRACTION, clip_max_norm=_CLIP_MAX_NORM,
+        )
     finally:
         writer.close()
     summary = inference.summary

@@ -1,19 +1,21 @@
 r"""SIXSA: simulation-based inference whose answer is checked against exact folds.
 
-Each round has two parts.
+History matching first shrinks the prior to the region worth sampling (see
+[`bsixsa.restriction`][bsixsa.restriction]). Then each round has two parts.
 
 1. **Learning where to look.** Spectra are simulated (folded through XSPEC,
    with Poisson noise) at parameters spread over the plausible region. An
    autoencoder compresses each spectrum into a short code, and `n_nde`
    normalising flows learn $p(\text{parameters} \mid \text{code})$ from these
-   pairs. Evaluated at the code of the observed spectrum, a flow is a
-   *proposal*: a cheap guess of the posterior.
-2. **Checking the guess exactly.** Draws from a proposal are folded through
-   XSPEC and weighted by $e^{-C/2} / q$, the exact likelihood over the
+   pairs. Evaluated at the code of the observed spectrum, the equal-weight
+   mixture of the flows is the round's *proposal*: a cheap guess of the
+   posterior.
+2. **Checking the guess exactly.** Draws from the proposal are folded
+   through XSPEC and weighted by $e^{-C/2} / q$, the exact likelihood over the
    proposal density. The Pareto k-hat of these weights says whether the guess
    is good enough for importance sampling. If it is not, the next round
-   simulates only where the best proposal puts its mass, with a larger
-   training set.
+   simulates only where the proposal puts its mass, with a larger training
+   set.
 
 Once a proposal passes, or the rounds run out, the posterior is an importance
 sample from the best one. Parameters live in the prior's unit cube, where the
@@ -22,11 +24,9 @@ prior density is 1.
 Glossary:
 
 - *fold*: one exact evaluation of the model through XSPEC.
-- *screen*: certifying every flow of a round, and their equal-weight mixture,
-  on `check_draws` draws each to pick the best one (skipped when `n_nde = 1`).
-- *gate*: certifying the round's best proposal on `check_draws` fresh draws;
-  it passes when k-hat is below `khat_threshold` and the efficiency is at
-  least `min_efficiency`.
+- *gate*: certifying the round's proposal on `check_draws` draws; it passes
+  when k-hat is below `khat_threshold` and the efficiency is at least
+  `min_efficiency`.
 - *certificate*: the draws, weights and diagnostics of one such check
   ([`Certificate`][bsixsa.backend.sixsa.certify.Certificate]).
 """
@@ -45,6 +45,7 @@ import pandas as pd
 from ..abc import Backend
 from ..config import SIXSA
 from ..._cube import in_cube, latin_hypercube, to_physical
+from ...restriction import Restriction, run_history_matching
 from ...solver import FitResults, Solver
 from .certify import Certificate, Proposal, certify, rank
 from .compressor import Compressor
@@ -75,12 +76,15 @@ class SIXSABackend(Backend):
     After `solver.run()`, `solver.backend` holds the attributes below.
 
     Attributes:
+        restriction: The history-matching
+            [`Restriction`][bsixsa.restriction.Restriction], or `None` without
+            history matching.
         posterior: The final weighted sample
             ([`Certificate`][bsixsa.backend.sixsa.certify.Certificate]).
         n_unique: Number of distinct rows in the equal-weight posterior samples.
         history: One dict per round: the gate certificate's diagnostics plus
             the training, compressor and truncation records.
-        certificates: Every screen and gate certificate of the run, in order.
+        certificates: The gate certificate of every round, in order.
         compressor: The spectrum autoencoder
             ([`Compressor`][bsixsa.backend.sixsa.compressor.Compressor]).
         best_round: Round whose gate certificate gave the final proposal.
@@ -99,6 +103,7 @@ class SIXSABackend(Backend):
         super().__init__(solver=solver, config=config)
         self.rng = np.random.default_rng(config.seed)
         self.outdir = Path(solver.outputfiles_basename) / "sixsa"
+        self.restriction: Restriction | None = None
         self.history: list[dict] = []
         self.certificates: list[Certificate] = []
         self.posterior: Certificate | None = None
@@ -111,12 +116,12 @@ class SIXSABackend(Backend):
 
     def _to_physical(self, u: np.ndarray) -> np.ndarray:
         """Physical parameters of cube points."""
-        return to_physical(self.solver.base_prior, u)
+        return to_physical(self.solver.prior, u)
 
     def _record(self, theta: np.ndarray, cstat: np.ndarray) -> None:
         """Feed the tracer and track the best fold."""
         self.tracer.record(theta, cstat)
-        stat = cstat + self.solver.base_prior.xspec_bayes_contribution(theta)
+        stat = cstat + self.solver.prior.xspec_bayes_contribution(theta)
         if np.isfinite(stat).any() and np.nanmin(stat) < self.best_fit_stat:
             best = int(np.nanargmin(stat))
             self.best_fit, self.best_fit_stat = theta[best].copy(), float(stat[best])
@@ -144,7 +149,7 @@ class SIXSABackend(Backend):
 
     def _draw_region(self, n: int) -> np.ndarray:
         """Flat draws on the history-matching region, or a Latin hypercube of the cube without one."""
-        restriction = self.solver.restriction
+        restriction = self.restriction
         if restriction is None:
             return latin_hypercube(self.solver.num_parameters, n, self.rng)
         return restriction.region.sample(n, self.rng, max_candidates=restriction.config.max_candidates)
@@ -158,7 +163,7 @@ class SIXSABackend(Backend):
 
     def _encode(self, r: int, cstat: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Refit the compressor if due; return the training codes and the observation's code."""
-        restriction = self.solver.restriction
+        restriction = self.restriction
         if self._refits_compressor(r):
             # Round 1 trains on the spectra that resemble the observation.
             cut = restriction.threshold if r == 1 and restriction is not None else None
@@ -166,38 +171,25 @@ class SIXSABackend(Backend):
         z = self.compressor.encode(counts)
         z_obs = self.compressor.encode(self.solver.observed_counts)[0]
         if np.any((z_obs < z.min(axis=0)) | (z_obs > z.max(axis=0))):
-            see = (f" (see {self.outdir / 'compressor.pdf'}, written at the end of the run)"
-                   if self.config.plot_diagnostics else "")
             _LOG.warning(
                 "Round %d: the observed spectrum's code lies outside the range of the training spectra, so the "
                 "flows must extrapolate. If this persists over rounds, the model or prior may not reproduce the "
-                "data%s.", r, see,
+                "data.", r,
             )
         return z, z_obs
 
     def _train_flows(self, r: int, u: np.ndarray, z: np.ndarray,
                      z_obs: np.ndarray) -> tuple[list[FlowProposal], list[dict]]:
         """Train `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
-        nde, training = self.config.nde.model_dump(), self.config.training.model_dump()
         flows, infos = [], []
         for k in range(self.config.n_nde):
             estimator, info = train_flow(
-                u, z, nde=nde, training=training, seed=int(self.rng.integers(2**31 - 1)),
+                u, z, **self.config.flow.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
                 log_dir=self.outdir / f"round_{r}" / f"member_{k}",
             )
             flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
             infos.append(info)
         return flows, infos
-
-    def _screen(self, r: int, flows: list[FlowProposal], thresholds: dict) -> FlowProposal | MixtureProposal:
-        """Certify every flow and their equal-weight mixture; return the best proposal."""
-        with self.solver.fold_phase("screen"):
-            screens = certify(flows, self.config.check_draws, self._cstat, rng=self.rng,
-                              mixture=MixtureProposal(flows, name=f"round{r}/mixture"), **thresholds)
-        self.certificates.extend(screens)
-        _LOG.info("SIXSA round %d screen: %s", r,
-                  ", ".join(f"{c.name} k_hat={c.k_hat:.2f} eff={c.efficiency:.1f}%" for c in screens))
-        return screens[rank(screens)].proposal
 
     def _warn_if_region_cuts_posterior(self, r: int, cert: Certificate) -> None:
         """Warn when 99.9% of the posterior weight reaches within one posterior span of the region's threshold.
@@ -205,7 +197,7 @@ class SIXSABackend(Backend):
         The flows only see the history-matching region, so posterior mass
         beyond it would go unnoticed.
         """
-        restriction = self.solver.restriction
+        restriction = self.restriction
         if restriction is None or not np.isfinite(cert.log_w_smoothed).any():
             return
         order = np.argsort(cert.cstat)
@@ -217,19 +209,19 @@ class SIXSABackend(Backend):
                 "Round %d: 99.9%% of the posterior weight lies below C-stat %.1f, only %.1f below the region "
                 "threshold %.1f (less than one posterior span, %.1f); the history-matching region may cut into "
                 "the posterior. Rerun with a wider restriction (larger HistoryMatching(target_spans=...)) or "
-                "restrict_prior=False to check.",
+                "SIXSA(history_matching=None) to check.",
                 r, reach, margin, restriction.threshold, restriction.span,
             )
 
     def _round(self, r: int, u: np.ndarray, cstat: np.ndarray, counts: np.ndarray) -> dict:
-        """One round: encode, train the flows, screen them, and certify the winner on fresh draws."""
+        """One round: encode, train the flows, and certify their equal-weight mixture."""
         cfg = self.config
-        thresholds = dict(round_index=r, khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency)
         z, z_obs = self._encode(r, cstat, counts)
         flows, infos = self._train_flows(r, u, z, z_obs)
-        proposal = flows[0] if len(flows) == 1 else self._screen(r, flows, thresholds)
+        proposal = flows[0] if len(flows) == 1 else MixtureProposal(flows, name=f"round{r}/mixture")
         with self.solver.fold_phase("gate"):
-            cert = certify([proposal], cfg.check_draws, self._cstat, rng=self.rng, **thresholds)[0]
+            cert = certify(proposal, cfg.check_draws, self._cstat, rng=self.rng, round_index=r,
+                           khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency)
         self.certificates.append(cert)
         _LOG.info("SIXSA round %d: %s k_hat=%.3f, efficiency=%.1f%%, ESS=%.0f, best fold %.1f",
                   r, cert.name, cert.k_hat, cert.efficiency, cert.ess, float(np.min(cert.cstat)))
@@ -238,12 +230,12 @@ class SIXSABackend(Backend):
                     compressor=self.compressor.history[-1], nde=infos, truncation=None)
 
     def _truncated_training_set(self, record: dict) -> tuple[np.ndarray, dict]:
-        """Draw the next, larger training set inside the round winner's highest-density region.
+        """Draw the next, larger training set inside the round proposal's highest-density region.
 
-        Done whatever the winner's k-hat: a poor k-hat condemns the proposal's
-        tails, not its high-density region.
+        Done whatever the proposal's k-hat: a poor k-hat condemns the
+        proposal's tails, not its high-density region.
         """
-        cfg, restriction = self.config, self.solver.restriction
+        cfg, restriction = self.config, self.restriction
         n = min(int(round(record["n_train"] * cfg.train_ramp)), cfg.train_max)
         u, info = sample_truncated(
             record["certificate"].proposal, n=n, quantile=cfg.truncated_quantile,
@@ -279,8 +271,13 @@ class SIXSABackend(Backend):
         started = time.perf_counter()
         cfg, solver = self.config, self.solver
         folds_before = sum(solver.fold_counts.values())
-        if solver.restriction is not None:
-            self._record(self._to_physical(solver.restriction.u), solver.restriction.cstat)
+        if cfg.history_matching is not None:
+            with solver.fold_phase("restriction"):
+                self.restriction = run_history_matching(
+                    self._cstat, solver.num_parameters, cfg.history_matching,
+                    param_names=solver.parameter_names, log=_LOG.info,
+                )
+            self.restriction.save(self.outdir / "restriction")
         self.compressor = Compressor(solver.n_bins, solver.num_parameters, **cfg.compressor.model_dump(),
                                      seed=cfg.seed, log=_LOG.info)
 
@@ -305,15 +302,13 @@ class SIXSABackend(Backend):
         if self.exit_reason != "gate":
             # Without a certified proposal, the final sample gets a small budget.
             max_draws = min(max_draws, 5 * cfg.check_draws)
-            trajectory = (f"the k-hat trajectory in {self.outdir / 'convergence.pdf'}" if cfg.plot_diagnostics
-                          else f"the per-round k_hat in {self.outdir / 'summary.json'}")
             warnings.warn(
                 f"SIXSA used all n_rounds={cfg.n_rounds} rounds without a proposal passing certification (best "
                 f"round {self.best_round}: k-hat {best.k_hat:.2f}, efficiency {best.efficiency:.1f}%; the gate "
                 f"needs k-hat < {cfg.khat_threshold} and efficiency >= {cfg.min_efficiency}%), so the final "
                 f"importance sample is capped at {max_draws} draws (min(max_sampling_draws, "
                 "5 x check_draws)). Increase n_rounds or train_max, check the priors and the model, and check "
-                f"{trajectory}.",
+                f"the per-round k_hat in {self.outdir / 'summary.json'}.",
                 RuntimeWarning, stacklevel=3,  # points at the caller of Solver.run
             )
         rows = self._final_sample(best.proposal, max_draws)
@@ -340,10 +335,6 @@ class SIXSABackend(Backend):
             best_fit=pd.Series(self.best_fit, index=solver.parameter_names), best_fit_stat=self.best_fit_stat,
         )
         self._save(result)
-        if cfg.plot_diagnostics:
-            from .plots import plot_diagnostics
-
-            plot_diagnostics(self)
         return result
 
     def sample(self, n: int) -> np.ndarray:

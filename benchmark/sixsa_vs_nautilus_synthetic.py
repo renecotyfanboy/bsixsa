@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -55,11 +56,13 @@ def summary(solver, fit):
                mean=values.mean(0).tolist(), std=values.std(0).tolist(),
                corr=np.corrcoef(values.T).tolist(), time=fit.time,
                n_likelihood_evaluations=fit.n_likelihood_evaluations,
-               fold_counts=solver.fold_counts, best_fit_stat=fit.best_fit_stat,
-               restriction_time=fit.restriction_time,
-               log_Z_restriction_correction=fit.log_Z_restriction_correction)
+               fold_counts=solver.fold_counts, best_fit_stat=fit.best_fit_stat)
     if solver.backend_name == "sixsa":
-        backend, posterior = solver.backend, solver.backend.posterior
+        backend, posterior, restriction = solver.backend, solver.backend.posterior, solver.backend.restriction
+        if restriction is not None:
+            out["restriction"] = dict(n_simulations=restriction.n_simulations, seconds=restriction.seconds,
+                                      prior_mass=restriction.prior_mass, threshold=restriction.threshold,
+                                      stop_reason=restriction.stop_reason)
         out.update(exit_reason=backend.exit_reason, passed=posterior.passed, k_hat=posterior.k_hat,
                    ess=posterior.ess, n_unique=backend.n_unique, best_round=backend.best_round,
                    history=[{"round": row["round"], "k_hat": row["k_hat"], "efficiency": row["efficiency"],
@@ -73,7 +76,7 @@ def reference_best_fit_stat(solver, reference_mean):
     """Refine a reference-posterior centre in the same statistic convention."""
     from scipy.optimize import minimize
 
-    prior = solver.base_prior
+    prior = solver.prior
     initial = prior.to_unit_cube(np.atleast_2d(reference_mean))[0]
 
     def objective(u):
@@ -97,7 +100,6 @@ def run(args):
     outdir.mkdir(parents=True, exist_ok=False)
     setup_xspec(outdir)
     summaries, draws = {}, {}
-    restriction = None
     for seed in range(args.repeats):
         key = f"nautilus_full_{seed}"
         solver = Solver(prior_spec(), outputfiles_basename=str(outdir / key), n_jobs=args.jobs,
@@ -107,40 +109,25 @@ def run(args):
         summaries[key], draws[key] = summary(solver, fit), np.asarray(fit.posterior_samples)
         print(f"{key}: log Z={fit.log_Z:.4f}; {fit.n_likelihood_evaluations} folds", flush=True)
 
-    hm = HistoryMatching(seed=0, plot=True)
+    hm = HistoryMatching(seed=0)
     if args.quick:
-        hm = HistoryMatching(seed=0, plot=True, n_waves=3, simulations_per_parameter=200,
-                             hidden=64, epochs=300, patience=15)
-    owner = Solver(prior_spec(), outputfiles_basename=str(outdir / "restriction"),
-                   n_jobs=args.jobs, backend=Nautilus(trace=False), restrict_prior=hm)
-    restriction = owner.restrict()
-    summaries["restriction"] = dict(n_likelihood_evaluations=restriction.n_simulations,
-                                    seconds=restriction.seconds, prior_mass=restriction.prior_mass,
-                                    threshold=restriction.threshold, stop_reason=restriction.stop_reason)
-
-    def infer(key, config):
-        import warnings
-        solver = Solver(prior_spec(), outputfiles_basename=str(outdir / key),
-                        n_jobs=args.jobs, backend=config, restrict_prior=restriction)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            fit = solver.run()
-        summaries[key] = summary(solver, fit)
-        summaries[key]["box_edge_warning"] = any("box" in str(w.message).lower() for w in caught)
-        summaries[key]["warnings"] = [str(w.message) for w in caught]
-        draws[key] = np.asarray(fit.posterior_samples)
-        print(f"{key}: log Z={fit.log_Z:.4f}; {fit.n_likelihood_evaluations} folds", flush=True)
-        return solver
-
-    infer("nautilus_restrict", Nautilus(trace=False, seed=0, n_pool=1,
-                                       num_live_points=500 if args.quick else 3000))
-    sixsa_kw = dict(seed=0, trace=False)
+        hm = HistoryMatching(seed=0, n_waves=3, simulations_per_parameter=200, hidden=64, epochs=300, patience=15)
+    sixsa_kw = dict(seed=0, trace=False, history_matching=hm)
     if args.quick:
         sixsa_kw.update(n_nde=2, n_rounds=6, n_training=3000, train_max=12000,
-                        training=dict(max_num_epochs=60, training_batch_size=256),
+                        flow=dict(max_num_epochs=60, training_batch_size=256),
                         compressor=dict(epochs=150, patience=15),
                         target_ess=1000, num_posterior_samples=5000, max_sampling_draws=30000)
-    solver = infer("sixsa_restrict", SIXSA(**sixsa_kw))
+    key = "sixsa_restrict"
+    solver = Solver(prior_spec(), outputfiles_basename=str(outdir / key), n_jobs=args.jobs,
+                    backend=SIXSA(**sixsa_kw))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fit = solver.run()
+    summaries[key] = summary(solver, fit)
+    summaries[key]["warnings"] = [str(w.message) for w in caught]
+    draws[key] = np.asarray(fit.posterior_samples)
+    print(f"{key}: log Z={fit.log_Z:.4f}; {fit.n_likelihood_evaluations} folds", flush=True)
 
     full = [summaries[f"nautilus_full_{i}"] for i in range(args.repeats)]
     reference = np.concatenate([draws[f"nautilus_full_{i}"] for i in range(args.repeats)])
@@ -153,16 +140,12 @@ def run(args):
         gates[name] = dict(value=float(value), threshold=float(bound), passed=bool(value <= bound))
 
     six = summaries["sixsa_restrict"]
-    box = summaries["nautilus_restrict"]
     check("G1_logZ_sixsa", abs(six["log_Z"] - logz_ref),
           min(0.25, 3 * np.hypot(six["log_Z_err"], error_ref)))
-    check("G2_logZ_box", abs(box["log_Z"] - logz_ref), min(0.25, 3 * np.hypot(error_ref, error_ref)))
-    check("G2_box_edge", box["box_edge_warning"], 0)
-    for key in ("sixsa_restrict", "nautilus_restrict"):
-        v = draws[key]
-        check(f"G3_{key}_mean", np.max(np.abs(v.mean(0) - ref_mean) / ref_std), 0.10)
-        check(f"G3_{key}_std", np.max(np.abs(v.std(0) / ref_std - 1)), 0.10)
-        check(f"G3_{key}_corr", np.max(np.abs(np.corrcoef(v.T) - np.corrcoef(reference.T))), 0.05)
+    v = draws["sixsa_restrict"]
+    check("G3_sixsa_restrict_mean", np.max(np.abs(v.mean(0) - ref_mean) / ref_std), 0.10)
+    check("G3_sixsa_restrict_std", np.max(np.abs(v.std(0) / ref_std - 1)), 0.10)
+    check("G3_sixsa_restrict_corr", np.max(np.abs(np.corrcoef(v.T) - np.corrcoef(reference.T))), 0.05)
     last = six["history"][-1]
     check("G4_certified", not (six["passed"] and six["exit_reason"] == "gate"
                              and last["k_hat"] < 0.7 and last["efficiency"] >= 5
@@ -195,7 +178,7 @@ def run(args):
     fig = Figure(figsize=(9, 3), layout="constrained")
     FigureCanvasAgg(fig)
     for j, ax in enumerate(fig.subplots(1, 3)):
-        for key in ("nautilus_full_0", "nautilus_restrict", "sixsa_restrict"):
+        for key in ("nautilus_full_0", "sixsa_restrict"):
             ax.hist(draws[key][:, j], bins=40, density=True, histtype="step", label=key)
         ax.axvline(TRUTH[j], color="black", linestyle=":")
         ax.set_xlabel(["nH", "PhoIndex", "norm"][j])

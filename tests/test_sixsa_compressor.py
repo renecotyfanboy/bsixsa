@@ -123,10 +123,6 @@ def test_fit_reduces_the_validation_cstat(spectra):
     counts = spectra["counts"]
     mean = np.repeat(counts.mean(axis=0, keepdims=True), len(counts), axis=0)
     assert record["val_cstat"] < 0.5 * _numpy_cash(mean, counts)
-    reconstruction = comp.reconstruct(counts)
-    assert reconstruction.dtype == np.float32 and reconstruction.shape == counts.shape
-    assert np.all(reconstruction > 0)
-    assert _numpy_cash(reconstruction, counts) < 0.5 * _numpy_cash(mean, counts)
 
 
 def test_fit_record_contents(spectra):
