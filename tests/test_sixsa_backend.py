@@ -1,5 +1,4 @@
 """The public SIXSA backend, including real training and exact grid checks."""
-import importlib.util
 import json
 import logging
 import warnings
@@ -355,23 +354,6 @@ def test_region_reach_warning_does_not_depend_on_the_size_of_the_cstat(caplog, b
     # Less than one span of margin left: the region may cut the posterior.
     (message,) = _region_warnings(caplog, best=best, spans_to_threshold=1.5)
     assert "less than one posterior span" in message and "target_spans" in message
-
-
-def test_benchmark_summary_reads_the_backend(completed):
-    solver, fit, _ = completed
-    path = Path(__file__).resolve().parents[1] / "benchmark/sixsa_vs_nautilus_synthetic.py"
-    spec = importlib.util.spec_from_file_location("sixsa_benchmark", path)
-    benchmark = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(benchmark)
-
-    out = benchmark.summary(solver, fit)
-
-    backend = solver.backend
-    assert out["exit_reason"] == backend.exit_reason and out["passed"] == backend.posterior.passed
-    assert out["n_unique"] == backend.n_unique and out["best_round"] == backend.best_round
-    assert [row["round"] for row in out["history"]] == [record["round"] for record in backend.history]
-    assert [row["generation"] for row in out["history"]][0] == 1
-    assert out["history"][-1]["truncation"] is None
 
 
 @pytest.mark.parametrize(("refresh", "rounds"), [

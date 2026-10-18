@@ -11,34 +11,6 @@ checked on Gaussian targets whose evidences and leakages are known in closed
 form. `tests/integration_xspec/` adds the checks that need a real PyXspec
 session (`conda activate bsixsa`).
 
-## SIXSA against Nautilus on a simulated spectrum
-
-`benchmark/sixsa_vs_nautilus_synthetic.py` simulates an XMM-Newton EPIC-pn
-spectrum of an absorbed power law (`tbabs*powerlaw`, 3 free parameters, 50 ks,
-with the responses of `tests/low_res_data/`), fits it with Nautilus on the full
-prior (three seeds, the reference), then with SIXSA and its history matching.
-It checks that:
-
-- SIXSA's log Z agrees with the reference within three combined standard
-  errors (its own and the reference's), and by no more than 0.25 (the
-  reference error is the scatter of the three seeds divided by √3, at least
-  0.02);
-- SIXSA's posterior means agree within 0.1 reference standard deviations, the
-  standard deviations within 10% and the correlations within 0.05;
-- SIXSA passed its certification gate, and the central 99.7% of its posterior
-  contains the simulated parameters;
-- SIXSA's best-fit statistic is within 3 of the reference one, and every run
-  reports exactly the folds it made.
-
-`benchmark/sixsa_v2_acceptance_20260916.json` is the report of a full run
-(16 September 2026) of an earlier version of the benchmark, which also ran
-Nautilus on a box around the history-matching region: every check passed (the best-fit check was recomputed
-afterwards on the saved spectrum, once a statistic-convention bug in the
-benchmark itself was fixed; no fit was rerun, see the file's `audit` section),
-SIXSA's log Z differed from the reference by 0.003, and SIXSA used 70 779
-folds (plus 4 500 history-matching folds) against about 106 000 for each
-full-prior Nautilus run.
-
 ## Perseus with X-IFU
 
 This run is not distributed with bsixsa: it comes from the author's analysis
@@ -68,17 +40,3 @@ The k-hat trajectory is the diagnosis to read: it falls as the training set
 shrinks inside the proposal's highest-density region round after round. A loop
 that only truncates once k-hat is already low never leaves round 1 on this
 problem.
-
-## Reproduce
-
-```bash
-conda activate bsixsa
-python -m pytest -q
-python benchmark/sixsa_vs_nautilus_synthetic.py --quick   # smaller settings, for a quick check
-python benchmark/sixsa_vs_nautilus_synthetic.py --strict  # full settings; exit status 1 if a check fails
-```
-
-The benchmark writes its report (`summary.json`) and a figure comparing the
-marginal posteriors to a new directory under `benchmark/`. The round-by-round
-log of a SIXSA run appears through the `bsixsa` logger, and
-`<outputfiles_basename>/sixsa/summary.json` holds its numbers.
