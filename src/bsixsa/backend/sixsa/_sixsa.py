@@ -46,6 +46,7 @@ from ..abc import Backend
 from ..config import SIXSA
 from ..._cube import in_cube, latin_hypercube, to_physical
 from ...restriction import Restriction, run_history_matching
+from ...restriction.region import _to_jsonable
 from ...solver import FitResults, Solver
 from .certify import Certificate, Proposal, certify, rank
 from .compressor import Compressor
@@ -362,15 +363,7 @@ class SIXSABackend(Backend):
             "rounds": [{k: v for k, v in record.items() if k != "certificate"} for record in self.history],
             "config": self.config.model_dump(mode="json"),
         }
-        (self.outdir / "summary.json").write_text(json.dumps(summary, indent=2, default=_jsonable))
+        # Non-finite values (e.g. k-hat = inf without a Pareto fit) become null: standard JSON.
+        (self.outdir / "summary.json").write_text(json.dumps(_to_jsonable(summary), indent=2))
         np.savez_compressed(self.outdir / "posterior.npz", u=post.u, cstat=post.cstat, log_w=post.log_w,
                             log_w_smoothed=post.log_w_smoothed)
-
-
-def _jsonable(value):
-    """JSON encoder fallback for numpy values."""
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    raise TypeError(f"{type(value).__name__} is not JSON serialisable")

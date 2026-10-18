@@ -505,13 +505,14 @@ def plot_predictive_coverage(
         labels = ["Observed Spectrum"]
 
         # Poisson noise from NumPy's global generator (np.random.seed fixes it, not the parameter draws).
-        total_model = np.random.poisson(bins.sum(simulated["total_model_counts"][:, segment]))
+        # Model counts can dip below zero (e.g. a negative-normalisation line): clip them first.
+        total_model = np.random.poisson(np.clip(bins.sum(simulated["total_model_counts"][:, segment]), 0, None))
         handles.append(_draw_median_and_bands(ax_spec, bins, total_model / bins.width, _TOTAL_MODEL_COLOR))
         labels.append("Total model")
         for curve_id, label, counts in curves:
             color, hatch = styles[curve_id]
             style = {} if hatch is None else {"hatch": hatch, **component_style}
-            simulated_counts = np.random.poisson(bins.sum(counts))
+            simulated_counts = np.random.poisson(np.clip(bins.sum(counts), 0, None))
             handles.append(_draw_median_and_bands(ax_spec, bins, simulated_counts / bins.width, color, **style))
             labels.append(label)
 

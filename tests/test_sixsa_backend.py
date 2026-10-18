@@ -88,7 +88,9 @@ def test_public_sampling_and_saved_diagnostics(completed):
     info = solver.build_inference_data(num_samples=20, include_log_likelihood=True)
     assert "posterior" in info.groups()
     assert fit.n_likelihood_evaluations < sum(solver.fold_counts.values())
-    summary = json.loads((Path(solver.outputfiles_basename) / "sixsa/summary.json").read_text())
+    # Standard JSON: non-finite values are written as null, never as NaN or Infinity.
+    summary = json.loads((Path(solver.outputfiles_basename) / "sixsa/summary.json").read_text(),
+                         parse_constant=lambda name: pytest.fail(f"summary.json holds {name}"))
     assert summary["best_round"] == backend.best_round
     assert summary["posterior"]["passed"] and summary["rounds"][-1]["passed"]
     # The persisted keys, which notebooks read.
