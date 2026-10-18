@@ -1,745 +1,681 @@
+"""Plots of the spectra loaded in XSPEC: the data, the current model and predictive checks.
+
+[`plot_data`][bsixsa.analysis.plotting.plot_data] shows the data and the
+current XSPEC model;
+[`plot_predictive_coverage`][bsixsa.analysis.plotting.plot_predictive_coverage]
+compares the data with spectra simulated from the prior or the posterior of a
+[`Solver`][bsixsa.solver.Solver]. Both draw one column per spectrum: the
+spectrum above its residuals. `min_counts` and `grouping` merge channels for
+the figure only, never for the fit.
+"""
+
 import itertools
+import os
+from collections.abc import Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Literal
+
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import ticker
+from matplotlib.axes import Axes
+from matplotlib.container import ErrorbarContainer
+from matplotlib.figure import Figure
 from scipy.stats import nbinom, norm
-from ..xspec import SpectrumState
-from ..backend.abc import Backend
 
-# Hardcoded Catppuccin Latte palette (https://github.com/catppuccin/catppuccin).
-# Inlined to avoid depending on the ``catppuccin`` package, whose matplotlib
-# integration breaks on recent matplotlib releases.
-_LATTE = {
-    "sky": "#04a5e5",
-    "teal": "#179299",
-    "green": "#40a02b",
-    "yellow": "#df8e1d",
-    "peach": "#fe640b",
-    "maroon": "#e64553",
-    "red": "#d20f39",
-    "pink": "#ea76cb",
-    "mauve": "#8839ef",
-    "blue": "#1e66f5",
-    "overlay2": "#7c7f93",
-    "text": "#4c4f69",
-}
+from ..xspec import SpectrumState, loaded_spectra
 
-COLOR_CYCLE = [
-    _LATTE[color]
-    for color in [
-        "sky",
-        "teal",
-        "green",
-        "yellow",
-        "peach",
-        "maroon",
-        "red",
-        "pink",
-        "mauve",
-        "blue",
-    ][::-1]
-]
+if TYPE_CHECKING:
+    from ..solver import Solver
 
-SPECTRUM_COLOR = _LATTE["blue"]
-SPECTRUM_DATA_COLOR = _LATTE["overlay2"]
-BACKGROUND_DATA_COLOR = _LATTE["text"]
-alpha_median = 0.7
-alpha_envelope = (0.15, 0.25)
+# Catppuccin Latte colours (https://github.com/catppuccin/catppuccin).
+_TOTAL_MODEL_COLOR = "#1e66f5"  # blue: total model and residuals
+_DATA_COLOR = "#7c7f93"  # overlay2: observed spectrum
+# One colour per model or component curve, cycled.
+_CURVE_COLORS = (
+    "#8839ef",  # mauve
+    "#ea76cb",  # pink
+    "#d20f39",  # red
+    "#e64553",  # maroon
+    "#fe640b",  # peach
+    "#df8e1d",  # yellow
+    "#40a02b",  # green
+    "#179299",  # teal
+    "#04a5e5",  # sky
+)
+_COMPONENT_HATCHES = ("//", r"\\", "||", "--", "++", "xx", "oo", "OO", "..", "**")
+_COMPONENT_EDGE_COLOR = (1 / 3, 1 / 3, 1 / 3, 1)  # colour of the component hatches
+_MEDIAN_ALPHA = 0.7
+_BAND_68 = (16, 84)  # percentiles bounding the central 68%
+_BAND_95 = (2.5, 97.5)  # percentiles bounding the central 95%
 
-def adaptive_bin_1d(counts, min_counts):
-    """Assign adjacent bins to groups so that each group has at least
-    *min_counts* total counts.
-
-    Parameters:
-        counts (numpy.ndarray): Observed counts per original bin (1-D).
-        min_counts (int): Minimum summed counts required per grouped bin.
-
-    Returns:
-        numpy.ndarray: Integer group id for every original bin.
-    """
-    bin_ids = np.zeros(len(counts), dtype=int)
-    current_bin = 0
-    running_sum = 0
-
-    for i, c in enumerate(counts):
-        running_sum += c
-        bin_ids[i] = current_bin
-        if running_sum >= min_counts:
-            current_bin += 1
-            running_sum = 0
-
-    # Merge the last under-threshold group into its predecessor
-    if running_sum < min_counts and current_bin > 0:
-        bin_ids[bin_ids == current_bin] = current_bin - 1
-
-    return bin_ids
+_SPECTRUM_YLABEL = "Observed Spectrum\n[counts keV$^{-1}$]"
+_UNNAMED_MODEL_LABEL = "unnamed model"
+_RESIDUAL_KINDS = ("pearson", "sigma", "raw")
+_RESIDUAL_MARGIN = 1.1  # 10% margin around the residuals
+_MIN_SIGMA_EXTENT = 3.2  # just beyond the +/-3 sigma guide lines
+_SINGLE_FIGSIZE = (12, 6)
+_PANEL_SIZE = (6, 6)  # per spectrum, when several are plotted
+_EDGE_RTOL = 1e-6  # channels closer than this share an edge (no ignored range between them)
 
 
-def rebin_counts(data, bin_ids):
-    """Sum counts inside each bin group.
+def poisson_error_bars(
+    observed_counts: np.ndarray, sigma: float = 1.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Range of counts expected if the observation were repeated.
+
+    For an observed count $k$, the bounds are the central interval of the
+    negative binomial $\mathrm{NB}(k, 1/2)$: the distribution of a repeated
+    Poisson count when the source rate has a $\mathrm{Gamma}(k, 1)$ posterior.
+    Bins with zero counts get NaN bounds.
 
     Parameters:
-        data (numpy.ndarray): Count array — either 1-D ``(n_bins,)`` or 2-D
-            ``(n_samples, n_bins)``.
-        bin_ids (numpy.ndarray): Group id for every original bin (length
-            ``n_bins``).
+        observed_counts: Observed counts per bin.
+        sigma: Coverage in Gaussian standard deviations (`1` gives the central 68%).
 
     Returns:
-        numpy.ndarray: Rebinned array with the last axis reduced to the number
-            of groups.
+        The observed counts (unchanged), the lower bounds and the upper bounds.
     """
-    n_groups = bin_ids.max() + 1
-    if data.ndim == 1:
-        return np.bincount(bin_ids, weights=data, minlength=n_groups)
-    agg = bin_ids[None, :] == np.arange(n_groups)[:, None]  # (n_groups, n_bins)
-    return data @ agg.T  # (n_samples, n_groups)
+    lower_quantile, upper_quantile = norm.cdf([-sigma, sigma])
+    low = nbinom.ppf(lower_quantile, observed_counts, 0.5)
+    high = nbinom.ppf(upper_quantile, observed_counts, 0.5)
+    return observed_counts, low, high
 
 
-def rebin_edges(bin_edges_1d, bin_ids):
-    """Compute new 1-D bin edges by keeping the outer boundaries of each group.
-
-    Parameters:
-        bin_edges_1d (numpy.ndarray): Original edges of length ``n_bins + 1``.
-        bin_ids (numpy.ndarray): Group id for every original bin (length
-            ``n_bins``).
-
-    Returns:
-        numpy.ndarray: New edges of length ``n_groups + 1``.
-    """
-    starts = np.r_[0, np.flatnonzero(np.diff(bin_ids)) + 1]
-    return bin_edges_1d[np.append(starts, len(bin_ids))]
+def _check_regrouping(min_counts: int | None, grouping: int | None) -> None:
+    """Refuse `min_counts` together with `grouping`, and a `grouping` below 1."""
+    if min_counts is not None and grouping is not None:
+        raise ValueError("min_counts and grouping are mutually exclusive; use one or the other.")
+    if grouping is not None and grouping < 1:
+        raise ValueError(f"grouping must be a positive number of channels, got {grouping}.")
 
 
-def sigma_to_percentile_intervals(sigmas:list[float]) -> list[tuple[float, float]]:
-    """
-    Calculate percentile intervals corresponding to given sigma values.
-
-    This function computes the lower and upper percentile bounds for each input
-    sigma (standard deviation) value, assuming a normal distribution. The
-    calculated intervals represent the percentage of data within ±sigma
-    standard deviations of the mean.
-
-    Parameters:
-        sigmas : list[float]
-            A list of standard deviation (sigma) values for which to calculate
-            percentile intervals.
-
-    Returns:
-        list[tuple[float, float]]
-            A list of tuples, where each tuple contains the lower and upper
-            percentile bounds corresponding to a given sigma value.
-    """
-    intervals = []
-    for sigma in sigmas:
-        lower_bound = 100 * norm.cdf(-sigma)
-        upper_bound = 100 * norm.cdf(sigma)
-        intervals.append((lower_bound, upper_bound))
-    return intervals
-
-
-def poisson_error_bars(observed_counts:np.ndarray, sigma=1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Calculate Gamma-prior credible intervals for observed counts.
-
-    Parameters:
-        observed_counts (numpy.ndarray): Observed counts per bin.
-        sigma (float, optional): Desired dispersion expressed in Gaussian
-            sigmas for the resulting quantile interval. Defaults to 1.
-
-    Returns:
-        (tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]): Observed counts,
-            lower bound, and upper bound corresponding to the requested
-            credible interval.
-    """
-
-    percentile = sigma_to_percentile_intervals([sigma])[0]
-
-    y_observed = observed_counts
-    y_observed_low = nbinom.ppf(percentile[0] / 100, observed_counts, 0.5)
-    y_observed_high = nbinom.ppf(percentile[1] / 100, observed_counts, 0.5)
-
-    return y_observed, y_observed_low, y_observed_high
-
-
-def plot_poisson_error_bars(center, edges, data, denominator, ax, color):
-    r"""Plot observed counts with Gamma-prior credible error bars.
-
-    Parameters:
-        center (numpy.ndarray): Bin centers.
-        edges (numpy.ndarray): Lower/upper bin edges with shape ``(2, n_bins)``.
-        data (numpy.ndarray): Observed counts per bin.
-        denominator (numpy.ndarray | float): Divisor applied to convert counts
-            to plotting units.
-        ax (matplotlib.axes.Axes): Target axis.
-        color: The data color.
-
-    Returns:
-        matplotlib.container.ErrorbarContainer: Error-bar artist handle.
-    """
-    y_observed, y_observed_low, y_observed_high = poisson_error_bars(
-        data, sigma=1
+def _contiguous_runs(low: np.ndarray, high: np.ndarray) -> list[tuple[int, int]]:
+    """`(start, stop)` of each run of channels with no ignored energy range between neighbours."""
+    adjacent = np.isclose(high[:-1], low[1:], rtol=_EDGE_RTOL, atol=0.0) | np.isclose(
+        low[:-1], high[1:], rtol=_EDGE_RTOL, atol=0.0
     )
+    bounds = [0, *(np.flatnonzero(~adjacent) + 1).tolist(), len(low)]
+    return list(zip(bounds[:-1], bounds[1:]))
 
-    y_observed, y_observed_low, y_observed_high = (
-        y_observed / denominator,
-        y_observed_low / denominator,
-        y_observed_high / denominator,
-    )
 
-    error_bar = ax.errorbar(
+def _run_starts(observed_counts: np.ndarray, min_counts: int | None, grouping: int | None) -> list[int]:
+    """First channel of each display bin of one run of channels."""
+    if grouping is not None:
+        return list(range(0, len(observed_counts), grouping))
+    starts, running = [0], 0
+    for channel, counts in enumerate(observed_counts):
+        running += counts
+        if running >= min_counts:
+            starts.append(channel + 1)
+            running = 0
+    # Drop the last start: it opens nothing or an under-filled tail.
+    if len(starts) > 1:
+        starts.pop()
+    return starts
+
+
+def _display_bin_starts(
+    observed_counts: np.ndarray,
+    min_counts: int | None,
+    grouping: int | None,
+    runs: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray | None:
+    """First channel of each display bin, or None when no regrouping is asked.
+
+    Channels are merged within each `(start, stop)` run of `runs` (the whole
+    spectrum by default), never across an ignored energy range. With
+    `min_counts`, an under-filled last bin of a run is merged into the previous one.
+    """
+    _check_regrouping(min_counts, grouping)
+    if min_counts is None and grouping is None:
+        return None
+    if runs is None:
+        runs = [(0, len(observed_counts))]
+    starts = [
+        start + first
+        for start, stop in runs
+        for first in _run_starts(observed_counts[start:stop], min_counts, grouping)
+    ]
+    return np.asarray(starts)
+
+
+class _DisplayBins:
+    """The channels of one spectrum merged into display bins and sorted by energy.
+
+    Attributes:
+        low: Lower energy of each display bin in keV, increasing.
+        high: Upper energy of each display bin in keV.
+        edges: Edges for `Axes.stairs`, with an extra stair over each ignored
+            energy range (drawn empty: see `stairs`).
+    """
+
+    def __init__(
+        self, bin_energies: np.ndarray, observed_counts: np.ndarray, min_counts: int | None, grouping: int | None
+    ):
+        low, high = bin_energies[:, 0], bin_energies[:, 1]
+        starts = _display_bin_starts(observed_counts, min_counts, grouping, _contiguous_runs(low, high))
+        self._starts = np.arange(len(low)) if starts is None else starts
+        low, high = np.minimum.reduceat(low, self._starts), np.maximum.reduceat(high, self._starts)
+        # Grating spectra list their channels from high to low energy.
+        self._order = np.argsort(low, kind="stable")
+        self.low, self.high = low[self._order], high[self._order]
+        gap_before = np.r_[False, ~np.isclose(self.low[1:], self.high[:-1], rtol=_EDGE_RTOL, atol=0.0)]
+        self._stair = np.arange(len(self.low)) + np.cumsum(gap_before)
+        self.edges = np.empty(self._stair[-1] + 2)
+        self.edges[self._stair] = self.low
+        self.edges[self._stair + 1] = self.high
+
+    @property
+    def width(self) -> np.ndarray:
+        """Width of each display bin in keV."""
+        return self.high - self.low
+
+    def sum(self, counts: np.ndarray) -> np.ndarray:
+        """Sum per-channel counts (last axis) into the display bins, in energy order."""
+        return np.add.reduceat(counts, self._starts, axis=-1)[..., self._order]
+
+    def stairs(self, values: np.ndarray) -> np.ndarray:
+        """Per-display-bin values (last axis) laid on `edges`, NaN over the ignored ranges."""
+        laid = np.full((*values.shape[:-1], len(self.edges) - 1), np.nan)
+        laid[..., self._stair] = values
+        return laid
+
+
+def _plotted_spectra(spectra: int | Sequence[int] | None) -> tuple[list[SpectrumState], list[SpectrumState]]:
+    """All loaded spectra and the ones to plot (all of them by default).
+
+    Raises:
+        ValueError: If `spectra` names no spectrum or one that is not loaded.
+    """
+    loaded = loaded_spectra()
+    if spectra is None:
+        return loaded, loaded
+    indices = [spectra] if isinstance(spectra, (int, np.integer)) else list(spectra)
+    if not indices or any(not 1 <= index <= len(loaded) for index in indices):
+        raise ValueError(
+            f"spectra must be XSPEC spectrum indices between 1 and {len(loaded)} "
+            f"(as in xspec.AllData(index)), got {spectra!r}."
+        )
+    return loaded, [loaded[index - 1] for index in indices]
+
+
+def _component_selection(
+    plot_components: bool | str | Sequence[str], spectra: Sequence[SpectrumState]
+) -> bool | frozenset[str]:
+    """`plot_components` as `True`, `False` or the set of models whose components are drawn.
+
+    Raises:
+        ValueError: If it names a model that is not folded into the plotted spectra.
+    """
+    if isinstance(plot_components, (bool, np.bool_)):
+        return bool(plot_components)
+    selected = frozenset([plot_components] if isinstance(plot_components, str) else plot_components)
+    available = {name for state in spectra for name in state.sources.values()}
+    unknown = selected - available
+    if unknown:
+        raise ValueError(
+            f"plot_components names models that are not in the plotted spectra: {sorted(unknown)}; "
+            f"their models are {sorted(available)} ('' is the unnamed model)."
+        )
+    return selected
+
+
+def _component_model(key: str, model_names: Iterable[str]) -> str | None:
+    """Model of a component key `"<model>_<component>"`: the longest model name that prefixes it."""
+    owners = [name for name in model_names if key.startswith(name + "_")]
+    return max(owners, key=len) if owners else None
+
+
+def _model_curves(
+    model_counts: dict[str, np.ndarray],
+    component_counts: dict[str, np.ndarray],
+    models: Sequence[str],
+    plot_models: bool,
+    plot_components: bool | frozenset[str],
+) -> Iterator[tuple[tuple[str, str], str, np.ndarray]]:
+    """Yield `(curve id, label, counts)` per curve of one spectrum, in legend order.
+
+    Each model of `models`, with its own curve when there are several and
+    `plot_models` is set, followed by its components when `plot_components`
+    is `True` or names it.
+    """
+    for model in models:
+        if plot_models and len(models) > 1:
+            yield ("model", model), model or _UNNAMED_MODEL_LABEL, model_counts[model]
+        if plot_components is True or (plot_components and model in plot_components):
+            for key, counts in component_counts.items():
+                if _component_model(key, model_counts) == model:
+                    # The unnamed model gives keys like "_bapec".
+                    yield ("component", key), key.lstrip("_"), counts
+
+
+def _curve_styles(curve_ids: Iterable[tuple[str, str]]) -> dict[tuple[str, str], tuple[str, str | None]]:
+    """Colour and hatch (`None` for a model curve) of each curve, the same in every panel."""
+    colors = itertools.cycle(_CURVE_COLORS)
+    hatches = itertools.cycle(_COMPONENT_HATCHES)
+    styles = {}
+    for curve_id in curve_ids:
+        if curve_id not in styles:
+            styles[curve_id] = (next(colors), next(hatches) if curve_id[0] == "component" else None)
+    return styles
+
+
+def _make_figure(
+    n_columns: int, figsize: tuple[float, float] | None, draw_residuals: bool
+) -> tuple[Figure, list[Axes], list[Axes | None]]:
+    """Return the figure, the spectrum axes and the residual axes (`None` without residuals), one per column."""
+    if figsize is None:
+        figsize = _SINGLE_FIGSIZE if n_columns == 1 else (_PANEL_SIZE[0] * n_columns, _PANEL_SIZE[1])
+    if draw_residuals:
+        fig, axes = plt.subplots(
+            nrows=2, ncols=n_columns, figsize=figsize, sharex="col", height_ratios=[4, 1], squeeze=False
+        )
+        return fig, list(axes[0]), list(axes[1])
+    fig, axes = plt.subplots(ncols=n_columns, figsize=figsize, squeeze=False)
+    return fig, list(axes[0]), [None] * n_columns
+
+
+def _panel_title(state: SpectrumState) -> str:
+    """Title of the column of a spectrum: its XSPEC index and file name."""
+    return f"Spectrum {state.index}: {os.path.basename(state.spectrum.fileName)}"
+
+
+def _draw_observed_spectrum(ax: Axes, bins: _DisplayBins, counts: np.ndarray) -> ErrorbarContainer:
+    """Draw the observed counts per keV with the error bars of `poisson_error_bars`, at geometric bin centres."""
+    center = np.sqrt(bins.low * bins.high)
+    per_kev, low, high = (values / bins.width for values in poisson_error_bars(counts))
+    return ax.errorbar(
         center,
-        y_observed,
-        xerr=np.abs(edges - center[None, :]),
-        yerr=[
-            np.maximum(y_observed - y_observed_low, 0),
-            np.maximum(y_observed_high - y_observed, 0),
-        ],
+        per_kev,
+        xerr=[center - bins.low, bins.high - center],
+        yerr=[np.maximum(per_kev - low, 0), np.maximum(high - per_kev, 0)],
         linestyle="none",
-        color=SPECTRUM_DATA_COLOR,
+        color=_DATA_COLOR,
         alpha=0.8,
         capsize=2,
         zorder=10,
     )
 
-    return error_bar
 
-
-def plot_median_and_bands(
-    edges,
-    data,
-    denominator,
-    ax,
-    color,
-    alpha_envelope=(0.15, 0.25),
-    **kwargs,
-):
-    """Plot median, 68%, and 95% predictive bands for sampled spectra.
-
-    Parameters:
-        edges (numpy.ndarray): Bin edges passed to ``matplotlib.axes.Axes.stairs``.
-        data (numpy.ndarray): Sampled spectra with shape
-            ``(n_samples, n_bins)``.
-        denominator (numpy.ndarray | float): Divisor applied to ``data`` before
-            plotting.
-        ax (matplotlib.axes.Axes): Target axis.
-        color: Base color for the median line and envelopes.
-        alpha_envelope (tuple[float, float], optional): Alpha values for the
-            95% and 68% filled bands, respectively.
-        **kwargs: Extra keyword arguments forwarded to the filled stairs and
-            legend proxy patch.
+def _draw_median_and_bands(
+    ax: Axes,
+    bins: _DisplayBins,
+    samples: np.ndarray,
+    color: str,
+    alpha_68: float = 0.25,
+    alpha_95: float = 0.15,
+    **patch_kwargs,
+) -> tuple:
+    """Draw the median of `samples` (shape `(n_samples, n_display_bins)`) and its central 68% and 95% bands.
 
     Returns:
-        tuple[matplotlib.patches.StepPatch, matplotlib.patches.Polygon]:
-            Handles for the median line and envelope proxy used in the legend.
+        A legend handle: the median line paired with the band swatch.
     """
-    data = data / denominator
-
     median = ax.stairs(
-        np.median(data, axis=0),
-        edges=edges,
+        bins.stairs(np.median(samples, axis=0)),
+        edges=bins.edges,
         color=color,
-        alpha=alpha_median,
+        alpha=_MEDIAN_ALPHA,
         zorder=100,
         linestyle="solid",
     )
-
-    low_band, high_band = np.percentile(data, [16, 84], axis=0)
-
-    ax.stairs(
-        high_band,
-        edges=edges,
-        baseline=low_band,
-        fill=True,
-        alpha=alpha_envelope[1],
-        color=color,
-        zorder=80,
-        **kwargs
-    )
-
-    low_band, high_band = np.percentile(data, [2.5, 97.5], axis=0)
-
-    ax.stairs(
-        high_band,
-        edges=edges,
-        baseline=low_band,
-        fill=True,
-        alpha=alpha_envelope[0],
-        color=color,
-        zorder=60,
-        **kwargs
-    )
-
-    # The legend cannot handle fill_between, so we pass a fill to get a fancy icon
-    (envelope,) = ax.fill(
-        np.nan, np.nan, alpha=alpha_envelope[-1], facecolor=color, **kwargs
-    )
-
-    return median, envelope
-
-
-def _compute_bin_ids(observed_counts, min_counts, grouping):
-    """Integer bin-group ids for the requested rebinning, or ``None``.
-
-    Assumes *min_counts* and *grouping* are not both set (validated by callers).
-    """
-    if min_counts is not None:
-        return adaptive_bin_1d(observed_counts, min_counts)
-    if grouping is not None:
-        return np.arange(len(observed_counts)) // grouping
-    return None
-
-
-def _bin_geometry(bin_edges_1d):
-    """Return ``(bin_edges, bin_width, bin_center)`` derived from 1-D bin edges."""
-    bin_edges = np.array([bin_edges_1d[:-1], bin_edges_1d[1:]])
-    bin_width = np.diff(bin_edges, axis=0).squeeze()
-    bin_center = np.sqrt(bin_edges[0] * bin_edges[1])
-    return bin_edges, bin_width, bin_center
-
-
-def _make_spectrum_axes(figsize, draw_residuals):
-    """Create the spectrum figure, with a residual panel below when requested.
-
-    Returns ``(fig, ax_spec, ax_res)`` where ``ax_res`` is ``None`` when
-    *draw_residuals* is ``False``.
-    """
-    if draw_residuals:
-        fig, (ax_spec, ax_res) = plt.subplots(
-            nrows=2, ncols=1, figsize=figsize, sharex=True, height_ratios=[4, 1]
+    for percentiles, alpha, zorder in ((_BAND_68, alpha_68, 80), (_BAND_95, alpha_95, 60)):
+        low, high = np.percentile(samples, percentiles, axis=0)
+        ax.stairs(
+            bins.stairs(high),
+            edges=bins.edges,
+            baseline=bins.stairs(low),
+            fill=True,
+            alpha=alpha,
+            color=color,
+            zorder=zorder,
+            **patch_kwargs,
         )
-        return fig, ax_spec, ax_res
-    fig, ax_spec = plt.subplots(figsize=figsize)
-    return fig, ax_spec, None
+    # Invisible patch used only as the legend swatch of the bands.
+    (swatch,) = ax.fill(np.nan, np.nan, alpha=alpha_68, facecolor=color, **patch_kwargs)
+    return median, swatch
+
+
+def _finish_residual_panel(ax: Axes, extent: float, label: str | None, in_sigma_units: bool) -> None:
+    """Set the range (+/-`extent` plus a margin), guide lines and labels of the residual panel."""
+    limit = extent * _RESIDUAL_MARGIN
+    if in_sigma_units:
+        limit = max(limit, _MIN_SIGMA_EXTENT)
+    ax.set_ylim(-limit, limit)
+    ax.axhline(0, color="black", linestyle="--", alpha=0.5)
+    if in_sigma_units:
+        ax.axhline(-3, color="black", linestyle="--", alpha=0.5)
+        ax.axhline(3, color="black", linestyle="--", alpha=0.5)
+        ax.set_yticks([-3, 0, 3])
+    if label is not None:
+        ax.set_ylabel("Residuals\n" + label)
+    ax.set_xlabel("Energy [keV]")
+
+
+class _EnergyFormatter(ticker.Formatter):
+    """Plain-number labels ("0.5", "2") on a log energy axis, at 1, 2 and 5 times a power of ten.
+
+    An axis spanning less than a factor 3 labels every tick.
+    """
+
+    def __call__(self, x: float, pos: int | None = None) -> str:
+        low, high = sorted(self.axis.get_view_interval())
+        mantissa = x / 10 ** np.floor(np.log10(x))
+        if high > 3 * low and not np.isclose(mantissa, [1, 2, 5, 10], rtol=1e-6).any():
+            return ""
+        return f"{x:g}"
+
+    def format_data_short(self, value: float) -> str:
+        """The cursor position shown by interactive backends."""
+        return f"{value:.4g}"
+
+
+def _finish_spectrum_panel(
+    ax: Axes,
+    bins: _DisplayBins,
+    x_lim: tuple[float, float] | None,
+    y_lim: tuple[float, float] | None,
+    with_ylabel: bool,
+) -> None:
+    """Set the limits, the y label and the log-log scales of the spectrum panel (and of its residual panel)."""
+    ax.set_xlim(*(x_lim if x_lim is not None else (bins.edges[0], bins.edges[-1])))
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
+    if with_ylabel:
+        ax.set_ylabel(_SPECTRUM_YLABEL)
+    ax.loglog()
+    # Setting the scale resets the tick labels of every axis sharing x.
+    for shared in ax.get_shared_x_axes().get_siblings(ax):
+        shared.xaxis.set_major_formatter(_EnergyFormatter())
+        shared.xaxis.set_minor_formatter(_EnergyFormatter())
 
 
 def plot_data(
-    spectrum_index=1,
-    plot_model=True,
-    plot_components=True,
-    show_residuals=True,
-    x_lim=None,
-    y_lim=None,
-    figsize=(12, 6),
-    min_counts=None,
-    grouping=None,
-    legend=True,
-):
-    r"""Plot the observed spectrum and the currently loaded XSPEC model.
+    *,
+    plot_model: bool = True,
+    plot_components: bool | str | Sequence[str] = True,
+    show_residuals: bool = True,
+    x_lim: tuple[float, float] | None = None,
+    y_lim: tuple[float, float] | None = None,
+    figsize: tuple[float, float] | None = None,
+    min_counts: int | None = None,
+    grouping: int | None = None,
+    legend: bool = True,
+    spectra: int | Sequence[int] | None = None,
+) -> Figure:
+    r"""Plot the observed spectra and the model currently loaded in XSPEC.
 
-    Useful for quick visual inspection during model exploration, without
-    running any inference.  The function reads the current XSPEC state
-    directly via :class:`~bsixsa.xspec.SpectrumState`.
+    A quick look without any inference: the model is folded at its current
+    XSPEC parameter values. Each spectrum gets a column with the data and the
+    error bars of
+    [`poisson_error_bars`][bsixsa.analysis.plotting.poisson_error_bars], the
+    total model, one curve per model folded into the spectrum and per
+    additive component, and the Pearson residuals $(D - M)/\sqrt{M}$. Ignored
+    energy ranges are left empty, and backgrounds are not plotted.
 
     Parameters:
-        spectrum_index (int, optional): 1-based XSPEC spectrum index.
-            Defaults to ``1``.
-        plot_model (bool, optional): If ``True``, overlay the current total
-            XSPEC model prediction. Defaults to ``True``.
-        plot_components (bool, optional): If ``True`` and *plot_model* is
-            ``True``, also draw each additive component separately (only when
-            more than one component is present). Defaults to ``True``.
-        show_residuals (bool, optional): If ``True``, add a residual panel
-            below the spectrum panel showing Pearson residuals
-            :math:`(D - M) / \sqrt{M}`.  When *plot_model* is ``False`` this
-            panel is automatically suppressed. Defaults to ``True``.
-        x_lim (tuple[float, float], optional): Energy bounds in keV.
-        y_lim (tuple[float, float], optional): Flux limits for the spectrum
-            panel y-axis.
-        figsize (tuple[float, float], optional): Figure size in inches.
-            Defaults to ``(12, 6)``.
-        min_counts (int, optional): Merge adjacent bins until each grouped bin
-            contains at least *min_counts* observed counts.  Mutually exclusive
-            with *grouping*.
-        grouping (int, optional): Merge every *grouping* adjacent bins into
-            one.  Mutually exclusive with *min_counts*.
-        legend (bool, optional): Whether to display the legend. Defaults to
-            ``True``.
+        plot_model: Overlay the model. Defaults to `True`.
+        plot_components: Draw the additive components of every model (`True`),
+            of none (`False`), or of the models named in a list (`''` for the
+            unnamed model). Defaults to `True`.
+        show_residuals: Add the residual panels (with `plot_model`). Defaults to `True`.
+        x_lim: Energy range in keV. Defaults to that of the noticed channels.
+        y_lim: y-axis limits of the spectrum panels, in counts per keV.
+        figsize: Figure size in inches. Defaults to `(12, 6)` for one
+            spectrum and 6 by 6 inches per spectrum otherwise.
+        min_counts: Merge adjacent channels until each displayed bin holds at
+            least this many counts. Exclusive with `grouping`.
+        grouping: Merge every `grouping` adjacent channels. Exclusive with `min_counts`.
+        legend: Show the legends. Defaults to `True`.
+        spectra: XSPEC index (or list of indices) of the spectra to plot.
+            Defaults to every loaded spectrum.
 
     Returns:
-        matplotlib.figure.Figure: Figure with the spectrum (and optionally
-            residual) panel(s).
+        The figure.
+
+    Raises:
+        ValueError: If both `min_counts` and `grouping` are given, if
+            `grouping` is below 1, or if `spectra` or `plot_components` names
+            something that is not loaded.
     """
-
-    if min_counts is not None and grouping is not None:
-        raise ValueError(
-            "min_counts and grouping are mutually exclusive; use one or the other."
-        )
-
-    state = SpectrumState(spectrum_index)
-
-    bin_edges_1d = state.bin_edges_1d
-    observed_counts = state.observed_counts
-
-    # Fetch model data once (avoids redundant XSPEC calls)
-    if plot_model:
-        total_model_counts = state.total_model_counts
-        model_counts = state.model_counts
-        component_counts = state.component_counts if plot_components else {}
-    else:
-        total_model_counts = None
-        model_counts = {}
-        component_counts = {}
-
-    # Compute bin group ids (if any rebinning is requested)
-    bin_ids = _compute_bin_ids(observed_counts, min_counts, grouping)
-
-    if bin_ids is not None:
-        bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
-        observed_counts = rebin_counts(observed_counts, bin_ids)
-        if total_model_counts is not None:
-            total_model_counts = rebin_counts(total_model_counts, bin_ids)
-        model_counts = {k: rebin_counts(v, bin_ids) for k, v in model_counts.items()}
-        component_counts = {k: rebin_counts(v, bin_ids) for k, v in component_counts.items()}
-
-    bin_edges, bin_width, bin_center = _bin_geometry(bin_edges_1d)
-    denominator = bin_width
-
+    _check_regrouping(min_counts, grouping)
+    _, states = _plotted_spectra(spectra)
+    components = _component_selection(plot_components, states) if plot_model else False
     draw_residuals = show_residuals and plot_model
 
-    fig, ax_spec, ax_res = _make_spectrum_axes(figsize, draw_residuals)
+    panels = []
+    for state in states:
+        bins = _DisplayBins(state.bin_energies, state.observed_counts, min_counts, grouping)
+        model_counts = state.model_counts if plot_model else {}
+        component_counts = state.component_counts if components else {}
+        curves = list(_model_curves(model_counts, component_counts, list(model_counts), True, components))
+        panels.append((state, bins, model_counts, curves))
+    styles = _curve_styles(curve_id for *_, curves in panels for curve_id, _, _ in curves)
 
-    legend_names = []
-    legend_list = []
+    fig, spectrum_axes, residual_axes = _make_figure(len(panels), figsize, draw_residuals)
+    for column, ((state, bins, model_counts, curves), ax_spec, ax_res) in enumerate(
+        zip(panels, spectrum_axes, residual_axes)
+    ):
+        observed_counts = bins.sum(state.observed_counts)
+        handles = [_draw_observed_spectrum(ax_spec, bins, observed_counts)]
+        labels = ["Observed Spectrum"]
 
-    # Observed spectrum
-    error_bar = plot_poisson_error_bars(
-        bin_center, bin_edges, observed_counts, denominator, ax_spec, SPECTRUM_DATA_COLOR
-    )
-    legend_list.append(error_bar)
-    legend_names.append("Observed Spectrum")
-
-    if plot_model and total_model_counts is not None:
-        # Total model — single curve (no sampling uncertainty)
-        model_flux = total_model_counts / denominator
-        (line,) = ax_spec.stairs(
-            model_flux,
-            edges=bin_edges_1d,
-            color=SPECTRUM_COLOR,
-            alpha=alpha_median,
-            zorder=100,
-            linestyle="solid",
-        )
-        legend_list.append(line)
-        legend_names.append("Total model")
-
-        # Per-source model curves (only when more than one source)
-        colors = iter(COLOR_CYCLE[1:])
-        for model_name, counts in model_counts.items():
-            if len(model_counts) > 1:
-                color = next(colors)
-                (comp_line,) = ax_spec.stairs(
-                    counts / denominator,
-                    edges=bin_edges_1d,
-                    color=color,
-                    alpha=alpha_median,
-                    zorder=90,
-                    linestyle="dashed",
+        if plot_model:
+            total_model_counts = bins.sum(sum(model_counts.values(), np.zeros(len(state.observed_counts))))
+            handles.append(
+                ax_spec.stairs(
+                    bins.stairs(total_model_counts / bins.width),
+                    edges=bins.edges,
+                    color=_TOTAL_MODEL_COLOR,
+                    alpha=_MEDIAN_ALPHA,
+                    zorder=100,
+                    linestyle="solid",
                 )
-                legend_list.append(comp_line)
-                legend_names.append(model_name)
+            )
+            labels.append("Total model")
 
-            # Additive components within this source
-            if plot_components:
-                hatches = itertools.cycle(['//', r'\\', '||', '--', '++', 'xx'])
-                for comp_name, comp_counts in component_counts.items():
-                    if comp_name.startswith(model_name + "_"):
-                        color = next(colors)
-                        (comp_line,) = ax_spec.stairs(
-                            comp_counts / denominator,
-                            edges=bin_edges_1d,
-                            color=color,
-                            alpha=alpha_median,
-                            zorder=80,
-                            linestyle="dotted",
-                        )
-                        ax_spec.stairs(
-                            comp_counts / denominator,
-                            edges=bin_edges_1d,
-                            baseline=0,
-                            fill=True,
-                            alpha=0.08,
-                            color=color,
-                            zorder=60,
-                            hatch=next(hatches),
-                            edgecolor=(1 / 3, 1 / 3, 1 / 3, 1),
-                        )
-                        legend_list.append(comp_line)
-                        legend_names.append(comp_name.lstrip("_"))
+            for curve_id, label, counts in curves:
+                color, hatch = styles[curve_id]
+                per_kev = bins.stairs(bins.sum(counts) / bins.width)
+                if hatch is None:  # a model
+                    line = ax_spec.stairs(
+                        per_kev, edges=bins.edges, color=color, alpha=_MEDIAN_ALPHA, zorder=90, linestyle="dashed"
+                    )
+                else:  # an additive component: dotted line over a hatched fill
+                    line = ax_spec.stairs(
+                        per_kev, edges=bins.edges, color=color, alpha=_MEDIAN_ALPHA, zorder=80, linestyle="dotted"
+                    )
+                    ax_spec.stairs(
+                        per_kev,
+                        edges=bins.edges,
+                        baseline=0,
+                        fill=True,
+                        alpha=0.08,
+                        color=color,
+                        zorder=60,
+                        hatch=hatch,
+                        edgecolor=_COMPONENT_EDGE_COLOR,
+                    )
+                handles.append(line)
+                labels.append(label)
 
-        # Residuals panel
-        if draw_residuals:
-            safe_model = np.where(total_model_counts > 0, total_model_counts, 1.0)
-            residuals = (observed_counts - total_model_counts) / np.sqrt(safe_model)
-            ax_res.stairs(residuals, edges=bin_edges_1d, color=SPECTRUM_COLOR, alpha=alpha_median)
-            residual_extent = max(np.max(np.abs(residuals)) * 1.1, 3.2)
-            ax_res.set_ylim(-residual_extent, residual_extent)
-            ax_res.axhline(0, color="black", linestyle="--", alpha=0.5)
-            ax_res.axhline(-3, color="black", linestyle="--", alpha=0.5)
-            ax_res.axhline(3, color="black", linestyle="--", alpha=0.5)
-            ax_res.set_yticks([-3, 0, 3])
-            ax_res.set_ylabel("Residuals\n" + r"$\frac{D - M}{\sqrt{M}}$")
-            ax_res.set_xlabel("Energy [keV]")
+            if draw_residuals:
+                safe_model = np.where(total_model_counts > 0, total_model_counts, 1.0)
+                residuals = (observed_counts - total_model_counts) / np.sqrt(safe_model)
+                ax_res.stairs(bins.stairs(residuals), edges=bins.edges, color=_TOTAL_MODEL_COLOR, alpha=_MEDIAN_ALPHA)
+                _finish_residual_panel(
+                    ax_res,
+                    np.max(np.abs(residuals)),
+                    r"$\frac{D - M}{\sqrt{M}}$" if column == 0 else None,
+                    in_sigma_units=True,
+                )
 
-    if x_lim is None:
-        x_lim = (np.min(bin_edges_1d), np.max(bin_edges_1d))
-    ax_spec.set_xlim(*x_lim)
-
-    if y_lim is not None:
-        ax_spec.set_ylim(*y_lim)
-
-    ax_spec.set_ylabel(
-        "Observed Spectrum\n" + r"[$\frac{\text{Counts}}{\text{keV} \cdot \text{s}}$]"
-    )
-    if not draw_residuals:
-        ax_spec.set_xlabel("Energy [keV]")
-
-    if legend:
-        ax_spec.legend(legend_list, legend_names, loc="upper right")
-
-    ax_spec.loglog()
+        _finish_spectrum_panel(ax_spec, bins, x_lim, y_lim, with_ylabel=column == 0)
+        if not draw_residuals:
+            ax_spec.set_xlabel("Energy [keV]")
+        if len(panels) > 1:
+            ax_spec.set_title(_panel_title(state))
+        if legend:
+            ax_spec.legend(handles, labels, loc="upper right", fontsize="small" if len(panels) > 1 else None)
     fig.align_ylabels()
-
     return fig
 
 
 def plot_predictive_coverage(
-    solver,
-    distribution="posterior",
-    x_lim=None,
-    y_lim=None,
-    figsize=(12, 6),
-    plot_background=False,
-    plot_models=True,
-    plot_components=True,
-    legend=True,
-    n_samples=100,
-    min_counts=None,
-    grouping=None,
-    residual_kind="pearson",
-):
-    r"""Plot posterior predictive spectra with residuals.
+    solver: "Solver",
+    distribution: str = "posterior",
+    x_lim: tuple[float, float] | None = None,
+    y_lim: tuple[float, float] | None = None,
+    figsize: tuple[float, float] | None = None,
+    *,
+    plot_models: bool = True,
+    plot_components: bool | str | Sequence[str] = True,
+    legend: bool = True,
+    n_samples: int = 100,
+    min_counts: int | None = None,
+    grouping: int | None = None,
+    residual_kind: Literal["pearson", "sigma", "raw"] = "pearson",
+    spectra: int | Sequence[int] | None = None,
+) -> Figure:
+    r"""Compare the observed spectra with spectra simulated from the prior or the posterior.
 
-    The lower panel displays residuals between the observed data $D$ and the
-    sampled model predictions $M_i$.  Three formulae are available, selected
-    via the *residual_kind* parameter:
+    Each of `n_samples` parameter vectors drawn from `distribution` is folded
+    and Poisson-sampled into a simulated spectrum $M_i$; the line and bands
+    show their median and central 68% and 95%. Before fitting, use `"prior"`
+    to check that the prior can produce spectra like the data; after fitting,
+    the data should lie within the `"posterior"` bands. Each spectrum gets a
+    column, with the models folded into it.
 
-    * **Pearson** (``"pearson"``, default) — per-sample Poisson normalisation,
-      well defined for both prior and posterior predictive checks:
+    The residual panels show the same bands for a residual $r_i$ between the
+    observed counts $D$ and each $M_i$, selected by `residual_kind`:
+
+    * `"pearson"` (default): Poisson-normalised residuals.
 
     $$
     r_i = \frac{D - M_i}{\sqrt{M_i}}
     $$
 
-    * **Sigma** (``"sigma"``) — normalised by the 68 % ensemble spread; can be
-      misleading when the prior is broad:
+    * `"sigma"`: model minus data, normalised by the width of the central
+      68% of the $M_i$ ($P_{16}$ to $P_{84}$); a broad prior gives small
+      residuals.
 
     $$
-    r = \frac{M - D}{P_{84} - P_{16}}
+    r_i = \frac{M_i - D}{P_{84} - P_{16}}
     $$
 
-    * **Raw** (``"raw"``) — un-normalised residuals in data units
-      (counts / keV / s):
+    * `"raw"`: un-normalised residuals in counts per keV, with $\Delta E$
+      the bin width.
 
     $$
     r_i = \frac{D - M_i}{\Delta E}
     $$
 
+    Ignored energy ranges are left empty; backgrounds and the effective area
+    are not accounted for.
+
     Parameters:
-        solver: Solver instance exposing ``distributions`` and ``simulate``.
-        distribution (str, optional): Name of the distribution to sample from,
-            looked up in ``solver.distributions``. Common values are
-            ``"prior"`` and ``"posterior"``. Defaults to ``"posterior"``.
-        x_lim (tuple[float, float], optional): Energy bounds in keV for the
-            upper panel x-axis.
-        y_lim (tuple[float, float], optional): Flux limits for the upper panel
-            y-axis.
-        figsize (tuple[float, float], optional): Matplotlib figure size in
-            inches. Defaults to ``(12, 6)``.
-        plot_background (bool, optional): Reserved for background overlays.
-            This currently has no effect unless the simulated payload contains a
-            ``background`` entry.
-        plot_models (bool, optional): If ``True``, draw one predictive band per
-            source model (in addition to the total model).
-        plot_components (bool, optional): If ``True``, draw additive-component
-            predictive bands for each source model.
-        legend (bool, optional): Whether to display the legend on the spectrum
-            panel. Defaults to ``True``.
-        n_samples (int, optional): Number of parameter draws used to build the
-            predictive bands. Defaults to ``100``.
-        min_counts (int, optional): If set, adjacent bins are merged until every
-            grouped bin contains at least *min_counts* observed counts.  The
-            same grouping is applied to all plotted quantities (observed
-            spectrum, models, components, and residuals).  ``None`` disables
-            adaptive rebinning.  Defaults to ``None``.  Mutually exclusive with
-            *grouping*.
-        grouping (int, optional): If set, every *grouping* adjacent bins are
-            merged into one (the last group may contain fewer bins).  Mutually
-            exclusive with *min_counts*.  Defaults to ``None``.
-        residual_kind (str, optional): Formula used for the residual panel.
-            One of ``"pearson"``, ``"sigma"``, or ``"raw"`` (see above).
-            Defaults to ``"pearson"``.
+        solver: The solver whose prior or posterior is checked.
+        distribution: `"prior"`, `"restricted_prior"` or `"posterior"`; see
+            [`Solver.sample_parameters`][bsixsa.solver.Solver.sample_parameters].
+            Defaults to `"posterior"`.
+        x_lim: Energy range in keV. Defaults to that of the noticed channels.
+        y_lim: y-axis limits of the spectrum panels, in counts per keV.
+        figsize: Figure size in inches. Defaults to `(12, 6)` for one
+            spectrum and 6 by 6 inches per spectrum otherwise.
+        plot_models: Draw one band per model when a spectrum has several.
+            Defaults to `True`.
+        plot_components: Draw one band per additive component of every model
+            (`True`), of none (`False`), or of the models named in a list
+            (`''` for the unnamed model). Defaults to `True`.
+        legend: Show the legends. Defaults to `True`.
+        n_samples: Number of simulated spectra. Defaults to `100`.
+        min_counts: Merge adjacent channels until each displayed bin holds at
+            least this many counts. Exclusive with `grouping`.
+        grouping: Merge every `grouping` adjacent channels. Exclusive with `min_counts`.
+        residual_kind: `"pearson"`, `"sigma"` or `"raw"`. Defaults to `"pearson"`.
+        spectra: XSPEC index (or list of indices) of the spectra to plot.
+            Defaults to every loaded spectrum.
 
     Returns:
-        matplotlib.figure.Figure: Figure containing spectrum and residual
-            panels.
+        The figure.
+
+    Raises:
+        ValueError: If `residual_kind`, `min_counts`, `grouping`, `spectra` or
+            `plot_components` is invalid (checked before any fold).
+        KeyError: If `distribution` is not available, e.g. `"posterior"`
+            before `solver.run()`.
     """
-
-    # TODO : check for background
-    # TODO : let the user chose the components to plot
-    # TODO : add ARF division when relevant
-    # TODO : issue when sometime the components are too high compared to the reference model. Happens when
-    # we charge a new xspec model. What could it be ?
-
-    if min_counts is not None and grouping is not None:
+    if residual_kind not in _RESIDUAL_KINDS:
         raise ValueError(
-            "min_counts and grouping are mutually exclusive; use one or the other."
+            f"residual_kind must be 'pearson', 'sigma' or 'raw' (see the docstring), got {residual_kind!r}."
         )
+    _check_regrouping(min_counts, grouping)
+    loaded, states = _plotted_spectra(spectra)
+    components = _component_selection(plot_components, states)
 
-    state = SpectrumState(1)
-
-    dist = solver.distributions[distribution]
-    if isinstance(dist, Backend):
-        parameters = dist.sample(n_samples)
-    else:
-        parameters = dist.sample((n_samples,))
-    if hasattr(parameters, "numpy"):
-        parameters = parameters.numpy()
-
-    data = solver.simulate(parameters, return_kind="models_and_components")
-
-    bin_edges_1d = state.bin_edges_1d
-    observed_counts = state.observed_counts
-
-    # Compute bin group ids (if any rebinning is requested)
-    bin_ids = _compute_bin_ids(observed_counts, min_counts, grouping)
-
-    if bin_ids is not None:
-        bin_edges_1d = rebin_edges(bin_edges_1d, bin_ids)
-        observed_counts = rebin_counts(observed_counts, bin_ids)
-        data["total_model_counts"] = rebin_counts(
-            data["total_model_counts"], bin_ids
-        )
-        data["model_counts"] = {
-            k: rebin_counts(v, bin_ids)
-            for k, v in data["model_counts"].items()
-        }
-        data["component_counts"] = {
-            k: rebin_counts(v, bin_ids)
-            for k, v in data["component_counts"].items()
-        }
-
-    bin_edges, bin_width, bin_center = _bin_geometry(bin_edges_1d)
-    denominator = bin_width
-
-    legend_names = []
-    legend_list = []
-
-    fig, ax_spec, ax_res = _make_spectrum_axes(figsize, draw_residuals=True)
-    axs = (ax_spec, ax_res)
-
-    ### OBSERVED SPECTRUM
-    error_bar = plot_poisson_error_bars(bin_center, bin_edges, observed_counts, denominator, axs[0], SPECTRUM_DATA_COLOR)
-    legend_list.append(error_bar)
-    legend_names.append("Observed Spectrum")
-
-    ### TOTAL MODEL
-    total_model = np.random.poisson(data["total_model_counts"])
-    median, envelope = plot_median_and_bands(bin_edges_1d, total_model, denominator, axs[0], color=SPECTRUM_COLOR)
-    legend_list.append((median, envelope))
-    legend_names.append("Total model")
-
-    ### INDIVIDUAL MODELS
-    colors = iter(COLOR_CYCLE[1:])
-
-    for i, (model_name, model_counts) in enumerate(
-        data["model_counts"].items()
-    ):
-
-        ### TOTAL MODEL COUNTS
-        if plot_models and (len(data["model_counts"]) > 1):
-
-            local_model = np.random.poisson(model_counts)
-            median, envelope = plot_median_and_bands(bin_edges_1d, local_model, denominator, axs[0], color=next(colors))
-            legend_list.append((median, envelope))
-            legend_names.append(model_name)
-
-        ### ADDITIVE COMPONENTS
-        if plot_components:
-
-            hatches = itertools.cycle(['//', r'\\', '||', '--', '++', 'xx', 'oo', 'OO', '..', '**'])
-
-            for component_name, component_counts in data["component_counts"].items():
-                if component_name.startswith(model_name + "_"):
-
-                    local_model = np.random.poisson(component_counts)
-                    median, envelope = plot_median_and_bands(
-                        bin_edges_1d,
-                        local_model, denominator, axs[0], next(colors),
-                        alpha_envelope=(0.05, 0.1),
-                        hatch=next(hatches),
-                        hatch_linewidth=1,
-                        edgecolor=(1/3, 1/3, 1/3, 1), #
-                    )
-
-                    legend_list.append((median, envelope))
-                    legend_names.append(component_name.lstrip("_")) # We remove the extra "_" if the model name is ""
-
-    total_model_flux = total_model / denominator
-    y_observed_flux = observed_counts / denominator
-
-    _VALID_RESIDUALS = {"pearson", "sigma", "raw"}
-    if residual_kind not in _VALID_RESIDUALS:
+    parameters = solver.sample_parameters(n_samples, distribution)
+    simulated = solver.simulate(parameters, return_kind="models_and_components")
+    # The folds cover every loaded spectrum, concatenated in spectrum order.
+    offsets = np.cumsum([0] + [len(state.observed_counts) for state in loaded])
+    if simulated["total_model_counts"].shape[-1] != offsets[-1]:
         raise ValueError(
-            f"residual_kind must be one of {_VALID_RESIDUALS!r}, "
-            f"got {residual_kind!r}"
+            f"The solver simulates {simulated['total_model_counts'].shape[-1]} bins, but the loaded spectra "
+            f"have {offsets[-1]} noticed channels: plot in the XSPEC session the solver was built in."
         )
 
-    if residual_kind == "pearson":
-        safe_model = np.where(total_model > 0, total_model, 1.0)
-        residuals = (observed_counts - total_model) / np.sqrt(safe_model)
-        residual_label = r"$\frac{D - M}{\sqrt{M}}$"
-    elif residual_kind == "sigma":
-        divider = (
-            np.percentile(total_model_flux, 84, axis=0)
-            - np.percentile(total_model_flux, 16, axis=0)
+    panels = []
+    for state in states:
+        segment = slice(offsets[state.index - 1], offsets[state.index])
+        model_counts = {name: counts[:, segment] for name, counts in simulated["model_counts"].items()}
+        component_counts = {name: counts[:, segment] for name, counts in simulated["component_counts"].items()}
+        folded_into = set(state.sources.values())
+        models = [name for name in model_counts if name in folded_into]
+        curves = list(_model_curves(model_counts, component_counts, models, plot_models, components))
+        panels.append((state, segment, curves))
+    styles = _curve_styles(curve_id for *_, curves in panels for curve_id, _, _ in curves)
+
+    fig, spectrum_axes, residual_axes = _make_figure(len(panels), figsize, draw_residuals=True)
+    component_style = {"alpha_68": 0.1, "alpha_95": 0.05, "hatch_linewidth": 1, "edgecolor": _COMPONENT_EDGE_COLOR}
+    for column, ((state, segment, curves), ax_spec, ax_res) in enumerate(zip(panels, spectrum_axes, residual_axes)):
+        bins = _DisplayBins(state.bin_energies, state.observed_counts, min_counts, grouping)
+        observed_counts = bins.sum(state.observed_counts)
+        handles = [_draw_observed_spectrum(ax_spec, bins, observed_counts)]
+        labels = ["Observed Spectrum"]
+
+        # Poisson noise from NumPy's global generator (np.random.seed fixes it, not the parameter draws).
+        total_model = np.random.poisson(bins.sum(simulated["total_model_counts"][:, segment]))
+        handles.append(_draw_median_and_bands(ax_spec, bins, total_model / bins.width, _TOTAL_MODEL_COLOR))
+        labels.append("Total model")
+        for curve_id, label, counts in curves:
+            color, hatch = styles[curve_id]
+            style = {} if hatch is None else {"hatch": hatch, **component_style}
+            simulated_counts = np.random.poisson(bins.sum(counts))
+            handles.append(_draw_median_and_bands(ax_spec, bins, simulated_counts / bins.width, color, **style))
+            labels.append(label)
+
+        if residual_kind == "pearson":
+            safe_model = np.where(total_model > 0, total_model, 1.0)
+            residuals = (observed_counts - total_model) / np.sqrt(safe_model)
+            residual_label = r"$\frac{D - M}{\sqrt{M}}$"
+        elif residual_kind == "sigma":
+            total_model_per_kev = total_model / bins.width
+            width_68 = np.percentile(total_model_per_kev, 84, axis=0) - np.percentile(total_model_per_kev, 16, axis=0)
+            residuals = (total_model_per_kev - observed_counts / bins.width) / np.where(width_68 > 0, width_68, 1.0)
+            residual_label = r"$\left[ \sigma \right]$"
+        else:
+            residuals = (observed_counts - total_model) / bins.width
+            residual_label = "[counts keV$^{-1}$]"
+        _draw_median_and_bands(ax_res, bins, residuals, _TOTAL_MODEL_COLOR)
+        # The panel range covers the 95% band of the residuals.
+        extent = np.max(np.abs(np.percentile(residuals, _BAND_95, axis=0)))
+        _finish_residual_panel(
+            ax_res, extent, residual_label if column == 0 else None, in_sigma_units=residual_kind != "raw"
         )
-        residuals = (total_model_flux - y_observed_flux) / np.where(divider > 0, divider, 1.0)
-        residual_label = r"$\left[ \sigma \right]$"
-    else:  # raw
-        residuals = (observed_counts - total_model) / denominator
-        residual_label = r"$\frac{\text{Counts}}{\text{keV} \text{s}}$"
 
-    plot_median_and_bands(bin_edges_1d, residuals, np.ones_like(observed_counts), axs[1], color=SPECTRUM_COLOR)
-
-    if x_lim is None:
-        x_lim = (np.min(bin_edges_1d), np.max(bin_edges_1d))
-
-    axs[0].set_xlim(*x_lim)
-
-    if y_lim is not None:
-        axs[0].set_ylim(*y_lim)
-
-    low_env, high_env = np.percentile(residuals, [2.5, 97.5], axis=0)
-    residual_extent = max(np.max(np.abs(low_env)), np.max(np.abs(high_env))) * 1.1
-    if residual_kind in ("pearson", "sigma"):
-        residual_lim = max(residual_extent, 3.2)
-    else:
-        residual_lim = residual_extent
-
-    axs[1].set_ylim(-residual_lim, residual_lim)
-    axs[1].axhline(0, color="black", linestyle="--", alpha=0.5)
-    if residual_kind in ("pearson", "sigma"):
-        axs[1].axhline(-3, color="black", linestyle="--", alpha=0.5)
-        axs[1].axhline(3, color="black", linestyle="--", alpha=0.5)
-        axs[1].set_yticks([-3, 0, 3])
-    axs[1].set_ylabel("Residuals \n" + residual_label)
-    axs[1].set_xlabel("Energy [keV]")
-    axs[0].set_ylabel(
-        "Observed Spectrum \n"
-        + r"[$\frac{\text{Counts}}{\text{keV} \text{s}}$]"
-    )
-
-    if legend:
-        axs[0].legend(legend_list, legend_names, loc="upper right")
-    axs[0].loglog()
+        _finish_spectrum_panel(ax_spec, bins, x_lim, y_lim, with_ylabel=column == 0)
+        if len(panels) > 1:
+            ax_spec.set_title(_panel_title(state))
+        if legend:
+            ax_spec.legend(handles, labels, loc="upper right", fontsize="small" if len(panels) > 1 else None)
     fig.align_ylabels()
-
     return fig

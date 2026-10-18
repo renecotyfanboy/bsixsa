@@ -1,49 +1,36 @@
-"""Configuration of the history-matching prior restriction.
-
-The model only depends on pydantic, so it can be imported (and validated) in
-processes that never load torch.
-"""
+"""Configuration of the history-matching prior restriction."""
 
 from __future__ import annotations
 
+import math
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from .._config_types import NonNegativeInt, PositiveFloat, PositiveInt
+
 __all__ = ["HistoryMatching"]
 
-PositiveInt = Annotated[int, Field(strict=True, gt=0)]
-NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
-PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
 NonNegativeFloat = Annotated[float, Field(strict=True, ge=0)]
 OpenUnitFloat = Annotated[float, Field(strict=True, gt=0, lt=1)]
 
-MODEL_CONFIG = ConfigDict(
-    arbitrary_types_allowed=True,
-    extra="forbid",
-    validate_default=True,
-)
-
 
 class HistoryMatching(BaseModel):
-    r"""Settings of the history-matching restriction of the prior.
+    r"""Settings of history matching, which shrinks the prior to the region worth sampling.
 
-    Waves of exact folds train a regressor $u \mapsto C(u)$ on the unit cube
-    $u = F(\theta)$ of the prior. The region $\{u : \hat C(u) \le t\}$ is kept
-    and the next wave is drawn uniformly inside it, until the region stops
-    shrinking, becomes too small to sample, or the wave budget is spent.
+    Most users set only `seed`, `n_waves`, `simulations_per_parameter` and
+    `target_spans`; the other fields tune the surrogate and the sampling budgets.
 
     The threshold of a wave is
-    $t = \max(\hat C_{best} + s\,\Delta,\; \hat C_{best} + \Delta + k\,\sigma_C,\; t_{cost})$,
-    where $\Delta = \chi^2_d(0.999)$ is the posterior span, $s$ is
-    ``target_spans``, $\sigma_C$ is the regressor's C-stat error near the
-    boundary, $k$ is ``min_margin_sigma`` and $t_{cost}$ is the smallest
-    region that ``max_candidates`` uniform candidates can still fill. It never
-    increases from one wave to the next, except through the recall check,
-    which only widens the region.
+    $t = \max(C_{best} + s\,\Delta,\; C_{best} + \Delta + k\,\sigma_C,\; t_{cost})$,
+    where $C_{best}$ is the best exact C-stat so far, $\Delta = \chi^2_d(0.999)$
+    the posterior span, $s$ is `target_spans`, $k$ is `min_margin_sigma`,
+    $\sigma_C$ the surrogate's held-out C-stat RMSE near the region and
+    $t_{cost}$ the lowest threshold one wave of `max_candidates` can still fill.
+    The threshold never increases between waves, except through the recall check.
     """
 
-    model_config = MODEL_CONFIG
+    model_config = ConfigDict(extra="forbid", validate_default=True)
 
     # ----- waves -----
     n_waves: PositiveInt = Field(
@@ -52,36 +39,29 @@ class HistoryMatching(BaseModel):
     )
     simulations_per_parameter: PositiveInt = Field(
         default=500,
-        description="Exact folds per wave, per free parameter (a wave folds `simulations_per_parameter * d`).",
+        description="Exact folds per wave and per free parameter.",
     )
 
     # ----- threshold -----
     target_spans: PositiveFloat = Field(
         default=3.0,
-        description=(
-            "Requested region width, in posterior spans `chi2_d(0.999)` above the best C-stat."
-        ),
+        description="Width of the region, in posterior spans above the best C-stat.",
     )
     min_margin_sigma: NonNegativeFloat = Field(
         default=3.0,
-        description=(
-            "Safety floor: the threshold stays at least this many regressor C-stat RMSEs "
-            "above `best + span`."
-        ),
+        description="Keep the threshold at least this many surrogate C-stat errors above `best + span`.",
     )
 
     # ----- stopping -----
     stop_when_acceptance: OpenUnitFloat = Field(
         default=5e-3,
-        description="Stop once the region's prior mass falls below this fraction of the cube.",
+        description="Stop once the region holds less than this fraction of the prior.",
     )
     stop_when_threshold: NonNegativeFloat = Field(
         default=0.01,
         description=(
-            "Stop once the threshold falls by less than this relative amount between two waves "
-            "(ignored on a wave widened by the recall check). The gain is relative to the "
-            "absolute C-stat, as in SIXSA v2, so spectra with a large best C-stat (many bins) "
-            "stop sooner, with a wider region; lower it for those."
+            "Stop once the threshold falls by less than this relative amount between two waves; "
+            "lower it for spectra with a large best C-stat."
         ),
     )
 
@@ -112,38 +92,25 @@ class HistoryMatching(BaseModel):
     )
     validation_fraction: OpenUnitFloat = Field(
         default=0.2,
-        description="Fraction of the accumulated folds held out for early stopping and the RMSE.",
+        description="Fraction of each wave's folds held out for validation and the recall check.",
     )
     focus_weight: PositiveFloat = Field(
         default=10.0,
-        description="Loss weight of the folds close to the previous threshold.",
+        description="Loss weight of folds with C-stat below `focus_factor` times the previous threshold.",
     )
     focus_factor: PositiveFloat = Field(
         default=3.0,
-        description=(
-            "A fold is close to the boundary when its C-stat is at most "
-            "`focus_factor * previous threshold`."
-        ),
+        description="Multiple of the previous threshold below which folds get `focus_weight` and set the RMSE.",
     )
 
     # ----- region sampling -----
     mass_probe: PositiveInt = Field(
         default=50_000,
-        description=(
-            "Uniform cube points used to place the cost floor and, grown fourfold until 100 hits, "
-            "to measure the region's prior mass. The growth stops at `50 * mass_probe` points, or "
-            "at the `400 / stop_when_acceptance` points that resolve the acceptance stop if more, "
-            "and never beyond `max_candidates`."
-        ),
+        description="Size of the uniform prior samples used to measure the region's prior mass.",
     )
     box_samples: NonNegativeInt = Field(
         default=50_000,
-        description=(
-            "Region draws added to the folded points when computing the bounding box "
-            "consumed by box-restricted backends. At most `50 * max(mass_probe, box_samples)` "
-            "uniform candidates (and `max_candidates`) are spent on them; a region too small "
-            "to fill them keeps the draws that budget yields."
-        ),
+        description="Region draws added to the folds when computing the bounding box (0 skips them).",
     )
     box_padding: NonNegativeFloat = Field(
         default=0.1,
@@ -151,22 +118,30 @@ class HistoryMatching(BaseModel):
     )
     max_candidates: PositiveInt = Field(
         default=2_000_000_000,
-        description=(
-            "Ceiling on the uniform candidates spent to fill one region sample; beyond it "
-            "sampling raises `TruncationBudgetError`."
-        ),
+        description="Maximum number of uniform trial points per rejection draw from the region.",
     )
 
     # ----- execution -----
     torch_threads: PositiveInt | None = Field(
         default=1,
-        description="Intra-op torch threads while training and predicting; `None` keeps torch's setting.",
+        description="Torch threads for the surrogate; `None` keeps torch's setting.",
     )
     seed: NonNegativeInt | None = Field(
         default=None,
-        description="Seed of every random stream of the restriction; `None` draws fresh entropy.",
+        description="Random seed for reproducible runs; `None` draws fresh entropy.",
     )
     plot: StrictBool = Field(
         default=True,
         description="Write one diagnostic PDF per wave when an output directory is given.",
     )
+
+    @property
+    def mass_probe_budget(self) -> int:
+        """Largest number of uniform points one prior-mass measurement may use."""
+        resolve_stop = math.ceil(400.0 / self.stop_when_acceptance)
+        return min(self.max_candidates, max(50 * self.mass_probe, resolve_stop))
+
+    @property
+    def box_candidate_budget(self) -> int:
+        """Largest number of uniform candidates spent on the bounding-box draws."""
+        return min(self.max_candidates, 50 * max(self.mass_probe, self.box_samples))

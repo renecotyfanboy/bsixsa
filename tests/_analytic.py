@@ -6,7 +6,7 @@ This is an importable helper module (not a test file). It provides:
   Poisson realisation and an exact, vectorised Cash statistic;
 - [`AnalyticSolver`][]: a [`Solver`][bsixsa.solver.Solver] whose folds are
   computed analytically through the overridable hooks, so that every solver
-  code path (fold accounting, pool scopes, fingerprint) runs without XSPEC;
+  code path (fold accounting, pool scopes) runs without XSPEC;
 - [`QuadCstat`][]: a quadratic C-stat on the unit cube with closed-form level
   sets and evidence;
 - [`GaussianProposal`][]: a raw (not cube-rejected) Gaussian proposal with its
@@ -221,7 +221,7 @@ class AnalyticSpectrum:
 class _NoWorkerPool:
     """Stand-in pool returned by `AnalyticSolver._get_pool`; it has no workers.
 
-    It is not `None`, so `Solver._fold` still takes its pooled branch, and any
+    It is not `None`, so `Solver.simulate` still takes its pooled branch, and any
     code that tried to dispatch work to it would fail loudly.
     """
 
@@ -236,15 +236,15 @@ class AnalyticSolver(Solver):
     """`Solver` whose folds are evaluated analytically on an `AnalyticSpectrum`.
 
     Every XSPEC hook is overridden, and only the leaf folding hook
-    `_fold_batch` is replaced, so the production `Solver._fold` (validation,
-    empty batches, fold accounting, pool scopes) runs without XSPEC, as do the
-    fingerprint and prior handling. The worker pool is never created:
+    `_fold_batch` is replaced, so the production `Solver.simulate` (validation,
+    empty batches, fold accounting, pool scopes) runs without XSPEC, as does the
+    prior handling. The worker pool is never created:
     `_get_pool` returns the `NO_WORKER_POOL` sentinel, leaves `self.pool`
     unset and counts its calls in `n_pool_requests`. Each folded batch is
     appended to `fold_log` as a dict with keys `phase`, `n`, `return_kind`,
     `no_pool` and `pool_depth` (the pool-scope depth *before* the fold opened
     its own scope, so a positive value means an outer scope was already open).
-    Empty batches are answered by `Solver._fold` and never reach the log.
+    Empty batches are answered by `Solver.simulate` and never reach the log.
 
     Parameters:
         spectrum: Analytic forward model and observed counts.
@@ -268,12 +268,12 @@ class AnalyticSolver(Solver):
         self.spectrum = spectrum
         self.n_pool_requests = 0
         self.fold_log: list[dict] = []
-        self.nb_models = 1
         d = spectrum.d
         self._setup(
             prior=MultipleIndependent(spectrum.prior_list()),
-            indexes=list(range(1, d + 1)),
-            model_indexes=["analytic"] * d,
+            parameter_indices=list(range(1, d + 1)),
+            model_names=["analytic"] * d,
+            parameter_names=spectrum.parameter_names,
             outputfiles_basename=os.fspath(outputfiles_basename),
             overwrite=overwrite,
             n_jobs=n_jobs,
@@ -282,16 +282,8 @@ class AnalyticSolver(Solver):
         )
 
     @property
-    def parameter_names(self) -> list[str]:
-        return list(self.spectrum.parameter_names)
-
-    @property
     def observed_counts(self) -> np.ndarray:
         return np.array(self.spectrum.observed, dtype=np.float64)
-
-    @property
-    def observed_spectrum(self) -> np.ndarray:
-        return np.asarray(self.spectrum.observed, dtype=np.float32)
 
     @property
     def n_bins(self) -> int:
@@ -302,16 +294,6 @@ class AnalyticSolver(Solver):
 
     def _xspec_constraints(self) -> dict:
         return {"n_spectra": 1, "stat_method": "cstat", "has_background": False}
-
-    def _xspec_problem_state(self) -> dict:
-        """Forward-model settings that change the likelihood but not the counts."""
-        spectrum = self.spectrum
-        return {
-            "model": "analytic absorbed power law",
-            "grid": [spectrum.e_min, spectrum.e_max, spectrum.n_channels],
-            "amplitude": spectrum.amplitude,
-            "fixed_nH": spectrum.fixed_nH if spectrum.d == 2 else None,
-        }
 
     def _get_pool(self):
         self.n_pool_requests += 1
@@ -340,7 +322,7 @@ class AnalyticSolver(Solver):
                 "n": int(len(parameters)),
                 "return_kind": return_kind,
                 "no_pool": pool is None,
-                # A pooled fold runs inside the scope `_fold` just opened.
+                # A pooled fold runs inside the scope `simulate` just opened.
                 "pool_depth": int(self._pool_depth) - (0 if pool is None else 1),
             }
         )

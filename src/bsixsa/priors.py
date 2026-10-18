@@ -1,10 +1,34 @@
-from collections import defaultdict
+"""Priors for bsixsa fits.
+
+- [`uniform`][bsixsa.priors.uniform], [`loguniform`][bsixsa.priors.loguniform]
+  and [`norm`][bsixsa.priors.norm] build 1-D priors (frozen SciPy distributions).
+- [`MultipleIndependent`][bsixsa.priors.MultipleIndependent] is the joint
+  prior of independent marginals, with its unit-cube maps and truncation.
+- [`build_prior`][bsixsa.priors.build_prior] matches a prior list to the
+  parameters of the loaded XSPEC model(s).
+"""
+
+import re
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
-from .convenience import XSilence, has_indexed_suffix
+from numpy.typing import ArrayLike
+from scipy import stats
 from xspec import AllModels
-from .convenience import iter_all_parameters
+
+from .convenience import (
+    XSilence,
+    XspecParameter,
+    base_component_name,
+    first_model_copy,
+    iter_all_parameters,
+    model_data_groups,
+)
+from .xspec import set_parameters
 
 __all__ = [
+    'MultipleIndependent',
     'TruncatedMarginal',
     'build_prior',
     'loguniform',
@@ -13,72 +37,75 @@ __all__ = [
     'validate_finite_support',
 ]
 
-def uniform(low, high):
-    """Create a uniform prior on a finite interval.
+# A frozen SciPy continuous distribution.
+Distribution = Any
+
+
+def uniform(low: float, high: float) -> Distribution:
+    """Uniform prior on ``[low, high]``, like XSPEC's ``cons`` prior.
 
     Parameters:
-        low:
-            Lower bound of the interval.
-        high:
-            Upper bound of the interval.
+        low: Lower bound.
+        high: Upper bound.
 
     Returns:
-        A SciPy ``uniform`` distribution defined on ``[low, high]``.
+        ``scipy.stats.uniform(loc=low, scale=high - low)``.
     """
-    from scipy.stats import uniform
-    return uniform(low, high-low)
+    if not (np.isfinite(low) and np.isfinite(high) and low < high):
+        raise ValueError(
+            f"uniform(low, high) needs finite bounds with low < high, got low={low}, high={high}."
+        )
+    return stats.uniform(low, high - low)
 
-def loguniform(low, high):
-    """Create a log-uniform prior on a positive interval.
+
+def loguniform(low: float, high: float) -> Distribution:
+    """Log-uniform prior on ``[low, high]``, like XSPEC's ``jeffreys`` prior.
+
+    The density is proportional to ``1/x``: every decade gets the same prior
+    mass. Use it for scale parameters such as normalisations.
 
     Parameters:
-        low:
-            Strictly positive lower bound.
-        high:
-            Upper bound.
+        low: Lower bound, strictly positive.
+        high: Upper bound.
 
     Returns:
-        A SciPy ``loguniform`` distribution defined on ``[low, high]``.
+        ``scipy.stats.loguniform(low, high)``.
     """
-    from scipy.stats import loguniform
-    return loguniform(low, high)
+    if not (0 < low < high < np.inf):
+        raise ValueError(
+            f"loguniform(low, high) needs 0 < low < high < inf, got low={low}, high={high}."
+        )
+    return stats.loguniform(low, high)
 
-def norm(loc, scale, low, high):
-    """Create a truncated Gaussian prior.
+
+def norm(loc: float, scale: float, low: float, high: float) -> Distribution:
+    """Gaussian prior of mean ``loc`` and standard deviation ``scale``, truncated to ``[low, high]``.
 
     Parameters:
-        loc:
-            Mean of the underlying Gaussian distribution.
-        scale:
-            Standard deviation of the underlying Gaussian distribution.
-        low:
-            Lower truncation bound, expressed in SciPy ``truncnorm``
-            coordinates.
-        high:
-            Upper truncation bound, expressed in SciPy ``truncnorm``
-            coordinates.
+        loc: Mean of the underlying Gaussian.
+        scale: Standard deviation of the underlying Gaussian.
+        low: Lower truncation bound.
+        high: Upper truncation bound.
 
     Returns:
-        A SciPy ``truncnorm`` distribution with the requested location,
-        scale, and truncation limits.
+        A ``scipy.stats.truncnorm`` distribution.
     """
-    from scipy.stats import truncnorm
+    if not (scale > 0 and low < high):
+        raise ValueError(
+            f"norm(loc, scale, low, high) needs scale > 0 and low < high, got scale={scale}, low={low}, high={high}."
+        )
+    # SciPy's truncnorm takes the bounds in units of standard deviations from loc.
     a, b = (low - loc) / scale, (high - loc) / scale
-    return truncnorm(a, b, loc=loc, scale=scale)
+    return stats.truncnorm(a, b, loc=loc, scale=scale)
 
 
-def _scalar_or_array(values: np.ndarray):
+def _scalar_or_array(values: np.ndarray) -> np.ndarray | float:
     """Return a NumPy scalar for 0-d input and the array otherwise (SciPy's convention)."""
     return values[()]
 
 
 class _TruncatedFamily:
-    """Stand-in for a SciPy ``rv_continuous`` that only exposes the family name.
-
-    Code dispatching on ``dist.dist.name`` (``xspec_bayes_contribution``,
-    ``max_log_pdf_per_axis``, prior fingerprints) reads ``"truncated"`` for a
-    [`TruncatedMarginal`][bsixsa.priors.TruncatedMarginal].
-    """
+    """Family descriptor of a ``TruncatedMarginal``: ``dist.dist.name == "truncated"``."""
 
     name = "truncated"
 
@@ -97,12 +124,10 @@ class TruncatedMarginal:
     $$\pi_B(\theta) = \frac{\pi(\theta)}{u_{hi} - u_{lo}}, \qquad
     F_B(\theta) = \frac{F(\theta) - u_{lo}}{u_{hi} - u_{lo}}.$$
 
-    It is the fallback of
+    Used by
     [`MultipleIndependent.truncated`][bsixsa.priors.MultipleIndependent.truncated]
-    for families without a closed-form truncation. It mimics the frozen SciPy
-    interface used across bsixsa (``support``, ``cdf``, ``sf``, ``ppf``,
-    ``isf`` -- required by nautilus --, ``logpdf``, ``pdf``, ``rvs``) and is
-    picklable, so it can be shipped to worker processes.
+    for families without a closed-form truncation. It behaves like a frozen
+    SciPy distribution.
 
     Attributes:
         base: Wrapped distribution.
@@ -110,28 +135,13 @@ class TruncatedMarginal:
         hi_u: Upper bound of the interval in the base unit cube.
         a: Lower physical bound, ``base.ppf(lo_u)``.
         b: Upper physical bound, ``base.ppf(hi_u)``.
-        dist: Family descriptor whose ``name`` is ``"truncated"``.
-        args: Always ``()``.
-        kwds: Always ``{}``.
     """
 
-    def __init__(self, base, lo_u: float, hi_u: float):
+    def __init__(self, base: Distribution, lo_u: float, hi_u: float):
         """Wrap ``base`` restricted to ``[base.ppf(lo_u), base.ppf(hi_u)]``.
 
-        Parameters:
-            base:
-                Distribution behaving like a frozen SciPy continuous
-                distribution (at least ``cdf``, ``ppf`` and ``logpdf``).
-            lo_u:
-                Lower bound in the base unit cube.
-            hi_u:
-                Upper bound in the base unit cube.
-
         Raises:
-            ValueError: If ``0 <= lo_u < hi_u <= 1`` does not hold, or if the
-                interval collapses to a single physical value
-                (``base.ppf(lo_u) >= base.ppf(hi_u)``), which would leave a
-                non-normalisable density.
+            ValueError: If ``0 <= lo_u < hi_u <= 1`` fails or the interval collapses to a point.
         """
         lo_u, hi_u = float(lo_u), float(hi_u)
         if not (0.0 <= lo_u < hi_u <= 1.0):
@@ -168,17 +178,17 @@ class TruncatedMarginal:
         """Physical support ``(a, b)`` of the truncated distribution."""
         return self.a, self.b
 
-    def cdf(self, x):
+    def cdf(self, x: ArrayLike) -> np.ndarray | float:
         """Cumulative distribution function $(F(x) - u_{lo}) / (u_{hi} - u_{lo})$, clipped to ``[0, 1]``."""
         base_cdf = np.asarray(self.base.cdf(np.asarray(x, dtype=float)), dtype=float)
         return _scalar_or_array(np.clip((base_cdf - self.lo_u) / self._width, 0.0, 1.0))
 
-    def sf(self, x):
+    def sf(self, x: ArrayLike) -> np.ndarray | float:
         """Survival function $(u_{hi} - F(x)) / (u_{hi} - u_{lo})$, clipped to ``[0, 1]``."""
         base_cdf = np.asarray(self.base.cdf(np.asarray(x, dtype=float)), dtype=float)
         return _scalar_or_array(np.clip((self.hi_u - base_cdf) / self._width, 0.0, 1.0))
 
-    def ppf(self, q):
+    def ppf(self, q: ArrayLike) -> np.ndarray | float:
         """Inverse CDF, ``base.ppf(lo_u + q * (hi_u - lo_u))``; ``nan`` outside ``[0, 1]``."""
         q = np.asarray(q, dtype=float)
         inside = (q >= 0.0) & (q <= 1.0)
@@ -188,11 +198,11 @@ class TruncatedMarginal:
         x = np.clip(np.asarray(self.base.ppf(u), dtype=float), self.a, self.b)
         return _scalar_or_array(np.where(inside, x, np.nan))
 
-    def isf(self, q):
+    def isf(self, q: ArrayLike) -> np.ndarray | float:
         """Inverse survival function, ``ppf(1 - q)``."""
         return self.ppf(1.0 - np.asarray(q, dtype=float))
 
-    def logpdf(self, x):
+    def logpdf(self, x: ArrayLike) -> np.ndarray | float:
         """Log-density ``base.logpdf(x) - log(hi_u - lo_u)`` on ``[a, b]``, ``-inf`` outside."""
         x = np.asarray(x, dtype=float)
         inside = (x >= self.a) & (x <= self.b)
@@ -201,23 +211,16 @@ class TruncatedMarginal:
         out = np.where(inside, log_pdf, -np.inf)
         return _scalar_or_array(np.where(np.isnan(x), np.nan, out))
 
-    def pdf(self, x):
+    def pdf(self, x: ArrayLike) -> np.ndarray | float:
         """Probability density, ``exp(logpdf(x))``."""
         return _scalar_or_array(np.exp(np.asarray(self.logpdf(x), dtype=float)))
 
-    def rvs(self, size=None, random_state=None):
-        """Draw samples by inverse-CDF sampling.
-
-        Parameters:
-            size:
-                Output shape, as in SciPy (``None`` draws a single scalar).
-            random_state:
-                Seed, ``numpy.random.Generator`` or legacy
-                ``numpy.random.RandomState``.
-
-        Returns:
-            Samples within ``[a, b]``.
-        """
+    def rvs(
+        self,
+        size: int | tuple[int, ...] | None = None,
+        random_state: int | np.random.Generator | np.random.RandomState | None = None,
+    ) -> np.ndarray | float:
+        """Draw samples by inverse-CDF sampling."""
         if isinstance(random_state, np.random.RandomState):
             u = random_state.uniform(size=size)
         else:
@@ -257,31 +260,9 @@ def _collapse_message(dist, lo_u: float, hi_u: float, low: float, high: float) -
 def _rebuild_inside(make, lo_param: float, hi_param: float, outer_low: float, outer_high: float):
     """Build ``make(lo_param, hi_param)`` with its support inside ``[outer_low, outer_high]``.
 
-    Rebuilding a family from its truncation bounds rounds them again (e.g.
-    ``uniform`` stores ``scale = high - low`` and reports ``low + scale``), so a
-    face can land one ulp outside the original support, where the original
-    prior density is ``-inf``. Each offending bound is moved inward by a step
-    that starts at one ulp of the bounds' magnitude and doubles, so the loop
-    terminates quickly and moves a face by a few ulps at most in practice.
-
-    Parameters:
-        make:
-            Callable ``(lo_param, hi_param) -> frozen distribution``.
-        lo_param:
-            Lower bound parameter passed to ``make``.
-        hi_param:
-            Upper bound parameter passed to ``make``.
-        outer_low:
-            Lower bound of the original support.
-        outer_high:
-            Upper bound of the original support.
-
-    Returns:
-        The rebuilt distribution, whose support is non-empty and inside the
-        original one.
-
-    Raises:
-        ValueError: If no nudged pair of bounds fits (a box a few ulps wide).
+    Rebuilding a family rounds its bounds again, so a face can land one ulp
+    outside the original support, where the prior density is ``-inf``. Such a
+    bound is nudged inward by doubling ulp steps.
     """
     first_step = float(np.spacing(max(abs(lo_param), abs(hi_param))))
     step_lo = step_hi = 0.0
@@ -308,14 +289,7 @@ def _rebuild_inside(make, lo_param: float, hi_param: float, outer_low: float, ou
 
 
 def _truncate_marginal(dist, lo_u: float, hi_u: float):
-    """Restrict one marginal to ``[dist.ppf(lo_u), dist.ppf(hi_u)]``, renormalised.
-
-    ``uniform``, ``loguniform``/``reciprocal`` and ``truncnorm`` are rebuilt in
-    closed form in the same SciPy family, so family-dispatching code
-    (``xspec_bayes_contribution``, ``max_log_pdf_per_axis``) keeps working on
-    the result. Everything else is wrapped in a ``TruncatedMarginal``. In
-    every case the truncated support lies inside ``dist.support()``.
-    """
+    """Restrict one marginal to ``[dist.ppf(lo_u), dist.ppf(hi_u)]``, in the same family when possible."""
     if isinstance(dist, TruncatedMarginal):
         # Compose in the base cube instead of nesting wrappers. An untouched
         # face keeps its exact bound: lo + 1.0 * width can round past hi_u.
@@ -338,15 +312,13 @@ def _truncate_marginal(dist, lo_u: float, hi_u: float):
     if name == "uniform":
         return _rebuild_inside(uniform, low, high, outer_low, outer_high)
     if name == "truncnorm":
-        from scipy.stats import truncnorm
-
         loc, scale = float(loc), float(scale)
         # Standardised bounds, as in norm(); an untouched face reuses the
         # original one so that it stays bit-identical to the original support.
         a = float(shapes[0]) if lo_u == 0.0 else (low - loc) / scale
         b = float(shapes[1]) if hi_u == 1.0 else (high - loc) / scale
         return _rebuild_inside(
-            lambda a_, b_: truncnorm(a_, b_, loc=loc, scale=scale), a, b, outer_low, outer_high
+            lambda a_, b_: stats.truncnorm(a_, b_, loc=loc, scale=scale), a, b, outer_low, outer_high
         )
     if loc == 0:
         # A pure rescale of a log-uniform is still log-uniform on [low, high].
@@ -355,20 +327,11 @@ def _truncate_marginal(dist, lo_u: float, hi_u: float):
     return TruncatedMarginal(dist, lo_u, hi_u)
 
 
-def validate_finite_support(prior) -> None:
+def validate_finite_support(prior: "MultipleIndependent") -> None:
     """Require every axis of a prior to have a finite support.
 
-    Prior restriction works in the unit cube and maps boxes back through
-    ``ppf``, which only yields a usable physical box when both bounds are
-    finite.
-
-    Parameters:
-        prior:
-            A [`MultipleIndependent`][bsixsa.priors.MultipleIndependent] prior.
-
     Raises:
-        ValueError: Naming every axis whose ``support()`` has an infinite (or
-            ``nan``) bound.
+        ValueError: Naming every axis with an infinite or ``nan`` bound.
     """
     offending = []
     for j, dist in enumerate(prior.dists):
@@ -382,122 +345,103 @@ def validate_finite_support(prior) -> None:
 
 
 class MultipleIndependent:
-    def __init__(self, dists):
+    r"""Joint prior made of independent 1-D marginals, one per fitted parameter.
+
+    The unit-cube coordinate of axis $j$ is $u_j = F_j(\theta_j)$, where
+    $F_j$ is the CDF of marginal $j$; under the prior, $u$ is uniform on
+    $[0, 1]^d$ (see
+    [`from_unit_cube`][bsixsa.priors.MultipleIndependent.from_unit_cube] and
+    [`to_unit_cube`][bsixsa.priors.MultipleIndependent.to_unit_cube]).
+
+    Attributes:
+        dists: The 1-D marginals, in parameter order.
+        ndim: Number of parameters.
+        bounds: Support ``(low, high)`` of each marginal.
+    """
+
+    def __init__(self, dists: Sequence[Distribution]):
+        """Combine 1-D marginals (frozen SciPy-like distributions, in parameter order) into a joint prior."""
         self.dists = list(dists)
         self.ndim = len(self.dists)
         self.bounds = [dist.support() for dist in self.dists]
 
-    def sample(self, size=1, random_state=None):
-        rng = np.random.default_rng(random_state)
-        cols = [dist.rvs(size=size, random_state=rng) for dist in self.dists]
-        x = np.stack(cols, axis=-1)
+    def _as_points(self, x: Any, *, batch_only: bool) -> np.ndarray:
+        """Return ``x`` as a float array whose last axis has ``ndim`` entries (at most 2-D with ``batch_only``)."""
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 0 or x.shape[-1] != self.ndim or (batch_only and x.ndim > 2):
+            expected = f"({self.ndim},) or (n, {self.ndim})" if batch_only else f"(..., {self.ndim})"
+            raise ValueError(f"Expected points of shape {expected}, got {x.shape}.")
         return x
 
-    def from_unit_cube(self, cube):
-        cube = np.asarray(cube, dtype=float)
-        params = np.empty_like(cube, dtype=float)
-        for j, dist in enumerate(self.dists):
-            params[..., j] = dist.ppf(cube[..., j])
-        return params
+    def sample(
+        self,
+        size: int | tuple[int, ...] = 1,
+        random_state: int | np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Draw independent samples from the prior, shape ``(*size, ndim)``."""
+        rng = np.random.default_rng(random_state)
+        return np.stack([dist.rvs(size=size, random_state=rng) for dist in self.dists], axis=-1)
 
-    def to_unit_cube(self, x):
-        x = np.asarray(x, dtype=float)
-        cube = np.empty_like(x, dtype=float)
+    def from_unit_cube(self, cube: Any) -> np.ndarray:
+        r"""Map unit-cube points to physical parameters, $\theta_j = F_j^{-1}(u_j)$ (last axis of size ``ndim``)."""
+        cube = self._as_points(cube, batch_only=False)
+        theta = np.empty_like(cube)
+        for j, dist in enumerate(self.dists):
+            theta[..., j] = dist.ppf(cube[..., j])
+        return theta
+
+    def to_unit_cube(self, x: Any) -> np.ndarray:
+        r"""Map physical parameters to the unit cube, $u_j = F_j(\theta_j)$ (last axis of size ``ndim``)."""
+        x = self._as_points(x, batch_only=False)
+        cube = np.empty_like(x)
         for j, dist in enumerate(self.dists):
             cube[..., j] = dist.cdf(x[..., j])
         return cube
 
-    def from_unit_gaussian(self, z):
-        """Map ``z ~ N(0, I)^D`` to physical space via ``ppf(Phi(z))`` per marginal.
-
-        Composes the standard-normal CDF ``Phi`` with each marginal's inverse CDF
-        (``from_unit_cube``), so a standard-normal latent is mapped to the prior
-        distribution. This is the unbounded counterpart of ``from_unit_cube`` used
-        by the SIXSA backend, whose latent space is a unit Gaussian rather than the
-        unit cube.
-        """
-        from scipy.stats import norm
-        z = np.asarray(z, dtype=float)
-        return self.from_unit_cube(norm.cdf(z))
-
-    def to_unit_gaussian(self, x):
-        """Map physical parameters to ``z ~ N(0, I)^D`` via ``Phi^{-1}(cdf(x))`` per marginal.
-
-        Inverse of ``from_unit_gaussian``: the per-marginal CDF (``to_unit_cube``)
-        followed by the standard-normal inverse CDF. The unit-cube values are
-        clipped away from ``0``/``1`` so the inverse CDF stays finite at the prior
-        bounds.
-        """
-        from scipy.stats import norm
-        cube = np.clip(self.to_unit_cube(x), 1e-12, 1.0 - 1e-12)
-        return norm.ppf(cube)
-
-    def log_prob(self, x):
-        x = np.asarray(x)
-        x2 = np.atleast_2d(x)
-        lp = np.zeros(x2.shape[0], dtype=float)
-
-        for j, dist in enumerate(self.dists):
-            lp += dist.logpdf(x2[:, j])
-
-        return lp[0] if x.ndim == 1 else lp
-
-    def xspec_bayes_contribution(self, x) -> float:
-        """XSPEC ``Fit.bayes="on"`` prior contribution to the fit statistic.
-
-        Evaluates ``-2 * Log(prior)`` per axis with XSPEC's unnormalised
-        conventions (``Bayes::lPrior``) for the priors we compare against
-        XSPEC: ``uniform`` -> ``cons`` contributes ``0``, ``loguniform`` ->
-        ``jeffreys`` contributes ``2*ln(x)``. Adding this to the bare cstat
-        at ``x`` reproduces XSPEC's ``Fit.statistic`` when ``Fit.bayes`` is
-        on for those priors.
-        """
-        x = np.asarray(x, dtype=float).ravel()
-        return float(self.xspec_bayes_contribution_batch(x.reshape(1, -1))[0])
-
-    def xspec_bayes_contribution_batch(self, x) -> np.ndarray:
-        """Vectorised [`xspec_bayes_contribution`][bsixsa.priors.MultipleIndependent.xspec_bayes_contribution].
+    def log_prob(self, x: Any) -> float | np.ndarray:
+        """Log prior density (sum of the marginal log-densities), ``-inf`` outside the support.
 
         Parameters:
-            x:
-                Physical parameters of shape ``(n, ndim)``; a single point of
-                shape ``(ndim,)`` is treated as ``n = 1``.
+            x: One point ``(ndim,)`` or a batch ``(n, ndim)``.
 
         Returns:
-            Array of shape ``(n,)`` whose row ``i`` is
-            ``xspec_bayes_contribution(x[i])``.
-
-        Raises:
-            ValueError: If ``x`` does not have ``ndim`` columns (extra
-                columns would otherwise be silently ignored).
+            A float for one point, an array of shape ``(n,)`` for a batch.
         """
-        x = np.asarray(x, dtype=float)
-        if x.ndim > 2 or np.atleast_2d(x).shape[1] != self.ndim:
-            raise ValueError(
-                f"x must have shape ({self.ndim},) or (n, {self.ndim}), got {x.shape}."
-            )
-        x = np.atleast_2d(x)
-        contribution = np.zeros(x.shape[0], dtype=float)
+        x = self._as_points(x, batch_only=True)
+        rows = np.atleast_2d(x)
+        log_density = np.zeros(len(rows))
+        for j, dist in enumerate(self.dists):
+            log_density += dist.logpdf(rows[:, j])
+        return log_density[0] if x.ndim == 1 else log_density
+
+    def xspec_bayes_contribution(self, x: Any) -> float | np.ndarray:
+        """Prior term that XSPEC adds to the fit statistic when ``Fit.bayes = "on"``.
+
+        Bare C-stat plus this term reproduces XSPEC's ``Fit.statistic`` with
+        bayes on. Per axis XSPEC adds ``-2 ln(prior)``, unnormalised:
+        ``uniform`` (``cons``) gives 0, ``loguniform`` (``jeffreys``) gives
+        ``2 ln(x)``, other families give ``-2 logpdf(x)`` (equal to XSPEC only
+        up to a constant).
+
+        Parameters:
+            x: One point ``(ndim,)`` or a batch ``(n, ndim)``.
+
+        Returns:
+            A float for one point, an array of shape ``(n,)`` for a batch.
+        """
+        x = self._as_points(x, batch_only=True)
+        rows = np.atleast_2d(x)
+        contribution = np.zeros(len(rows))
         for j, dist in enumerate(self.dists):
             name = dist.dist.name
-            if name == "uniform":
-                continue
-            elif name in ("loguniform", "reciprocal"):
-                contribution += 2.0 * np.log(x[:, j])
-            else:
-                # Only uniform (-> cons) and loguniform (-> jeffreys) are
-                # guaranteed to match XSPEC's bayes-on statistic exactly.
-                # Everything else uses the scipy log-pdf, which differs
-                # from the XSPEC counterpart by normalisation constants
-                # (e.g. XSPEC's gauss prior is an untruncated Gaussian
-                # while bsixsa's norm() is a truncated one) — acceptable,
-                # as only uniform/loguniform fits are cross-checked
-                # against XSPEC.
-                contribution += -2.0 * np.asarray(dist.logpdf(x[:, j]), dtype=float)
-        return contribution
+            if name in ("loguniform", "reciprocal"):
+                contribution += 2.0 * np.log(rows[:, j])
+            elif name != "uniform":
+                contribution -= 2.0 * np.asarray(dist.logpdf(rows[:, j]), dtype=float)
+        return float(contribution[0]) if x.ndim == 1 else contribution
 
     def truncated(
-        self, lower_u, upper_u, *, min_width: float = 1e-9
+        self, lower_u: np.ndarray, upper_u: np.ndarray, *, min_width: float = 1e-9
     ) -> tuple["MultipleIndependent", float]:
         r"""Restrict the prior to a box of its unit cube $u = F(\theta)$.
 
@@ -510,32 +454,21 @@ class MultipleIndependent:
         An evidence computed under $\pi_B$ is therefore corrected with
         $\log Z = \log Z_B + \log M_B$.
 
-        ``uniform``, ``loguniform`` and truncated ``norm`` marginals are
-        rebuilt in the same SciPy family (so ``xspec_bayes_contribution`` and
-        ``max_log_pdf_per_axis`` keep working); other families are wrapped in a
-        [`TruncatedMarginal`][bsixsa.priors.TruncatedMarginal]. Axes spanning
-        the whole ``[0, 1]`` keep their original distribution object. Every
-        truncated support lies inside the original one, even when rebuilding
-        a family would round a face an ulp past it (a face on the original
-        support boundary is moved inward by a few ulps), so the original prior
-        density stays finite on the whole truncated support.
+        ``uniform``, ``loguniform`` and ``norm`` marginals stay in their SciPy
+        family; others are wrapped in a
+        [`TruncatedMarginal`][bsixsa.priors.TruncatedMarginal]. Truncated
+        supports always lie inside the original ones.
 
         Parameters:
-            lower_u:
-                Lower box bounds in the unit cube, shape ``(ndim,)``.
-            upper_u:
-                Upper box bounds in the unit cube, shape ``(ndim,)``.
-            min_width:
-                Smallest accepted ``upper_u - lower_u`` on any axis.
+            lower_u: Lower box bounds in the unit cube, shape ``(ndim,)``.
+            upper_u: Upper box bounds in the unit cube, shape ``(ndim,)``.
+            min_width: Smallest accepted width on any axis.
 
         Returns:
             ``(prior, log_mass)``: the truncated prior and $\log M_B$.
 
         Raises:
-            ValueError: If the bounds have the wrong shape, are not finite,
-                violate ``0 <= lower_u < upper_u <= 1``, are narrower than
-                ``min_width``, or collapse to a single physical value (for
-                every family, including the ``TruncatedMarginal`` fallback).
+            ValueError: If the box is invalid, too narrow, or collapses to a point.
         """
         lo, hi = _validate_unit_box(lower_u, upper_u, self.ndim, min_width)
         dists = [
@@ -548,15 +481,10 @@ class MultipleIndependent:
         return MultipleIndependent(dists), log_mass
 
     def max_log_pdf_per_axis(self) -> np.ndarray:
-        """Per-axis maximum of ``logpdf`` over the prior support.
+        """Per-axis maximum of ``logpdf`` over the support (``uniform``, ``loguniform`` and ``norm`` only).
 
-        Used by least-squares MAP fits to shift the prior log-density into a
-        non-negative range, so that the prior contribution can be encoded as
-        extra residuals whose sum of squares equals
-        ``-2 * log_prior + const``.
-
-        Closed-form per family. Supported priors are ``uniform``,
-        ``loguniform``, and truncated ``norm``.
+        Least-squares MAP fits use it to write the prior as extra residuals
+        whose sum of squares is ``-2 * log_prior + const``.
         """
         out = np.empty(self.ndim, dtype=float)
         for j, dist in enumerate(self.dists):
@@ -586,111 +514,202 @@ class MultipleIndependent:
         return out
 
 
-def build_prior(define_prior):
+def _model_label(model_name: str) -> str:
+    """Name of a model in error messages."""
+    return f"model '{model_name}'" if model_name else "the model"
+
+
+def _model_names_label(model_names: Sequence[str]) -> str:
+    """List of model names in error messages."""
+    return ", ".join(repr(name) if name else "'' (the unnamed model)" for name in model_names)
+
+
+def _resolve_component(model_name: str, name: str) -> str:
+    """Return the XSPEC name of a component given by XSPEC name or as ``<base>_<position>``."""
+    names = list(first_model_copy(model_name).componentNames)
+    if name in names:
+        return name
+    suffixed = re.fullmatch(r"(.+)_(\d+)", name)
+    if suffixed:
+        position = int(suffixed.group(2))
+        if 1 <= position <= len(names) and base_component_name(names[position - 1]) == suffixed.group(1):
+            return names[position - 1]
+    by_position = [f"{base_component_name(other)}_{k}" for k, other in enumerate(names, start=1)]
+    raise ValueError(
+        f"Unknown component '{name}' in {_model_label(model_name)}. Its components are "
+        f"{', '.join(names)} (or, by position, {', '.join(by_position)})."
+    )
+
+
+def _prior_entries(define_prior: Sequence[tuple], loaded_models: list[str]) -> dict[tuple[str, str, str], tuple]:
+    """Map ``(model, XSPEC component, parameter)`` to ``(entry label, distribution)``."""
+    lengths = sorted({len(entry) for entry in define_prior})
+    if lengths and lengths not in ([3], [4]):
+        raise ValueError(
+            "Each prior entry must be (component, parameter, distribution), or "
+            "(model_name, component, parameter, distribution) to name the model, and all "
+            f"entries must have the same form; got entries with {lengths} elements."
+        )
+    if lengths == [3] and len(loaded_models) > 1:
+        raise ValueError(
+            f"{len(loaded_models)} models are loaded in XSPEC ({_model_names_label(loaded_models)}): "
+            "start each prior entry with the model name, e.g. "
+            f"({loaded_models[0]!r}, 'powerlaw', 'PhoIndex', uniform(1, 3))."
+        )
+
+    entries = {}
+    for entry in define_prior:
+        label, distribution = tuple(entry[:-1]), entry[-1]
+        model_name, component_name, parameter_name = label if len(label) == 3 else (loaded_models[0], *label)
+        if model_name not in loaded_models:
+            single_model_hint = (
+                " With a single model, the model name can be left out (3-element entries)."
+                if len(loaded_models) == 1
+                else ""
+            )
+            raise ValueError(
+                f"Prior entry {label}: no model named {model_name!r} is loaded in XSPEC; "
+                f"the loaded models are {_model_names_label(loaded_models)}.{single_model_hint}"
+            )
+        key = (model_name, _resolve_component(model_name, component_name), parameter_name)
+        if key in entries:
+            raise ValueError(
+                f"Two prior entries address the same XSPEC parameter: {entries[key][0]} and {label}."
+            )
+        entries[key] = (label, distribution)
+    return entries
+
+
+def _as_prior_entry(par: XspecParameter, with_model: bool) -> str:
+    """Write a parameter as a prior entry, without the distribution."""
+    names = (par.component.name, par.parameter.name)
+    return repr((par.model.name, *names) if with_model else names)
+
+
+def _free_in_later_copies() -> list[str]:
+    """XSPEC labels (`"17 (factor)"`, `"bkg:3 (norm)"`) of the free parameters of model copies after the first."""
+    labels = []
+    for model_name in AllModels.sources.values():
+        for group in model_data_groups(model_name)[1:]:
+            model = AllModels(group, model_name)
+            for number in range(1, model.nParameters + 1):
+                parameter = model(number)
+                if not (parameter.frozen or parameter.link):
+                    index = model.startParIndex + number - 1
+                    label = f"{model_name}:{index}" if model_name else str(index)
+                    labels.append(f"{label} ({parameter.name})")
+    return labels
+
+
+def build_prior(define_prior: Sequence[tuple]) -> tuple["MultipleIndependent", list[int], list[str]]:
     """Build the joint prior from a list of XSPEC prior specifications.
 
-    For a **single-model** fit, each item must be a 3-tuple:
+    Each entry gives the prior of one XSPEC parameter:
 
-    `(component_name, parameter_name, distribution)`
+    - `(component, parameter, distribution)` when a single model is loaded;
+    - `(model_name, component, parameter, distribution)` with any number of
+      loaded models (required when several are loaded, e.g. a source and a
+      background model).
 
-    For a **multi-model** fit, each item must be a 4-tuple:
+    Component and parameter names are XSPEC's (case-sensitive). A repeated
+    component can also be named by its position in the model expression: in
+    `tbabs*(powerlaw + powerlaw)` the first powerlaw is `powerlaw` or
+    `powerlaw_2`, as in `Solver.parameter_names`. Each distribution needs a
+    finite support, e.g. [`uniform`][bsixsa.priors.uniform],
+    [`loguniform`][bsixsa.priors.loguniform] or [`norm`][bsixsa.priors.norm].
 
-    `(model_name, component_name, parameter_name, distribution)`
+    Every parameter given a prior is thawed, unlinked, set to the prior median
+    and given the prior support as XSPEC limits. Every other parameter must be
+    frozen or linked, so the free XSPEC parameters are exactly the prior axes,
+    ordered by model (source number) then parameter number. With several data
+    groups, the entries address the copy of each model in its first data group
+    (data group 1 for a model on every spectrum); the copies in later data
+    groups must be frozen or linked.
 
-    `distribution` can be and must behave like a SciPy continuous
-    distribution and provide at least `support()`, `ppf()`,
-    `cdf()`, `rvs()`, and `logpdf()`.
-    Component and parameter names must match the names exposed by `xspec`.
-    Repeated components can be addressed with suffixed names such as `powerlaw_3`.
+    Example:
+        ```python
+        from bsixsa.priors import build_prior, loguniform, uniform
+
+        prior, indices, models = build_prior([
+            ("powerlaw", "PhoIndex", uniform(1, 3)),
+            ("powerlaw", "norm", loguniform(1e-5, 1e-1)),
+        ])
+        ```
 
     Parameters:
-        define_prior:
-            Sequence describing one prior per free XSPEC parameter.
+        define_prior: One entry per free XSPEC parameter.
 
     Returns:
-        `(prior, parameters_index, model_index)`
+        The joint [`MultipleIndependent`][bsixsa.priors.MultipleIndependent]
+        prior, the XSPEC index of each parameter, and its model name (`''` for
+        the unnamed model).
 
-        `prior` is a [`MultipleIndependent`][bsixsa.priors.MultipleIndependent]
-        distribution over all unfrozen, unlinked fitted parameters. Its
-        per-parameter support bounds are available on `prior.bounds`.
+    Raises:
+        ValueError: If an entry is malformed or unknown, a support is not
+            finite, a free parameter has no prior, or a parameter is free in a
+            later data group.
     """
-    model_list = [AllModels(1, modName=name) for name in AllModels.sources.values()]
+    loaded_models = list(AllModels.sources.values())
+    if not loaded_models:
+        raise ValueError("No XSPEC model is loaded: define the model before building the prior.")
+    entries = _prior_entries(define_prior, loaded_models)
 
-    is_single_model_prior = all(len(definition) == 3 for definition in define_prior)
-    is_multi_model_prior = all(len(definition) == 4 for definition in define_prior)
-
-    # Sanity checks
-    if not (is_single_model_prior or is_multi_model_prior):
-        raise ValueError("Prior must be defined either as single model or multi-model")
-
-    if (is_single_model_prior and len(model_list) != 1) or (is_multi_model_prior and len(model_list) == 1):
-        raise ValueError("Single model prior defined for multiple models (or the opposite)")
-
-    # Let's format the prior to the general multimodel setup
-    if is_single_model_prior:
-
-        # We explicitly add the model name at the start of the prior settings
-        model_name = model_list[0].name
-        define_prior = [(model_name,) + prior_setting for prior_setting in define_prior]
-
-    # We turn the list of prior settings in a nested dictionary indexed by model/components/parameter names
-    define_prior_dict = defaultdict(lambda: defaultdict(dict))
-
-    for model_name, component_name, parameter_name, distribution in define_prior:
-
-        model = AllModels(1, modName=model_name)
-
-        # Handle the weird situation where a component is defined multiple times
-        # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
-        # An insightful user might want to pass "powerlaw_2" & "powerlaw_3" instead of "powerlaw" & "powerlaw_3"
-        if has_indexed_suffix(component_name):
-            if component_name not in model.componentNames:
-                split_name = component_name.split('_')[0]
-                if split_name in model.componentNames:
-                    component_name = split_name
-                else:
-                    raise ValueError(f"Component '{component_name}' or '{split_name}' not in {model.componentNames}")
-
-        # Nested defaultdicts handle intermediate dictionary creation
-        define_prior_dict[model_name][component_name][parameter_name] = distribution
-
-    # Now we build the necessary blocks for inference
-    parameter_to_set = defaultdict(dict)  # Will contain {model : {par_index:prior}}
-    list_of_prior = []
-    model_index = []
-    parameters_index = []
+    distributions, parameter_indices, model_names, xspec_settings = [], [], [], []
+    problems, missing = [], []
     for par in iter_all_parameters():
+        key = (par.model.name, par.component.name, par.parameter.name)
+        if key not in entries:
+            if not (par.parameter.frozen or par.parameter.link):
+                missing.append(par)
+            continue
 
-        prior = None
+        label, distribution = entries.pop(key)
+        low, high = (float(bound) for bound in distribution.support())
+        if not (np.isfinite(low) and np.isfinite(high) and low < high):
+            problems.append(
+                f"the prior of {label} has support [{low}, {high}], but XSPEC needs finite parameter "
+                "limits with low < high. Give the prior finite bounds (for a Gaussian prior: "
+                "bsixsa.priors.norm(loc, scale, low, high) with finite low and high)."
+            )
+            continue
+        # Range-proportional fit delta (used by XSPEC only when Fit.delta == 0).
+        delta = 0.01 * (high - low)
+        start = float(distribution.ppf(0.5))
+        xspec_settings.append(f"{start},{delta},{low},{low},{high},{high}")
+        distributions.append(distribution)
+        parameter_indices.append(par.parameter.index)
+        model_names.append(par.model.name)
 
-        # Smooth brain syntax to check whether a prior exists for a given parameter and extract its value
-        match define_prior_dict:
-            # Prior is only instantiated in the following line if there is a match
-            case {par.model.name: {par.component.name: {par.parameter.name: prior}}}:
-                pass
-
-        if prior is None and not (par.parameter.frozen or bool(par.parameter.link)):
-            raise ValueError(f"No prior or link for {par.name}. Either pass a prior or freeze explicitly.")
-
-        if prior is not None:
-
-            low, high = prior.support()
-            # Range-proportional fit delta: XSPEC only uses these per-parameter
-            # deltas when Fit.delta == 0 (PyXspec defaults to proportional
-            # deltas of 0.01), but a fixed 0.1 here is a landmine — it exceeds
-            # e.g. a whole redshift range and is ~1e5 times a typical norm.
-            delta = 0.01 * (high - low)
-            parameter_to_set[par.model][par.parameter.index] = f"{np.random.uniform(low, high)},{delta},{low},{low},{high},{high}"
-
-            list_of_prior.append(prior)
-            parameters_index.append(par.parameter.index)
-            model_index.append(par.model.name)
-
-    # Turn the model / index dict into args for AllModels.set and apply them
-    parameter_to_set = sum(((k, v) for k, v in parameter_to_set.items()), ())
+    for (model_name, component_name, _), (label, _) in entries.items():
+        component = getattr(first_model_copy(model_name), component_name)
+        problems.append(
+            f"the prior entry {label} matches no parameter; the parameters of {component_name} in "
+            f"{_model_label(model_name)} are {', '.join(component.parameterNames)} (names are case-sensitive)."
+        )
+    if missing:
+        with_model = len(loaded_models) > 1 or any(len(entry) == 4 for entry in define_prior)
+        example = missing[0]
+        name = example.model.name
+        group = model_data_groups(name)[0]
+        model_handle = f"xspec.AllModels({group}, {name!r})" if name else f"xspec.AllModels({group})"
+        problems.append(
+            "these free XSPEC parameters have no prior: "
+            + ", ".join(_as_prior_entry(par, with_model=with_model) for par in missing)
+            + ". Give each one a prior, or freeze it (e.g. "
+            f"{model_handle}.{example.component.name}.{example.parameter.name}.frozen = True) "
+            "or link it before building the Solver."
+        )
+    later_free = _free_in_later_copies()
+    if later_free:
+        problems.append(
+            "bsixsa fits the parameters of the first data group of each model, but these are free in "
+            f"a later data group: {', '.join(later_free)}. Link them to the first data group or freeze them."
+        )
+    if problems:
+        raise ValueError("Cannot build the prior:\n" + "\n".join(f"  - {problem}" for problem in problems))
+    if not distributions:
+        raise ValueError("Nothing to fit: the prior list is empty and every XSPEC parameter is frozen or linked.")
 
     with XSilence():
-        AllModels.setPars(*parameter_to_set)
-
-    prior = MultipleIndependent(list_of_prior)
-    return prior, parameters_index, model_index
+        set_parameters(xspec_settings, parameter_indices, model_names)
+    return MultipleIndependent(distributions), parameter_indices, model_names

@@ -4,7 +4,7 @@ The history matching itself is replaced by a monkeypatched
 `bsixsa.restriction.waves.run_history_matching` returning a small stub that
 implements the `Restriction` contract, so these tests exercise the solver
 wiring only: resolution of `restrict_prior`, caching, pool scopes, prior swap,
-evidence and fold accounting, fingerprint and box-edge diagnostics. The same
+evidence and fold accounting, and box-edge diagnostics. The same
 paths with the real restriction package are covered by
 `test_restriction_integration.py`.
 """
@@ -28,9 +28,8 @@ from _analytic import AnalyticSolver, AnalyticSpectrum, grid_truth
 import bsixsa.backend as backend_package
 from bsixsa.backend.abc import Backend
 from bsixsa.backend.config import BackendConfig, Nautilus
-from bsixsa.exceptions import BoxEdgeWarning
 from bsixsa.priors import norm
-from bsixsa.restriction import waves
+from bsixsa.restriction import Restriction, waves
 from bsixsa.restriction.config import HistoryMatching
 from bsixsa.solver import FitResults
 
@@ -48,8 +47,11 @@ def hm_cls():
     return HistoryMatching
 
 
-class StubRestriction:
-    """Implements the `Restriction` contract the solver relies on."""
+class StubRestriction(Restriction):
+    """A `Restriction` with a fixed box: it implements only what the solver uses.
+
+    It skips the dataclass `__init__`, so it has no region, history or folds.
+    """
 
     def __init__(
         self,
@@ -59,7 +61,6 @@ class StubRestriction:
         core_lo=(0.3, 0.3),
         core_hi=(0.7, 0.7),
         config=None,
-        fingerprint: str = "",
         n_simulations: int = 123,
         seconds: float = 4.5,
         box_info: dict | None = None,
@@ -68,11 +69,9 @@ class StubRestriction:
         self.hi = np.asarray(hi, dtype=np.float64)
         self._core = (np.asarray(core_lo, dtype=np.float64), np.asarray(core_hi, dtype=np.float64))
         self.config = config
-        self.fingerprint = fingerprint
         self.n_simulations = n_simulations
         self.seconds = seconds
-        if box_info is not None:
-            self.box_info = box_info
+        self.box_info = box_info if box_info is not None else {}
         self.threshold = 1.0
         self.truncated_calls: list = []
         self.saved_to: list[str] = []
@@ -93,12 +92,12 @@ class StubRestriction:
             self._cache[id(base_prior)] = cached
         return cached[1]
 
-    def check_fingerprint(self, fingerprint: str) -> None:
-        if fingerprint != self.fingerprint:
-            raise ValueError("restriction fingerprint mismatch")
-
     def save(self, directory: str) -> None:
         self.saved_to.append(directory)
+
+    def __repr__(self) -> str:
+        # `Restriction.__repr__` reads the region and folds, which the stub lacks.
+        return "StubRestriction()"
 
 
 @pytest.fixture
@@ -106,21 +105,19 @@ def fake_hm(monkeypatch, hm_cls):
     """Monkeypatch `run_history_matching` with a stub that folds one batch."""
     state = SimpleNamespace(calls=[], box={}, n_design=16)
 
-    def run_history_matching(simulate_cstat, d, cfg, *, seed_seq, outdir=None, fingerprint="",
+    def run_history_matching(simulate_cstat, d, cfg, *, outdir=None,
                              param_names=None, log=None):
         solver = state.solver
         u = np.random.default_rng(0).random((state.n_design, d))
         cstat = simulate_cstat(u)
         restriction = StubRestriction(
-            config=cfg, fingerprint=fingerprint, n_simulations=len(u), **state.box
+            config=cfg, n_simulations=len(u), **state.box
         )
         state.calls.append(
             {
                 "d": d,
                 "cfg": cfg,
-                "seed_seq": seed_seq,
                 "outdir": outdir,
-                "fingerprint": fingerprint,
                 "param_names": param_names,
                 "u": u,
                 "cstat": cstat,
@@ -190,7 +187,6 @@ def backends(monkeypatch):
             def sample(self, n):
                 return self.solver.prior.sample(n, random_state=2)
 
-        FakeBackend.name = name
         FakeBackend.config_cls = config_cls
         monkeypatch.setitem(backend_package.BACKEND_REGISTRY, name, FakeBackend)
 
@@ -327,7 +323,11 @@ def test_restrict_prior_rejects_unknown_objects_before_touching_the_directory(tm
     target.mkdir()
     (target / "keep.txt").write_text("x")
 
-    for value in (object(), SimpleNamespace(kind="history-matching"), _BoxConfig(trace=False)):
+    # A duck-typed look-alike of a Restriction is refused too: only real ones are reused.
+    look_alike = SimpleNamespace(
+        truncated_prior=lambda prior: None, config=None
+    )
+    for value in (object(), SimpleNamespace(kind="history-matching"), _BoxConfig(trace=False), look_alike):
         with pytest.raises(TypeError, match="restrict_prior"):
             _make_solver(tmp_path, overwrite=True, restrict_prior=value)
     assert (target / "keep.txt").exists()
@@ -370,8 +370,7 @@ def test_restrict_runs_once_in_a_single_pool_scope_and_caches(tmp_path, fake_hm,
     # Arguments of the contract.
     assert call["d"] == 2
     assert call["param_names"] == ["Gamma", "norm"]
-    assert call["fingerprint"] == solver.fingerprint()
-    assert call["seed_seq"].entropy == 11
+    assert call["cfg"].seed == 11
     assert call["log"] is print
     outdir = str(Path(solver.outputfiles_basename) / "restriction")
     assert Path(call["outdir"]) == Path(outdir)
@@ -545,8 +544,7 @@ def test_run_without_restriction_is_untouched(tmp_path, fake_hm, backends):
 
 
 def test_run_does_not_recount_an_injected_restriction(tmp_path, fake_hm, backends, hm_cls):
-    probe = _make_solver(tmp_path, name="probe")
-    stub = StubRestriction(config=hm_cls(), fingerprint=probe.fingerprint(), n_simulations=999, seconds=7.0)
+    stub = StubRestriction(config=hm_cls(), n_simulations=999, seconds=7.0)
     solver = _with_solver(fake_hm, _make_solver(tmp_path, restrict_prior=stub))
 
     result = solver.run()
@@ -588,39 +586,14 @@ def test_rerunning_never_truncates_twice(tmp_path, fake_hm, backends):
     assert second.n_likelihood_evaluations == 1000
     assert second.n_restriction_evaluations == 0 and second.restriction_time == 0.0
 
-    # Switching to a region backend restores the base prior and drops the box.
+    # Switching to a region backend restores the base prior and drops the box;
+    # `backend_name` follows the configuration.
     solver.backend_config = _RegionConfig(trace=False)
-    solver.backend_name = "fake_region"
+    assert solver.backend_name == "fake_region"
     third = solver.run()
 
     assert solver.prior is base and "restricted_prior" not in solver.distributions
     assert third.log_Z == -10.0
-
-
-def test_run_rejects_a_restriction_for_another_problem(tmp_path, fake_hm, backends, hm_cls):
-    stub = StubRestriction(config=hm_cls(), fingerprint="another problem")
-    solver = _with_solver(fake_hm, _make_solver(tmp_path, restrict_prior=stub))
-
-    with pytest.raises(ValueError, match="fingerprint"):
-        solver.run()
-
-    assert backends.constructed == []
-    assert solver.prior is solver.base_prior and solver._pool_depth == 0
-
-
-def test_rerun_with_a_mismatched_fingerprint_drops_the_installed_box(tmp_path, fake_hm, backends, monkeypatch):
-    solver = _with_solver(fake_hm, _make_solver(tmp_path, restrict_prior=True))
-    solver.run()
-    assert solver.prior is not solver.base_prior and "restricted_prior" in solver.distributions
-
-    # The data changed after the first run.
-    monkeypatch.setattr(solver, "fingerprint", lambda: "another spectrum")
-    with pytest.raises(ValueError, match="fingerprint"):
-        solver.run()
-
-    assert solver.prior is solver.base_prior
-    assert "restricted_prior" not in solver.distributions
-    assert len(backends.constructed) == 1 and solver._pool_depth == 0
 
 
 def test_run_saves_the_box_of_a_computed_restriction_only(tmp_path, fake_hm, backends, hm_cls):
@@ -631,8 +604,7 @@ def test_run_saves_the_box_of_a_computed_restriction_only(tmp_path, fake_hm, bac
     # restrict() saved before the box existed; the box-mode run records it.
     assert [Path(p) for p in solver.restriction.saved_to] == [outdir, outdir]
 
-    probe = _make_solver(tmp_path, name="probe")
-    stub = StubRestriction(config=hm_cls(), fingerprint=probe.fingerprint())
+    stub = StubRestriction(config=hm_cls())
     injected = _with_solver(fake_hm, _make_solver(tmp_path, name="injected", restrict_prior=stub))
     injected.run()
     assert stub.saved_to == []
@@ -687,8 +659,8 @@ def test_box_edge_warning_as_error_keeps_the_finished_run(tmp_path, fake_hm, bac
 
     backends.result_fn = result_fn
     with warnings.catch_warnings():
-        warnings.simplefilter("error", BoxEdgeWarning)
-        with pytest.raises(BoxEdgeWarning, match="Gamma"):
+        warnings.simplefilter("error", UserWarning)
+        with pytest.raises(UserWarning, match="Gamma"):
             solver.run()
 
     backend = backends.constructed[0]
@@ -698,6 +670,47 @@ def test_box_edge_warning_as_error_keeps_the_finished_run(tmp_path, fake_hm, bac
     assert backends.tracer_saves == [backend]
     assert solver.fit_result.log_Z == pytest.approx(-10.0 + 2 * np.log(0.6))
     assert solver._pool_depth == 0
+
+
+def test_backend_warnings_keep_their_category_message_and_line(tmp_path, fake_hm, backends):
+    solver = _with_solver(fake_hm, _make_solver(tmp_path, restrict_prior=True))
+    rng = np.random.default_rng(3)
+
+    def result_fn(s):
+        # Points at the caller of Solver.run (result_fn <- backend.run <- Solver.run <- caller).
+        warnings.warn("SIXSA final importance sample not certified", RuntimeWarning, stacklevel=4)
+        for _ in range(3):
+            warnings.warn("repeated", UserWarning, stacklevel=2)
+        result = _default_result(s)
+        result.posterior_samples = _box_cube_samples(s, rng, [0.0, 0.4], [0.1, 0.6])
+        return result
+
+    backends.result_fn = result_fn
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        run_line = sys._getframe().f_lineno + 1
+        solver.run()
+
+    first, repeated, box_edge = caught
+    assert (first.category, str(first.message)) == (RuntimeWarning, "SIXSA final importance sample not certified")
+    assert (first.filename, first.lineno) == (__file__, run_line)
+    # Repeated at one line: shown once, as Python does by default.
+    assert (repeated.category, str(repeated.message)) == (UserWarning, "repeated")
+    # The box-edge diagnostic comes after the backend's own warnings.
+    assert "Gamma" in str(box_edge.message) and "lower" in str(box_edge.message)
+
+
+def test_backend_warnings_are_issued_when_the_backend_fails(tmp_path, backends):
+    solver = _make_solver(tmp_path)
+
+    def result_fn(s):
+        warnings.warn("explains the failure", UserWarning, stacklevel=2)
+        raise RuntimeError("backend crashed")
+
+    backends.result_fn = result_fn
+    with pytest.warns(UserWarning, match="explains the failure"), pytest.raises(RuntimeError, match="backend crashed"):
+        solver.run()
+    assert solver.fit_result is None and solver._pool_depth == 0
 
 
 def test_run_rejects_bayes_on_before_restricting_or_building_the_backend(tmp_path, fake_hm, backends):
@@ -728,7 +741,7 @@ def test_run_rejects_x0_outside_the_box(tmp_path, fake_hm, backends):
 
 
 # ---------------------------------------------------------------------------
-# best_fit_stat and BoxEdgeWarning
+# best_fit_stat and UserWarning
 # ---------------------------------------------------------------------------
 
 
@@ -766,7 +779,7 @@ def _record_box_warnings(solver) -> list[str]:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         solver.run()
-    return [str(w.message) for w in caught if issubclass(w.category, BoxEdgeWarning)]
+    return [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
 
 
 def test_box_edge_warning_for_samples_crowding_an_interior_shell(tmp_path, fake_hm, backends):
@@ -837,8 +850,7 @@ def test_box_edge_warning_for_a_best_fit_on_an_interior_face(tmp_path, fake_hm, 
 
 
 def test_box_edge_diagnostics_never_raise(tmp_path, fake_hm, backends, hm_cls):
-    probe = _make_solver(tmp_path, name="probe")
-    stub = StubRestriction(config=hm_cls(), fingerprint=probe.fingerprint())
+    stub = StubRestriction(config=hm_cls())
     stub.box = MagicMock(side_effect=[stub.box(), RuntimeError("box unavailable")])
     solver = _with_solver(fake_hm, _make_solver(tmp_path, restrict_prior=stub))
 
@@ -869,6 +881,7 @@ def test_nautilus_backend_uses_solver_names_seed_and_shuffled_samples(tmp_path):
     prior = MagicMock()
 
     with patch("bsixsa.backend.nautilus.Prior", return_value=prior), \
+         patch("bsixsa.backend.nautilus.Pool"), \
          patch("bsixsa.backend.nautilus.NestedSampler") as sampler_cls:
         sampler = sampler_cls.return_value
         sampler.posterior.return_value = (points, np.zeros(20), np.zeros(20))
@@ -900,13 +913,11 @@ def _central_box_restriction(spectrum, tmp_path, spans=12.0):
     """A stub restriction boxing the grid posterior at `mean_u +- spans * std_u`."""
     truth = grid_truth(spectrum)
     mean, std = truth["mean_u"], truth["std_u"]
-    probe = AnalyticSolver(spectrum, backend=_BoxConfig(trace=False), outputfiles_basename=tmp_path / "probe")
     return truth, StubRestriction(
         lo=np.clip(mean - spans * std, 0.0, 1.0),
         hi=np.clip(mean + spans * std, 0.0, 1.0),
         core_lo=np.clip(mean - 2 * spans / 3 * std, 0.0, 1.0),
         core_hi=np.clip(mean + 2 * spans / 3 * std, 0.0, 1.0),
-        fingerprint=probe.fingerprint(),
     )
 
 
@@ -928,7 +939,7 @@ def test_levenberg_marquardt_samples_stay_in_the_box_after_run(tmp_path):
 
     bounds = _bounds(solver.prior)
     assert solver.prior is not solver.base_prior
-    assert not [w for w in caught if issubclass(w.category, BoxEdgeWarning)]
+    assert not [w for w in caught if issubclass(w.category, UserWarning)]
     assert np.isnan(result.log_Z)
     assert result.log_Z_restriction_correction == pytest.approx(float(np.sum(np.log(stub.hi - stub.lo))))
     best = result.best_fit.to_numpy()
@@ -937,25 +948,6 @@ def test_levenberg_marquardt_samples_stay_in_the_box_after_run(tmp_path):
     assert result.best_fit_stat == pytest.approx(expected_stat, rel=1e-9)
     for samples in (solver.backend.sample(2000), solver.build_dataframe(num_samples=2000).to_numpy()):
         assert np.all((samples >= bounds[:, 0]) & (samples <= bounds[:, 1]))
-
-
-def test_nautilus_backend_omits_seed_when_unsupported(tmp_path):
-    from bsixsa.backend import nautilus as nautilus_module
-
-    def legacy_sampler(prior, likelihood, n_live=2000, vectorized=False, pass_dict=None,
-                       n_batch=None, n_networks=4, pool=None):
-        return SimpleNamespace(kwargs=dict(n_live=n_live, pool=pool))
-
-    solver = SimpleNamespace(
-        outputfiles_basename=str(tmp_path),
-        parameter_names=["alpha"],
-        prior=SimpleNamespace(dists=["dist_a"]),
-    )
-    with patch.object(nautilus_module, "Prior", return_value=MagicMock()), \
-         patch.object(nautilus_module, "NestedSampler", legacy_sampler):
-        backend = nautilus_module.NautilusBackend(solver=solver, config=Nautilus(trace=False, seed=5))
-
-    assert backend._nested_sampler.kwargs["n_live"] == 3000
 
 
 def test_ultranest_backend_uses_solver_names(tmp_path):
@@ -984,9 +976,6 @@ sys.path.insert(0, {str(SRC_DIR)!r})
 sys.modules.setdefault("xspec", MagicMock())
 import bsixsa
 assert "torch" not in sys.modules, "torch imported by the package"
-assert "bsixsa.restriction" not in sys.modules, "restriction imported eagerly"
-from bsixsa import BoxEdgeWarning, FoldError, TruncationBudgetError
-assert issubclass(BoxEdgeWarning, UserWarning)
 assert "HistoryMatching" in bsixsa.__all__
 from bsixsa.restriction import HistoryMatching
 assert bsixsa.HistoryMatching is HistoryMatching

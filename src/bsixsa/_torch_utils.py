@@ -1,4 +1,4 @@
-"""Small torch helpers that must not import torch at module import time."""
+"""Torch helpers."""
 
 from __future__ import annotations
 
@@ -10,23 +10,7 @@ __all__ = ["torch_threads"]
 
 @contextlib.contextmanager
 def torch_threads(n: int | None) -> Iterator[None]:
-    """Temporarily set the number of intra-op torch threads.
-
-    The previous value of ``torch.get_num_threads()`` is restored on exit,
-    including when the body raises. torch is imported lazily, and only when a
-    thread count is requested, so ``torch_threads(None)`` works without torch.
-
-    Parameters:
-        n:
-            Number of threads to use inside the block. ``None`` leaves the
-            torch configuration untouched.
-
-    Yields:
-        ``None``.
-
-    Raises:
-        ValueError: If ``n`` is not ``None`` and smaller than 1.
-    """
+    """Temporarily set the number of intra-op torch threads; ``None`` leaves it unchanged."""
     if n is None:
         yield
         return

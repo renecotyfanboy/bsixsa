@@ -11,7 +11,7 @@ sys.modules.setdefault("xspec", MagicMock())
 
 torch = pytest.importorskip("torch")
 
-from bsixsa._torch_utils import torch_threads
+from bsixsa._torch_utils import torch_threads  # noqa: E402
 
 
 @pytest.fixture

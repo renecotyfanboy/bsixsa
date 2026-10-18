@@ -1,137 +1,103 @@
+"""Nested sampling with nessai's importance nested sampler, driven by normalising flows."""
+
+from __future__ import annotations
+
 import os
-import typing
+import warnings
+from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from nessai.flowsampler import FlowSampler
-from nessai.livepoint import live_points_to_array, live_points_to_dict
+from nessai.livepoint import live_points_to_array
 from nessai.model import Model as NessaiModel
-from nessai.posterior import draw_posterior_samples
+
 from ..solver import FitResults
-from .abc import Backend
-from . import register_backend
+from .abc import Backend, traced_log_likelihood
 from .config import Nessai
-import warnings
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
     from ..solver import Solver
+    from .tracer import EvaluationTracer
 
 
-class ModelFromSolver(NessaiModel):
+class _NessaiModel(NessaiModel):
+    """nessai's view of the solver.
 
-    def __init__(self, solver, tracer):
+    It holds the solver, not the backend, because nessai may pickle it for its worker pool.
+    """
+
+    def __init__(self, solver: Solver, tracer: EvaluationTracer) -> None:
         self.solver = solver
         self._tracer = tracer
         self.names = solver.parameter_names
-        self.bounds = {
-            self.names[idx]: bound
-            for idx, bound in enumerate(solver.prior.bounds)
-        }
+        self.bounds = dict(zip(self.names, solver.prior.bounds))
 
-    def to_array(self, x):
-        new_array = live_points_to_array(x, names=self.names, copy=True)
+    def to_array(self, x: np.ndarray) -> np.ndarray:
+        """Live points (a structured array) as a plain array of shape `(n, d)`."""
+        return np.atleast_2d(live_points_to_array(x, names=self.names, copy=True))
 
-        if new_array.ndim == 1:
-            new_array = new_array[None, :]
+    def _with_values(self, x: np.ndarray, values: np.ndarray) -> np.ndarray:
+        """Copy of *x* with its parameter fields set from the columns of *values*."""
+        out = x.copy()
+        for j, name in enumerate(self.names):
+            out[name] = values[:, j]
+        return out
 
-        return new_array
+    def from_unit_hypercube(self, x: np.ndarray) -> np.ndarray:
+        """Map live points from the unit hypercube to physical parameters."""
+        return self._with_values(x, self.solver.prior.from_unit_cube(self.to_array(x)))
 
-    def from_unit_hypercube(self, x):
-        """Map from the unit hypercube to the physical parameter space."""
-        x_out = x.copy()
-        params = self.solver.prior.from_unit_cube(self.to_array(x))
-        for idx, name in enumerate(self.names):
-            x_out[name] = params[:, idx]
-        return x_out
+    def to_unit_hypercube(self, x: np.ndarray) -> np.ndarray:
+        """Map live points from physical parameters to the unit hypercube."""
+        return self._with_values(x, self.solver.prior.to_unit_cube(self.to_array(x)))
 
-    def to_unit_hypercube(self, x):
-        """Map from the physical parameter space to the unit hypercube."""
-        x_out = x.copy()
-        cube = self.solver.prior.to_unit_cube(self.to_array(x))
-        for idx, name in enumerate(self.names):
-            x_out[name] = cube[:, idx]
-        return x_out
+    def log_prior(self, theta: np.ndarray) -> np.ndarray:
+        """Log prior density of the live points."""
+        return self.solver.log_prior_fn(self.to_array(theta))
 
-    def log_prior(self, theta):
-        """Returns log of prior given a live point."""
-        theta = self.to_array(theta)
-        return self.solver.log_prior_fn(theta, None)
-
-    def log_likelihood(self, theta):
-        """Returns log likelihood of given live point."""
-        theta = self.to_array(theta)
-        ll = self.solver.log_likelihood_fn(theta, None, progress_bar=False, no_pool=False)
-        self._tracer.record(theta, -2.0 * np.atleast_1d(ll))
-        return ll
+    def log_likelihood(self, theta: np.ndarray) -> np.ndarray:
+        """Log-likelihood `-C/2` of the live points, recorded by the tracer."""
+        return traced_log_likelihood(self.solver, self._tracer, self.to_array(theta))
 
 
-@register_backend
 class NessaiBackend(Backend):
+    """Importance nested sampling with nessai; returns the equal-weight posterior and log Z."""
 
-    name = "nessai"
     config_cls = Nessai
 
-    def __init__(
-        self,
-        *,
-        solver: 'Solver',
-        config: Nessai,
-    ):
+    def __init__(self, *, solver: Solver, config: Nessai) -> None:
         super().__init__(solver=solver, config=config)
-
-        flow_kwargs = self.config.engine_kwargs.copy()
-        flow_kwargs.setdefault("importance_nested_sampler", True)
-        self.model = ModelFromSolver(self.solver, self.tracer)
-        self.n_live_points = self.config.num_live_points
-
-        nessai_output = os.path.join(self.solver.outputfiles_basename, "nessai_outputs")
-        os.makedirs(nessai_output, exist_ok=True)
-
+        self.model = _NessaiModel(solver, self.tracer)
+        output = os.path.join(solver.outputfiles_basename, "nessai_outputs")
+        os.makedirs(output, exist_ok=True)
         self._flow_sampler = FlowSampler(
             self.model,
-            nlive=self.config.num_live_points,
-            output=nessai_output,
-            **flow_kwargs
+            nlive=config.num_live_points,
+            output=output,
+            importance_nested_sampler=True,
+            **config.engine_kwargs,
         )
 
-    def run(self, **kwargs) -> 'FitResults':
-        from ..solver import FitResults
-
+    def run(self) -> FitResults:
+        """Run nessai and return its equal-weight posterior and log evidence."""
         with warnings.catch_warnings():
-            # Ignore a bunch of warnings that are raised by nessai early
+            # Harmless numpy warnings raised inside nessai.
             warnings.filterwarnings("ignore", message="divide by zero encountered in log")
             warnings.filterwarnings("ignore", message="All-NaN slice encountered")
             warnings.filterwarnings("ignore", message="invalid value encountered in scalar subtract")
             warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
-
             self._flow_sampler.run()
 
-        posterior_dict = live_points_to_dict(
-            self._flow_sampler.posterior_samples,
-            names=self.solver.parameter_names,
-        )
-
+        nested_sampler = self._flow_sampler.ns
         return FitResults(
-            time=float(self._flow_sampler.ns.current_sampling_time.total_seconds()),
-            posterior_samples=pd.DataFrame.from_dict(posterior_dict),
-            n_likelihood_evaluations=self._flow_sampler.ns.total_likelihood_evaluations,
+            time=float(nested_sampler.current_sampling_time.total_seconds()),
+            posterior_samples=self._posterior_dataframe(self.model.to_array(self._flow_sampler.posterior_samples)),
+            n_likelihood_evaluations=nested_sampler.total_likelihood_evaluations,
             log_Z=float(self._flow_sampler.log_evidence),
             log_Z_err=float(self._flow_sampler.log_evidence_error),
         )
 
     def sample(self, n: int) -> np.ndarray:
-        if getattr(self._flow_sampler, "nested_samples", None) is not None:
-            samples = draw_posterior_samples(
-                self._flow_sampler.nested_samples,
-                nlive=self.n_live_points,
-                n=n,
-                method="importance_sampling",
-            )
-            return self.model.to_array(samples)
-
-        posterior = self.model.to_array(self._flow_sampler.posterior_samples)
-        if posterior.shape[0] >= n:
-            return posterior[:n]
-
-        idx = np.random.default_rng().choice(posterior.shape[0], size=n, replace=True)
-        return posterior[idx]
+        """Draw *n* posterior rows with replacement, using nessai's importance weights."""
+        rows = self._flow_sampler.ns.draw_posterior_samples(sampling_method="importance_sampling", n=int(n))
+        return self.model.to_array(rows)

@@ -1,69 +1,43 @@
+"""Bayesian X-ray spectral fitting on top of PyXspec.
+
+Load a spectrum and a model in PyXspec, build a [`Solver`][bsixsa.solver.Solver]
+from a prior (see [`bsixsa.priors`][bsixsa.priors]) and a backend configuration
+(`Nautilus`, `Nessai`, `Ultranest`, `Emcee`, `Iminuit`, `LevenbergMarquardt` or
+`SIXSA`), and call `run()`. [`HistoryMatching`][bsixsa.restriction.HistoryMatching]
+configures the optional prior restriction, and
+[`export_xspec_chain`][bsixsa.export.export_xspec_chain] writes the posterior as
+an XSPEC chain file.
+"""
+
 from .backend import (
+    SIXSA,
+    BackendConfig,
     Emcee,
     Iminuit,
     LevenbergMarquardt,
     Nautilus,
     Nessai,
-    BackendConfig,
-    SIXSA,
     Ultranest,
 )
 from .backend.config import CompressorConfig, NDEConfig, TrainingConfig
-from .exceptions import BoxEdgeWarning, FoldError, TruncationBudgetError
+from .export import export_xspec_chain
+from .restriction import HistoryMatching
 from .solver import FitResults, Solver
 
-# Public alias: `SIXSASolver` is the SIXSA-facing name for the solver entry point
-# (used by tests and some docstrings); `Solver` is the generic name used in the
-# docs, notebooks, and internal type hints. Both refer to the same class.
-SIXSASolver = Solver
-
 __all__ = [
-    "BoxEdgeWarning",
+    "SIXSA",
+    "BackendConfig",
     "CompressorConfig",
-    "NDEConfig",
-    "TrainingConfig",
     "Emcee",
     "FitResults",
-    "FoldError",
     "HistoryMatching",
     "Iminuit",
     "LevenbergMarquardt",
+    "NDEConfig",
     "Nautilus",
     "Nessai",
     "Solver",
-    "SIXSASolver",
-    "BackendConfig",
-    "SIXSA",
-    "TruncationBudgetError",
+    "TrainingConfig",
     "Ultranest",
+    "export_xspec_chain",
 ]
-
-
-def __getattr__(name: str):
-    """Resolve the restriction exports on first access.
-
-    Parameters:
-        name: Attribute requested on the package.
-
-    Returns:
-        The requested object.
-
-    Raises:
-        AttributeError: If *name* is not a lazy export.
-    """
-    # Loaded lazily so that `import bsixsa` never pays for the restriction
-    # package (whose regressor needs torch).
-    if name == "HistoryMatching":
-        from .restriction.config import HistoryMatching
-
-        return HistoryMatching
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__() -> list[str]:
-    """List the package attributes, including the lazy exports.
-
-    Returns:
-        Sorted attribute names.
-    """
-    return sorted(set(globals()) | set(__all__))

@@ -1,13 +1,8 @@
-"""Diagnostic figure of one history-matching wave.
-
-Built with matplotlib's object API (``Figure`` + ``FigureCanvasAgg``), so it
-never touches pyplot's global state or the process-wide backend.
-"""
+"""Diagnostic figure of one history-matching wave."""
 
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -15,8 +10,6 @@ from matplotlib.figure import Figure
 
 __all__ = ["plot_wave"]
 
-# Categorical slots 1-3 of the reference palette (validated all-pairs) plus
-# a recessive neutral for the points that are correctly rejected.
 _KEPT = "#2a78d6"
 _LOST = "#eb6834"
 _WASTED = "#1baf7a"
@@ -38,63 +31,42 @@ def _history_series(history: list[dict], key: str) -> np.ndarray:
 
 def plot_wave(
     history: list[dict],
-    model: Any,
     u: np.ndarray,
     cstat: np.ndarray,
+    pred_cstat: np.ndarray,
     probe: np.ndarray,
-    pred: np.ndarray,
-    wave: int,
-    outdir: str,
+    pred_probe: np.ndarray,
     span: float,
+    outdir: str,
     param_names: list[str] | None = None,
 ) -> str:
-    """Write the four-panel diagnostic PDF of a wave.
+    """Write the four-panel diagnostic PDF of the last wave in *history*.
 
-    Panels:
-
-    1. predicted against exact C-stat of every fold, coloured by the verdict:
-       kept and belonging, rejected but belonging (lost: the risk), kept but
-       above the threshold (wasted: the cost);
-    2. the probe points the region accepts, projected on the two axes where
-       the region is narrowest relative to the cube (for ``d = 1``, the
-       prediction along the axis);
-    3. the histogram of every exact C-stat folded so far;
-    4. the region width in posterior spans and the safety margin in
-       regressor RMSEs, per wave, as two stacked panels.
+    Panels: predicted against exact C-stat of every fold (with precision and
+    recall), the region on its two narrowest axes, the histogram of every
+    exact C-stat, and the region width and safety margin per wave.
 
     Parameters:
-        history:
-            Per-wave history dicts up to and including *wave* (keys
-            ``threshold``, ``best``, ``prior_mass``, ``spans``,
-            ``margin_sigma``).
-        model:
-            Surrogate exposing ``predict_cstat``.
-        u:
-            Every folded unit-cube point, shape ``(N, d)``.
-        cstat:
-            Their exact C-stat, shape ``(N,)``.
-        probe:
-            Uniform probe points, shape ``(M, d)``.
-        pred:
-            Surrogate predictions on the probe, shape ``(M,)``.
-        wave:
-            1-based wave index, used in the file name.
-        outdir:
-            Output directory, created if needed.
-        span:
-            Posterior span in C-stat units.
-        param_names:
-            Axis labels; ``u0, u1, ...`` when omitted.
+        history: Per-wave history dicts up to the wave to plot.
+        u: Folded unit-cube points, shape ``(N, d)``.
+        cstat: Their exact C-stat, shape ``(N,)``.
+        pred_cstat: Surrogate predictions on ``u``, shape ``(N,)``.
+        probe: Uniform probe points, shape ``(M, d)``.
+        pred_probe: Surrogate predictions on ``probe``, shape ``(M,)``.
+        span: Posterior span in C-stat units.
+        outdir: Output directory, created if needed.
+        param_names: Axis labels; ``u0, u1, ...`` when omitted.
 
     Returns:
         Path of the written ``restriction_wave_{wave}.pdf``.
     """
     u = np.asarray(u, dtype=np.float64)
     cs = np.asarray(cstat, dtype=np.float64).reshape(-1)
-    pr = np.asarray(model.predict_cstat(u), dtype=np.float64).reshape(-1)
+    pr = np.asarray(pred_cstat, dtype=np.float64).reshape(-1)
     probe = np.asarray(probe, dtype=np.float64)[:_MAX_PROBE_POINTS]
-    probe_pred = np.asarray(pred, dtype=np.float64).reshape(-1)[:_MAX_PROBE_POINTS]
+    probe_pred = np.asarray(pred_probe, dtype=np.float64).reshape(-1)[:_MAX_PROBE_POINTS]
     last = history[-1]
+    wave = int(last["wave"])
     thr = float(last["threshold"])
     best = float(last["best"])
     d = u.shape[1]
@@ -113,7 +85,7 @@ def plot_wave(
     # 1. predicted vs exact
     finite = np.isfinite(cs) & np.isfinite(pr)
     keep, good = pr <= thr, cs <= thr
-    purity = float(np.mean(good[keep])) if keep.any() else float("nan")
+    precision = float(np.mean(good[keep])) if keep.any() else float("nan")
     recall = float(np.mean(keep[good])) if good.any() else float("nan")
     groups = (
         (~keep & ~good, _NEUTRAL, 2.0, 0.35, "rejected, above"),
@@ -138,7 +110,9 @@ def plot_wave(
     ax_scatter.axvline(thr, color="k", ls=":", lw=0.9)
     ax_scatter.set_xlabel("exact C-stat")
     ax_scatter.set_ylabel("predicted C-stat")
-    ax_scatter.set_title(f"purity {100 * purity:.1f}% (cost), recall {100 * recall:.1f}% (risk)", fontsize="medium")
+    ax_scatter.set_title(
+        f"precision {100 * precision:.1f}% (cost), recall {100 * recall:.1f}% (risk)", fontsize="medium"
+    )
     ax_scatter.legend(frameon=False, fontsize="small", loc="upper left", markerscale=2.0)
 
     # 2. the region on the probe
@@ -186,7 +160,7 @@ def plot_wave(
     ax_hist.legend(frameon=False, fontsize="small")
     ax_hist.set_title(f"every fold so far ({values.size:,} finite)", fontsize="medium")
 
-    # 4. width and safety per wave (two panels instead of a second y-axis)
+    # 4. width and safety per wave
     waves = np.array([int(row["wave"]) for row in history])
     spans = _history_series(history, "spans")
     margin = _history_series(history, "margin_sigma")
@@ -204,7 +178,7 @@ def plot_wave(
     for ax in (ax_scatter, ax_probe, ax_hist, ax_spans, ax_margin):
         ax.grid(alpha=0.2)
     fig.suptitle(
-        f"Restriction, wave {wave}: C-stat <= {thr:,.1f} = best + {(thr - best) / max(float(span), 1e-12):.1f} spans, "
+        f"Restriction, wave {wave}: C-stat <= {thr:,.1f} = best + {(thr - best) / float(span):.1f} spans, "
         f"{100 * float(last.get('prior_mass') or 0.0):.4g}% of the prior"
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))

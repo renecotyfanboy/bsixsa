@@ -24,10 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _analytic import QuadCstat  # noqa: E402
 
-from bsixsa.exceptions import TruncationBudgetError  # noqa: E402
 from bsixsa.priors import MultipleIndependent, loguniform, uniform  # noqa: E402
 from bsixsa.restriction import HistoryMatching, Region, Restriction  # noqa: E402
-from bsixsa.restriction.region import _box_candidate_budget, _mass_probe_budget  # noqa: E402
 from bsixsa.restriction.rules import pad_box, posterior_span  # noqa: E402
 
 _COV = np.array([[0.01, 0.004], [0.004, 0.02]])
@@ -108,7 +106,7 @@ def test_history_matching_compares_by_value():
         {"stop_when_acceptance": 1.0},
         {"validation_fraction": 1.0},
         {"box_samples": -1},
-        {"max_candidates": 2e9},
+        {"max_candidates": 2.5e9 + 0.5},  # whole numbers written as floats (2e9) are accepted
         {"torch_threads": 0},
         {"plot": "yes"},
         {"n_waves": True},
@@ -118,6 +116,14 @@ def test_history_matching_compares_by_value():
 def test_history_matching_refuses_invalid_values(kwargs):
     with pytest.raises(ValidationError):
         HistoryMatching(**kwargs)
+
+
+def test_history_matching_budgets_are_derived_not_stored():
+    cfg = HistoryMatching()
+    dumped = cfg.model_dump()
+    # history.json stores model_dump(), and HistoryMatching(**dumped) must round-trip.
+    assert "mass_probe_budget" not in dumped and "box_candidate_budget" not in dumped
+    assert HistoryMatching(**dumped) == cfg
 
 
 def test_history_matching_accepts_none_threads_and_zero_box_samples():
@@ -155,24 +161,13 @@ def test_accepts_without_any_point_in_the_cube_skips_the_model():
 
 def test_region_dimension_is_read_from_the_model_or_given(quad):
     assert Region(QuadModel(quad), 1.0).d == 2
-    assert Region(QuadModel(quad, with_d=False), 1.0).d is None
     assert Region(QuadModel(quad, with_d=False), 1.0, d=2).d == 2
-
-    class TorchLike:
-        t_mu = np.zeros((1, 3))
-
-        def predict_cstat(self, u, batch=200_000):
-            return np.zeros(len(u))
-
-    assert Region(TorchLike(), 1.0).d == 3
+    assert Region(QuadModel(quad), 1.0, d=np.int64(2)).d == 2
 
 
-def test_region_with_unknown_dimension_cannot_sample(quad):
-    region = Region(QuadModel(quad, with_d=False), _C0 + 1.0)
+def test_region_with_unknown_dimension_is_refused_at_construction(quad):
     with pytest.raises(ValueError, match="dimension"):
-        region.sample(10, np.random.default_rng(0), max_candidates=1000)
-    with pytest.raises(ValueError, match="dimension"):
-        region.prior_mass(np.random.default_rng(0), n_probe=10, max_candidates=100)
+        Region(QuadModel(quad, with_d=False), _C0 + 1.0)
 
 
 # ------------------------------------------------------------ Region.sample
@@ -225,15 +220,19 @@ def test_sample_is_deterministic_given_the_generator(quad):
 
 def test_sample_raises_on_a_tiny_region_with_a_tiny_budget(quad):
     region = _ellipse_region(quad, 1e-8)  # prior mass ~ 4e-10
-    with pytest.raises(TruncationBudgetError, match="budget"):
+    with pytest.raises(RuntimeError, match="budget") as err:
         region.sample(10, np.random.default_rng(0), max_candidates=100_000, batch=10_000)
-    assert region.model.rows_seen <= 100_000
+    assert type(err.value) is RuntimeError
+    assert "HistoryMatching.max_candidates" in str(err.value)
+    # It gives up once even an optimistic acceptance rate cannot fill the
+    # draws: after 60 000 hitless candidates, before the budget is spent.
+    assert region.model.rows_seen == 60_000
 
 
 def test_sample_never_exceeds_the_candidate_budget(quad):
     # mass ~ 0.043: 1000 draws need ~23k candidates, far over 5k.
     region = _ellipse_region(quad, 1.0)
-    with pytest.raises(TruncationBudgetError):
+    with pytest.raises(RuntimeError):
         region.sample(1000, np.random.default_rng(0), max_candidates=5_000, batch=3_000)
     assert region.model.rows_seen <= 5_000
 
@@ -247,8 +246,11 @@ def test_sample_succeeds_when_the_budget_is_ample(quad):
 def test_sample_zero_and_negative(quad):
     region = _ellipse_region(quad, 1.0)
     assert region.sample(0, np.random.default_rng(0), max_candidates=1).shape == (0, 2)
+    assert region.model.rows_seen == 0
     with pytest.raises(ValueError):
         region.sample(-1, np.random.default_rng(0), max_candidates=1)
+    with pytest.raises(RuntimeError, match="over the budget of -5"):
+        region.sample(1, np.random.default_rng(0), max_candidates=-5)
 
 
 # ------------------------------------------------------------ Region.prior_mass
@@ -296,13 +298,14 @@ def test_prior_mass_probe_never_exceeds_the_budget():
 
 def test_mass_probe_budget_resolves_the_acceptance_stop():
     # Default: 50 * mass_probe (2.5M) already exceeds 400 / 5e-3 = 80k.
-    assert _mass_probe_budget(HistoryMatching()) == 2_500_000
+    assert HistoryMatching().mass_probe_budget == 2_500_000
     # A lowered acceptance stop grows the probe until it can resolve it (the
     # fixed 50 * mass_probe cap reported a 1e-6 region as exactly 0).
-    assert _mass_probe_budget(HistoryMatching(stop_when_acceptance=1e-7)) == 2_000_000_000
-    assert _mass_probe_budget(HistoryMatching(stop_when_acceptance=1e-6)) == 400_000_000
+    assert HistoryMatching(stop_when_acceptance=1e-7).mass_probe_budget == 2_000_000_000
+    assert HistoryMatching(stop_when_acceptance=1e-6).mass_probe_budget == 400_000_000
     # ... but never beyond the candidate budget.
-    assert _mass_probe_budget(HistoryMatching(stop_when_acceptance=1e-6, max_candidates=10_000_000)) == 10_000_000
+    assert HistoryMatching(stop_when_acceptance=1e-6, max_candidates=10_000_000).mass_probe_budget == 10_000_000
+    assert isinstance(HistoryMatching().mass_probe_budget, int)
 
 
 def test_prior_mass_measures_a_region_below_the_old_fixed_cap(quad):
@@ -315,7 +318,7 @@ def test_prior_mass_measures_a_region_below_the_old_fixed_cap(quad):
     cfg = HistoryMatching(mass_probe=100, stop_when_acceptance=1e-4)
     fixed = region.prior_mass(np.random.default_rng(0), n_probe=cfg.mass_probe, max_candidates=50 * cfg.mass_probe)
     assert fixed == 0.0
-    budget = _mass_probe_budget(cfg)
+    budget = cfg.mass_probe_budget
     assert budget == 4_000_000
     mass = region.prior_mass(np.random.default_rng(0), n_probe=cfg.mass_probe, max_candidates=budget)
     assert region.last_probe_hits > 30
@@ -325,12 +328,12 @@ def test_prior_mass_measures_a_region_below_the_old_fixed_cap(quad):
 # ------------------------------------------------------------ Restriction
 
 
-def _restriction(quad, *, r2=4.0, n=3000, seed_entropy=123, rmse=0.5, fingerprint="fp", **cfg_kwargs):
+def _restriction(quad, *, r2=4.0, n=3000, seed=123, rmse=0.5, **cfg_kwargs):
     rng = np.random.default_rng(11)
     u = rng.random((n, 2))
     cstat = quad.cstat(u)
     threshold = quad.c0 + r2
-    cfg = HistoryMatching(box_samples=cfg_kwargs.pop("box_samples", 5_000), **cfg_kwargs)
+    cfg = HistoryMatching(box_samples=cfg_kwargs.pop("box_samples", 5_000), seed=seed, **cfg_kwargs)
     history = [
         {
             "wave": 1,
@@ -361,9 +364,7 @@ def _restriction(quad, *, r2=4.0, n=3000, seed_entropy=123, rmse=0.5, fingerprin
         stop_reason="n_waves",
         n_simulations=n,
         seconds=1.5,
-        fingerprint=fingerprint,
         config=cfg,
-        seed_entropy=seed_entropy,
         param_names=["nH", "norm"],
     )
 
@@ -393,16 +394,15 @@ def test_restriction_validates_shapes(quad):
             stop_reason="n_waves",
             n_simulations=5,
             seconds=0.0,
-            fingerprint="",
             config=HistoryMatching(),
         )
 
 
-def test_restriction_fills_a_missing_region_dimension(quad):
+def test_restriction_optional_fields_default_to_none(quad):
     rng = np.random.default_rng(0)
     u = rng.random((10, 2))
     res = Restriction(
-        region=Region(QuadModel(quad, with_d=False), 20.0),
+        region=Region(QuadModel(quad), 20.0),
         threshold=20.0,
         best=10.0,
         span=1.0,
@@ -415,11 +415,9 @@ def test_restriction_fills_a_missing_region_dimension(quad):
         stop_reason="n_waves",
         n_simulations=10,
         seconds=0.0,
-        fingerprint="",
         config=HistoryMatching(box_samples=10),
     )
-    assert res.region.d == 2
-    assert res.seed_entropy is None and res.param_names is None
+    assert res.param_names is None
 
 
 def test_box_contains_every_inside_point_and_is_padded(quad):
@@ -472,10 +470,10 @@ def test_box_is_cached_and_returns_copies(quad):
     assert np.all(second[0] >= 0.0)
 
 
-def test_box_is_deterministic_given_the_seed_entropy(quad):
-    a = _restriction(quad, seed_entropy=5).box()
-    b = _restriction(quad, seed_entropy=5).box()
-    c = _restriction(quad, seed_entropy=6).box()
+def test_box_is_deterministic_given_the_seed(quad):
+    a = _restriction(quad, seed=5).box()
+    b = _restriction(quad, seed=5).box()
+    c = _restriction(quad, seed=6).box()
     np.testing.assert_array_equal(a[0], b[0])
     np.testing.assert_array_equal(a[1], b[1])
     assert not np.array_equal(a[0], c[0])
@@ -492,16 +490,16 @@ def test_box_keeps_the_draws_its_candidate_budget_yields(quad):
 
 
 def test_box_candidate_budget_is_about_one_mass_probe():
-    assert _box_candidate_budget(HistoryMatching()) == 2_500_000
-    assert _box_candidate_budget(HistoryMatching(mass_probe=1_000, box_samples=4_000)) == 200_000
-    assert _box_candidate_budget(HistoryMatching(max_candidates=123)) == 123
+    assert HistoryMatching().box_candidate_budget == 2_500_000
+    assert HistoryMatching(mass_probe=1_000, box_samples=4_000).box_candidate_budget == 200_000
+    assert HistoryMatching(max_candidates=123).box_candidate_budget == 123
 
 
 def test_box_of_a_small_region_spends_its_budget_not_max_candidates(quad):
     # mass ~ 1e-3: 5 000 draws would need ~5M candidates, as many surrogate
     # evaluations as max_candidates allows; the box stops at 50 * box_samples.
     res = _restriction(quad, r2=0.025, box_samples=5_000, mass_probe=1_000)
-    budget = _box_candidate_budget(res.config)
+    budget = res.config.box_candidate_budget
     assert budget == 250_000 < res.config.max_candidates
     res.region.model.rows_seen = 0
     lo, hi = res.box()
@@ -574,13 +572,6 @@ def test_truncated_prior_with_a_real_prior(quad):
     assert res.truncated_prior(base)[0] is prior
 
 
-def test_check_fingerprint(quad):
-    res = _restriction(quad, fingerprint="abc")
-    res.check_fingerprint("abc")
-    with pytest.raises(ValueError, match="another inference problem"):
-        res.check_fingerprint("abd")
-
-
 def test_save_writes_the_arrays_and_the_history(quad, tmp_path):
     res = _restriction(quad)
     target = tmp_path / "nested" / "restriction"
@@ -612,12 +603,10 @@ def test_save_writes_the_arrays_and_the_history(quad, tmp_path):
     assert payload["stop_reason"] == "n_waves"
     assert payload["n_simulations"] == res.n_simulations
     assert payload["seconds"] == res.seconds
-    assert payload["fingerprint"] == "fp"
     assert HistoryMatching(**payload["config"]) == res.config
     assert payload["history"][0]["purity"] is None
     assert payload["history"][0]["recall_info"] == {"skipped": True, "n_core": 3}
     assert payload["param_names"] == ["nH", "norm"]
-    assert payload["seed_entropy"] == "123"
 
 
 def test_report_summarises_the_waves(quad):

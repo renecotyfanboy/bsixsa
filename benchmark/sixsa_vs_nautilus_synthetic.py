@@ -1,11 +1,10 @@
-"""SIXSA v2 versus Nautilus on a reproducible XSPEC fakeit spectrum.
+"""SIXSA versus Nautilus on a reproducible XSPEC fakeit spectrum.
 
 Activate the bsixsa environment, then run:
     python benchmark/sixsa_vs_nautilus_synthetic.py --quick
     python benchmark/sixsa_vs_nautilus_synthetic.py --repeats 3 --strict
 
 Each invocation writes to a fresh directory unless --output is provided.
---exact adds a report-only comparison using the optional auto truncation.
 """
 from __future__ import annotations
 
@@ -60,13 +59,13 @@ def summary(solver, fit):
                restriction_time=fit.restriction_time,
                log_Z_restriction_correction=fit.log_Z_restriction_correction)
     if solver.backend_name == "sixsa":
-        b, p = solver.backend, solver.backend.posterior
-        out.update(exit_reason=b.exit_reason, certified=p.certified, k_hat=p.k_hat,
-                   ess=p.ess, n_unique=p.n_unique, best_round=b.best_round,
-                   log_Z_err_reliable=p.log_z_err_reliable,
-                   history=[{k: row[k] for k in ("round", "k_hat", "efficiency", "n_train",
-                                                "generation", "truncation_source", "truncation")}
-                            for row in b.history])
+        backend, posterior = solver.backend, solver.backend.posterior
+        out.update(exit_reason=backend.exit_reason, passed=posterior.passed, k_hat=posterior.k_hat,
+                   ess=posterior.ess, n_unique=backend.n_unique, best_round=backend.best_round,
+                   history=[{"round": row["round"], "k_hat": row["k_hat"], "efficiency": row["efficiency"],
+                             "n_train": row["n_train"], "generation": row["compressor"]["generation"],
+                             "truncation": row["truncation"]}
+                            for row in backend.history])
     return out
 
 
@@ -80,7 +79,7 @@ def reference_best_fit_stat(solver, reference_mean):
     def objective(u):
         theta = prior.from_unit_cube(np.asarray(u)[None, :])
         cstat = solver.simulate(theta, return_kind="cstat", progress_bar=False)["cstat"]
-        return float((cstat + prior.xspec_bayes_contribution_batch(theta))[0])
+        return float((cstat + prior.xspec_bayes_contribution(theta))[0])
 
     result = minimize(objective, initial, method="Powell",
                       bounds=[(0.0, 1.0)] * solver.num_parameters,
@@ -121,14 +120,13 @@ def run(args):
 
     def infer(key, config):
         import warnings
-        from bsixsa import BoxEdgeWarning
         solver = Solver(prior_spec(), outputfiles_basename=str(outdir / key),
                         n_jobs=args.jobs, backend=config, restrict_prior=restriction)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             fit = solver.run()
         summaries[key] = summary(solver, fit)
-        summaries[key]["box_edge_warning"] = any(issubclass(w.category, BoxEdgeWarning) for w in caught)
+        summaries[key]["box_edge_warning"] = any("box" in str(w.message).lower() for w in caught)
         summaries[key]["warnings"] = [str(w.message) for w in caught]
         draws[key] = np.asarray(fit.posterior_samples)
         print(f"{key}: log Z={fit.log_Z:.4f}; {fit.n_likelihood_evaluations} folds", flush=True)
@@ -136,15 +134,13 @@ def run(args):
 
     infer("nautilus_restrict", Nautilus(trace=False, seed=0, n_pool=1,
                                        num_live_points=500 if args.quick else 3000))
-    sixsa_kw = dict(seed=0, trace=False, training_n_jobs=args.training_jobs)
+    sixsa_kw = dict(seed=0, trace=False)
     if args.quick:
         sixsa_kw.update(n_nde=2, n_rounds=6, n_training=3000, train_max=12000,
                         training=dict(max_num_epochs=60, training_batch_size=256),
                         compressor=dict(epochs=150, patience=15),
                         target_ess=1000, num_posterior_samples=5000, max_sampling_draws=30000)
     solver = infer("sixsa_restrict", SIXSA(**sixsa_kw))
-    if args.exact:
-        infer("sixsa_exact", SIXSA(**sixsa_kw, truncated_sampling="auto"))
 
     full = [summaries[f"nautilus_full_{i}"] for i in range(args.repeats)]
     reference = np.concatenate([draws[f"nautilus_full_{i}"] for i in range(args.repeats)])
@@ -168,7 +164,7 @@ def run(args):
         check(f"G3_{key}_std", np.max(np.abs(v.std(0) / ref_std - 1)), 0.10)
         check(f"G3_{key}_corr", np.max(np.abs(np.corrcoef(v.T) - np.corrcoef(reference.T))), 0.05)
     last = six["history"][-1]
-    check("G4_certified", not (six["certified"] and six["exit_reason"] == "gate"
+    check("G4_certified", not (six["passed"] and six["exit_reason"] == "gate"
                              and last["k_hat"] < 0.7 and last["efficiency"] >= 5
                              and six["k_hat"] < 0.7), 0)
     low, high = np.quantile(draws["sixsa_restrict"], [0.0015, 0.9985], axis=0)
@@ -214,10 +210,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--strict", action="store_true")
-    parser.add_argument("--exact", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=4)
-    parser.add_argument("--training-jobs", type=int, default=2)
     parser.add_argument("--output", type=Path, default=REPO / "benchmark" /
                         ("sixsa_v2_" + datetime.now().strftime("%Y%m%d_%H%M%S")))
     args = parser.parse_args()

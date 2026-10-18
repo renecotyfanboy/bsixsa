@@ -1,4 +1,35 @@
-"""SIXSA v2 orchestration over the Solver's exact folding interface."""
+r"""SIXSA: simulation-based inference whose answer is checked against exact folds.
+
+Each round has two parts.
+
+1. **Learning where to look.** Spectra are simulated (folded through XSPEC,
+   with Poisson noise) at parameters spread over the plausible region. An
+   autoencoder compresses each spectrum into a short code, and `n_nde`
+   normalising flows learn $p(\text{parameters} \mid \text{code})$ from these
+   pairs. Evaluated at the code of the observed spectrum, a flow is a
+   *proposal*: a cheap guess of the posterior.
+2. **Checking the guess exactly.** Draws from a proposal are folded through
+   XSPEC and weighted by $e^{-C/2} / q$, the exact likelihood over the
+   proposal density. The Pareto k-hat of these weights says whether the guess
+   is good enough for importance sampling. If it is not, the next round
+   simulates only where the best proposal puts its mass, with a larger
+   training set.
+
+Once a proposal passes, or the rounds run out, the posterior is an importance
+sample from the best one. Parameters live in the prior's unit cube, where the
+prior density is 1.
+
+Glossary:
+
+- *fold*: one exact evaluation of the model through XSPEC.
+- *screen*: certifying every flow of a round, and their equal-weight mixture,
+  on `check_draws` draws each to pick the best one (skipped when `n_nde = 1`).
+- *gate*: certifying the round's best proposal on `check_draws` fresh draws;
+  it passes when k-hat is below `khat_threshold` and the efficiency is at
+  least `min_efficiency`.
+- *certificate*: the draws, weights and diagnostics of one such check
+  ([`Certificate`][bsixsa.backend.sixsa.certify.Certificate]).
+"""
 
 from __future__ import annotations
 
@@ -11,279 +42,344 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .. import register_backend
 from ..abc import Backend
 from ..config import SIXSA
-from ..._cube import child_rng, child_seed, latin_hypercube, make_seed_sequence, to_physical
-from ..._torch_utils import torch_threads
-from ...solver import FitResults
-from . import budget
-from ._simulator import CubeSimulator
-from .certify import certify_fresh, certify_many, rank_candidates, tier
+from ..._cube import in_cube, latin_hypercube, to_physical
+from ...solver import FitResults, Solver
+from .certify import Certificate, Proposal, certify, rank
 from .compressor import Compressor
-from .flows import FlowProposal, MixtureProposal, member_seeds, train_members
-from .sampling import resample, sample_final
+from .flows import FlowProposal, MixtureProposal, train_flow
+from .sampling import importance_sample, resample
 from .truncation import sample_truncated
 
 _LOG = logging.getLogger(__name__)
+# Proposal draws per batch of the final importance sample.
+_SAMPLING_BATCH = 5000
 
 
-class _BestFitRecorder:
-    """Track the best exact fold even when evaluation tracing is disabled."""
+def training_set_size(d: int, n_bins: int) -> int:
+    """Size of the first training set: `d` times a per-parameter budget.
 
-    def __init__(self, prior, tracer):
-        self.prior, self.tracer = prior, tracer
-        self.theta = None
-        self.stat = np.inf
-
-    def record(self, theta, cstat, *, trace=True):
-        theta = np.asarray(theta, dtype=np.float64)
-        values = np.asarray(cstat, dtype=np.float64)
-        stats = values + self.prior.xspec_bayes_contribution_batch(theta)
-        finite = np.isfinite(stats)
-        if finite.any():
-            index = int(np.argmin(np.where(finite, stats, np.inf)))
-            if stats[index] < self.stat:
-                self.stat = float(stats[index])
-                self.theta = theta[index].copy()
-        if trace and self.tracer is not None:
-            self.tracer.record(theta, values)
+    The budget is 2000 simulations per parameter for `d = 6` on 2500 channels,
+    and grows with the number of parameters and of channels.
+    """
+    dimension_factor = (d / 6.0) ** 0.6
+    channel_factor = min(max((n_bins / 2500.0) ** 0.25, 0.5), 3.0)
+    per_param = 2000.0 * dimension_factor * channel_factor
+    return int(max(round(per_param / 250) * 250, 750)) * int(d)
 
 
-@register_backend
 class SIXSABackend(Backend):
-    """Train proposals in parallel and certify them against the exact likelihood."""
+    """Train flow proposals on simulated spectra and certify them against exact folds.
 
-    name = "sixsa"
+    After `solver.run()`, `solver.backend` holds the attributes below.
+
+    Attributes:
+        posterior: The final weighted sample
+            ([`Certificate`][bsixsa.backend.sixsa.certify.Certificate]).
+        n_unique: Number of distinct rows in the equal-weight posterior samples.
+        history: One dict per round: the gate certificate's diagnostics plus
+            the training, compressor and truncation records.
+        certificates: Every screen and gate certificate of the run, in order.
+        compressor: The spectrum autoencoder
+            ([`Compressor`][bsixsa.backend.sixsa.compressor.Compressor]).
+        best_round: Round whose gate certificate gave the final proposal.
+        exit_reason: `"gate"` (a proposal passed) or `"n_rounds"` (the round
+            budget ran out).
+        best_fit: Physical parameters of the best fold.
+        best_fit_stat: The best C-stat plus the prior term XSPEC's `bayes`
+            would add.
+        outdir: Output directory, `<outputfiles_basename>/sixsa`.
+        rng: NumPy generator seeded from `SIXSA.seed`.
+    """
+
     config_cls = SIXSA
 
-    def __init__(self, *, solver, config):
+    def __init__(self, *, solver: Solver, config: SIXSA) -> None:
         super().__init__(solver=solver, config=config)
-        self.restriction = solver.restriction
-        self.history = []
-        self.certificates = []
-        self.posterior = None
-        self.best_round = None
+        self.rng = np.random.default_rng(config.seed)
+        self.outdir = Path(solver.outputfiles_basename) / "sixsa"
+        self.history: list[dict] = []
+        self.certificates: list[Certificate] = []
+        self.posterior: Certificate | None = None
+        self.n_unique: int | None = None
+        self.compressor: Compressor | None = None
+        self.best_round: int | None = None
         self.exit_reason = ""
-        self.flows = []
-        self.flow = None
-        self.compressor = None
-        self.fold_counts = {}
-        self.timers = {}
-        self._seed_seq = make_seed_sequence(config.seed)
-        self._sample_rng = child_rng(self._seed_seq, 41)
+        self.best_fit: np.ndarray | None = None
+        self.best_fit_stat = np.inf
+
+    def _to_physical(self, u: np.ndarray) -> np.ndarray:
+        """Physical parameters of cube points."""
+        return to_physical(self.solver.base_prior, u)
+
+    def _record(self, theta: np.ndarray, cstat: np.ndarray) -> None:
+        """Feed the tracer and track the best fold."""
+        self.tracer.record(theta, cstat)
+        stat = cstat + self.solver.base_prior.xspec_bayes_contribution(theta)
+        if np.isfinite(stat).any() and np.nanmin(stat) < self.best_fit_stat:
+            best = int(np.nanargmin(stat))
+            self.best_fit, self.best_fit_stat = theta[best].copy(), float(stat[best])
+
+    def _cstat(self, u: np.ndarray) -> np.ndarray:
+        """Exact C-stat of cube points, `+inf` outside the closed cube."""
+        u = np.asarray(u, dtype=np.float64)
+        out = np.full(len(u), np.inf)
+        inside = in_cube(u)
+        if inside.any():
+            theta = self._to_physical(u[inside])
+            out[inside] = self.solver.simulate(theta, return_kind="cstat", progress_bar=False)["cstat"]
+            self._record(theta, out[inside])
+        return out
+
+    def _training_data(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Exact C-stat and one Poisson realisation of the model counts at each cube point."""
+        theta = self._to_physical(u)
+        sim = self.solver.simulate(theta, return_kind="full_model_counts", progress_bar=False)
+        cstat = np.asarray(sim["cstat"], dtype=np.float64)
+        self._record(theta, cstat)
+        # Model counts can dip below zero (e.g. negative-normalisation lines).
+        counts = self.rng.poisson(np.clip(sim["total_model_counts"], 0, None)).astype(np.float32)
+        return cstat, counts
+
+    def _draw_region(self, n: int) -> np.ndarray:
+        """Flat draws on the history-matching region, or a Latin hypercube of the cube without one."""
+        restriction = self.solver.restriction
+        if restriction is None:
+            return latin_hypercube(self.solver.num_parameters, n, self.rng)
+        return restriction.region.sample(n, self.rng, max_candidates=restriction.config.max_candidates)
+
+    def _refits_compressor(self, r: int) -> bool:
+        """Whether round `r` refits the compressor (`refresh_compressor`: every round, never again, or up to round k)."""
+        refresh = self.config.refresh_compressor
+        if isinstance(refresh, bool):
+            return r == 1 or refresh
+        return r <= max(refresh, 1)
+
+    def _encode(self, r: int, cstat: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Refit the compressor if due; return the training codes and the observation's code."""
+        restriction = self.solver.restriction
+        if self._refits_compressor(r):
+            # Round 1 trains on the spectra that resemble the observation.
+            cut = restriction.threshold if r == 1 and restriction is not None else None
+            self.compressor.fit(counts, cstat=cstat, max_cstat=cut)
+        z = self.compressor.encode(counts)
+        z_obs = self.compressor.encode(self.solver.observed_counts)[0]
+        if np.any((z_obs < z.min(axis=0)) | (z_obs > z.max(axis=0))):
+            see = (f" (see {self.outdir / 'compressor.pdf'}, written at the end of the run)"
+                   if self.config.plot_diagnostics else "")
+            _LOG.warning(
+                "Round %d: the observed spectrum's code lies outside the range of the training spectra, so the "
+                "flows must extrapolate. If this persists over rounds, the model or prior may not reproduce the "
+                "data%s.", r, see,
+            )
+        return z, z_obs
+
+    def _train_flows(self, r: int, u: np.ndarray, z: np.ndarray,
+                     z_obs: np.ndarray) -> tuple[list[FlowProposal], list[dict]]:
+        """Train `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
+        nde, training = self.config.nde.model_dump(), self.config.training.model_dump()
+        flows, infos = [], []
+        for k in range(self.config.n_nde):
+            estimator, info = train_flow(
+                u, z, nde=nde, training=training, seed=int(self.rng.integers(2**31 - 1)),
+                log_dir=self.outdir / f"round_{r}" / f"member_{k}",
+            )
+            flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
+            infos.append(info)
+        return flows, infos
+
+    def _screen(self, r: int, flows: list[FlowProposal], thresholds: dict) -> FlowProposal | MixtureProposal:
+        """Certify every flow and their equal-weight mixture; return the best proposal."""
+        with self.solver.fold_phase("screen"):
+            screens = certify(flows, self.config.check_draws, self._cstat, rng=self.rng,
+                              mixture=MixtureProposal(flows, name=f"round{r}/mixture"), **thresholds)
+        self.certificates.extend(screens)
+        _LOG.info("SIXSA round %d screen: %s", r,
+                  ", ".join(f"{c.name} k_hat={c.k_hat:.2f} eff={c.efficiency:.1f}%" for c in screens))
+        return screens[rank(screens)].proposal
+
+    def _warn_if_region_cuts_posterior(self, r: int, cert: Certificate) -> None:
+        """Warn when 99.9% of the posterior weight reaches within one posterior span of the region's threshold.
+
+        The flows only see the history-matching region, so posterior mass
+        beyond it would go unnoticed.
+        """
+        restriction = self.solver.restriction
+        if restriction is None or not np.isfinite(cert.log_w_smoothed).any():
+            return
+        order = np.argsort(cert.cstat)
+        cumulative = np.cumsum(np.exp(cert.log_w_smoothed[order]))
+        reach = float(cert.cstat[order][np.searchsorted(cumulative, 0.999)])
+        margin = restriction.threshold - reach
+        if margin < restriction.span:
+            _LOG.warning(
+                "Round %d: 99.9%% of the posterior weight lies below C-stat %.1f, only %.1f below the region "
+                "threshold %.1f (less than one posterior span, %.1f); the history-matching region may cut into "
+                "the posterior. Rerun with a wider restriction (larger HistoryMatching(target_spans=...)) or "
+                "restrict_prior=False to check.",
+                r, reach, margin, restriction.threshold, restriction.span,
+            )
+
+    def _round(self, r: int, u: np.ndarray, cstat: np.ndarray, counts: np.ndarray) -> dict:
+        """One round: encode, train the flows, screen them, and certify the winner on fresh draws."""
+        cfg = self.config
+        thresholds = dict(round_index=r, khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency)
+        z, z_obs = self._encode(r, cstat, counts)
+        flows, infos = self._train_flows(r, u, z, z_obs)
+        proposal = flows[0] if len(flows) == 1 else self._screen(r, flows, thresholds)
+        with self.solver.fold_phase("gate"):
+            cert = certify([proposal], cfg.check_draws, self._cstat, rng=self.rng, **thresholds)[0]
+        self.certificates.append(cert)
+        _LOG.info("SIXSA round %d: %s k_hat=%.3f, efficiency=%.1f%%, ESS=%.0f, best fold %.1f",
+                  r, cert.name, cert.k_hat, cert.efficiency, cert.ess, float(np.min(cert.cstat)))
+        self._warn_if_region_cuts_posterior(r, cert)
+        return dict(cert.summary(), round=r, n_train=len(u), certificate=cert,
+                    compressor=self.compressor.history[-1], nde=infos, truncation=None)
+
+    def _truncated_training_set(self, record: dict) -> tuple[np.ndarray, dict]:
+        """Draw the next, larger training set inside the round winner's highest-density region.
+
+        Done whatever the winner's k-hat: a poor k-hat condemns the proposal's
+        tails, not its high-density region.
+        """
+        cfg, restriction = self.config, self.solver.restriction
+        n = min(int(round(record["n_train"] * cfg.train_ramp)), cfg.train_max)
+        u, info = sample_truncated(
+            record["certificate"].proposal, n=n, quantile=cfg.truncated_quantile,
+            n_support=cfg.truncated_support_draws, oversampling=cfg.truncated_oversampling,
+            rng=self.rng, region=None if restriction is None else restriction.region,
+        )
+        _LOG.info("SIXSA round %d truncation: %s", record["round"], info)
+        return u, info
+
+    def _final_sample(self, proposal: Proposal, max_draws: int) -> np.ndarray:
+        """Importance-sample `proposal` into `self.posterior`; return equal-weight cube rows."""
+        cfg = self.config
+        with self.solver.fold_phase("sampling"):
+            self.posterior = importance_sample(
+                proposal, self._cstat, target_ess=cfg.target_ess, max_draws=max_draws, batch=_SAMPLING_BATCH,
+                rng=self.rng, khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency,
+            )
+        rows, self.n_unique = resample(self.posterior.u, self.posterior.log_w_smoothed,
+                                       cfg.num_posterior_samples, self.rng)
+        return rows
 
     def run(self) -> FitResults:
-        # Small networks and density evaluations are substantially faster with
-        # one intra-op thread; restore the caller's setting even on failure.
-        with torch_threads(self.config.threads_per_member):
-            return self._run()
+        """Run the SIXSA rounds, then importance-sample the best proposal.
 
-    def _run(self) -> FitResults:
+        Returns:
+            A [`FitResults`][bsixsa.solver.FitResults] with the posterior
+            samples, the log evidence and the best fit.
+
+        Warns:
+            RuntimeWarning: If no round passed the gate, or if the final
+                importance sample is not certified.
+        """
         started = time.perf_counter()
-        cfg, solver, ss = self.config, self.solver, self._seed_seq
-        solver._check_xspec_state()
-        before = solver.fold_counts
-        recorder = _BestFitRecorder(solver.base_prior, self.tracer)
-        sim = CubeSimulator(solver, seed_seq=ss, fold_chunk=cfg.fold_chunk, tracer=recorder)
-        region = self.restriction.region if self.restriction is not None else None
-        if self.restriction is not None:
-            recorder.record(to_physical(solver.base_prior, self.restriction.u), self.restriction.cstat, trace=False)
+        cfg, solver = self.config, self.solver
+        folds_before = sum(solver.fold_counts.values())
+        if solver.restriction is not None:
+            self._record(self._to_physical(solver.restriction.u), solver.restriction.cstat)
+        self.compressor = Compressor(solver.n_bins, solver.num_parameters, **cfg.compressor.model_dump(),
+                                     seed=cfg.seed, log=_LOG.info)
 
-        n = cfg.n_training or budget.training_set_size(
-            sim.d, sim.n_bins, base=cfg.training_set_base,
-            per_param_min=cfg.training_set_min_per_param,
-        )
-        n = min(n, cfg.train_max)
-        u = self._draw_region(n, child_rng(ss, 1))
-        cstat, counts = sim.counts(u, phase="harvest", key=(2, 0))
-        self.compressor = Compressor(
-            sim.n_bins, sim.d, **cfg.compressor.model_dump(),
-            seed=child_seed(ss, 3), log=_LOG.info,
-        )
-        gate = dict(khat_threshold=cfg.khat_threshold, khat_safe=cfg.khat_safe,
-                    min_efficiency=cfg.min_efficiency)
-        fresh_all = []
-        best = None
+        n = min(cfg.n_training or training_set_size(solver.num_parameters, solver.n_bins), cfg.train_max)
+        u = self._draw_region(n)
+        with solver.fold_phase("harvest"):
+            cstat, counts = self._training_data(u)
         for r in range(1, cfg.n_rounds + 1):
-            t0 = time.perf_counter()
-            refresh = cfg.refresh_compressor
-            if r == 1 or refresh is True or (type(refresh) is int and r <= refresh):
-                cut = self.restriction.threshold if r == 1 and region is not None else None
-                self.compressor.fit(counts, cstat=cstat, max_cstat=cut)
-            z, generation = self.compressor.encode_with_generation(counts)
-            z_obs, obs_generation = self.compressor.encode_with_generation(sim.x_obs)
-            self.compressor.check_generation(generation, "training codes")
-            self.compressor.check_generation(obs_generation, "observation")
-            outside = np.any((z_obs[0] < z.min(axis=0)) | (z_obs[0] > z.max(axis=0)))
-            if outside:
-                _LOG.warning("Round %s: observation code outside the training range.", r)
-            self._time("compressor", t0)
-
-            t0 = time.perf_counter()
-            estimators, infos = train_members(
-                u, z, nde=cfg.nde.model_dump(), training=cfg.training.model_dump(),
-                seeds=member_seeds(ss, r, cfg.n_nde), n_jobs=cfg.training_n_jobs,
-                threads_per_member=cfg.threads_per_member, log=_LOG.info,
-            )
-            self.flows = [
-                FlowProposal(est, z_obs[0], name=f"round{r}/member{k}", generation=generation)
-                for k, est in enumerate(estimators)
-            ]
-            self._time("nde", t0)
-
-            t0 = time.perf_counter()
-            if len(self.flows) == 1:
-                proposal = self.flows[0]
-            else:
-                mixture = MixtureProposal(self.flows, name=f"round{r}/mixture")
-                if cfg.screen_members:
-                    screens = certify_many(
-                        self.flows, cfg.check_draws, sim, mixture=mixture,
-                        rng=child_rng(ss, 20, r), phase="screen", round_index=r, **gate,
-                    )
-                    selected = rank_candidates(screens, khat_safe=cfg.khat_safe,
-                                               tolerance=cfg.screen_tolerance)
-                    proposal = screens[selected].proposal
-                    self.certificates.extend(c.without_proposal() for c in screens)
-                else:
-                    proposal = mixture
-            fresh = certify_fresh(
-                proposal, cfg.check_draws, sim, rng=child_rng(ss, 21, r),
-                phase="gate", round_index=r, **gate,
-            )
-            fresh_all.append(fresh)
-            self.certificates.append(fresh.without_proposal())
-            best = fresh_all[rank_candidates(fresh_all, khat_safe=cfg.khat_safe,
-                                            tolerance=cfg.screen_tolerance)]
-            self._time("certify", t0)
-            record = dict(fresh.summary(), round=r, n_train=len(u),
-                          generation=generation, observation_outside_range=bool(outside),
-                          nde_stats=infos, truncation_source=None, truncation=None)
+            record = self._round(r, u, cstat, counts)
             self.history.append(record)
-            _LOG.info("SIXSA round %d: k_hat=%.3f, efficiency=%.1f%%, ESS=%.0f",
-                      r, fresh.k_hat, fresh.efficiency, fresh.ess)
-            if fresh.passed:
-                self.exit_reason = "gate"
+            if record["passed"] or r == cfg.n_rounds:
                 break
-            if r == cfg.n_rounds:
-                self.exit_reason = "n_rounds"
-                break
+            u, record["truncation"] = self._truncated_training_set(record)
+            with solver.fold_phase("training"):
+                cstat, counts = self._training_data(u)
+        self.exit_reason = "gate" if self.history[-1]["passed"] else "n_rounds"
 
-            t0 = time.perf_counter()
-            n = budget.next_training_size(len(u), ramp=cfg.train_ramp, n_max=cfg.train_max)
-            source = fresh if tier(fresh, khat_safe=cfg.khat_safe) <= 1 else best
-            if tier(source, khat_safe=cfg.khat_safe) <= 1:
-                u, info = sample_truncated(
-                    source.proposal, n=n, quantile=cfg.truncated_quantile,
-                    n_support=cfg.truncated_support_draws, region=region,
-                    method=cfg.truncated_sampling, rng=child_rng(ss, 30, r),
-                    max_candidates=cfg.truncated_max_candidates, log=_LOG.info,
-                )
-                record["truncation_source"] = source.name
-                record["truncation"] = info
-            else:
-                u = self._draw_region(n, child_rng(ss, 31, r))
-                record["truncation_source"] = "region" if region is not None else "prior"
-            self._time("propose", t0)
-            cstat, counts = sim.counts(u, phase="training", key=(2, r))
-
+        gates = [record["certificate"] for record in self.history]
+        best = gates[rank(gates)]
         self.best_round = best.round_index
-        self.flow = best.proposal  # Keeps the original conditioning code/generation.
-        limit = cfg.max_sampling_draws
+        max_draws = cfg.max_sampling_draws
         if self.exit_reason != "gate":
-            limit = min(limit, 5 * cfg.check_draws)
-            warnings.warn("SIXSA reached n_rounds without passing certification.",
-                          RuntimeWarning, stacklevel=2)
-        n_planned = budget.final_draws(target_ess=cfg.target_ess, ess_fresh=best.ess,
-                                      n_fresh=best.n_raw, max_draws=limit)
-        t0 = time.perf_counter()
-        self.posterior = sample_final(
-            self.flow, sim, n_planned=n_planned, target_ess=cfg.target_ess,
-            max_draws=limit, rng=child_rng(ss, 40), certified=best.passed,
-            khat_threshold=cfg.khat_threshold,
-        )
-        self._time("sampling", t0)
-        rows, n_unique = resample(self.posterior.u, self.posterior.log_w_smoothed,
-                                 cfg.num_posterior_samples, self._sample_rng)
-        self.posterior.n_unique = n_unique
-        samples = self._posterior_dataframe(to_physical(solver.base_prior, rows))
-        self.fold_counts = {k: v - before.get(k, 0) for k, v in solver.fold_counts.items()
-                            if v != before.get(k, 0)}
-        self.timers["folds"] = dict(sim.seconds)
-        self.timers["total"] = time.perf_counter() - started
+            # Without a certified proposal, the final sample gets a small budget.
+            max_draws = min(max_draws, 5 * cfg.check_draws)
+            trajectory = (f"the k-hat trajectory in {self.outdir / 'convergence.pdf'}" if cfg.plot_diagnostics
+                          else f"the per-round k_hat in {self.outdir / 'summary.json'}")
+            warnings.warn(
+                f"SIXSA used all n_rounds={cfg.n_rounds} rounds without a proposal passing certification (best "
+                f"round {self.best_round}: k-hat {best.k_hat:.2f}, efficiency {best.efficiency:.1f}%; the gate "
+                f"needs k-hat < {cfg.khat_threshold} and efficiency >= {cfg.min_efficiency}%), so the final "
+                f"importance sample is capped at {max_draws} draws (min(max_sampling_draws, "
+                "5 x check_draws)). Increase n_rounds or train_max, check the priors and the model, and check "
+                f"{trajectory}.",
+                RuntimeWarning, stacklevel=3,  # points at the caller of Solver.run
+            )
+        rows = self._final_sample(best.proposal, max_draws)
+        post = self.posterior
+        if not post.passed:
+            if self.exit_reason == "gate":
+                advice = (f"the gate passed on {cfg.check_draws} draws but the final sample did not; raise "
+                          "check_draws for a stricter gate, or cross-check with a nested sampler.")
+            else:
+                advice = "increase n_rounds, check the priors and the model, or cross-check with a nested sampler."
+            warnings.warn(
+                f"SIXSA final importance sample not certified: k-hat {post.k_hat:.2f} (needs < "
+                f"{cfg.khat_threshold}), efficiency {post.efficiency:.1f}% (needs >= {cfg.min_efficiency}%), "
+                f"ESS {post.ess:.0f} from {post.n_raw} draws. Treat the posterior and log Z as approximate: "
+                + advice,
+                RuntimeWarning, stacklevel=3,
+            )
+
         result = FitResults(
-            time=self.timers["total"], posterior_samples=samples,
-            n_likelihood_evaluations=sum(self.fold_counts.values()),
-            log_Z=self.posterior.log_z, log_Z_err=self.posterior.log_z_err,
-            best_fit=pd.Series(recorder.theta, index=solver.parameter_names),
-            best_fit_stat=recorder.stat,
+            time=time.perf_counter() - started,
+            posterior_samples=self._posterior_dataframe(self._to_physical(rows)),
+            n_likelihood_evaluations=sum(solver.fold_counts.values()) - folds_before,
+            log_Z=post.log_z, log_Z_err=post.log_z_err,
+            best_fit=pd.Series(self.best_fit, index=solver.parameter_names), best_fit_stat=self.best_fit_stat,
         )
-        self._save()
+        self._save(result)
         if cfg.plot_diagnostics:
-            self.plot_diagnostics()
-        for message in self.posterior.warnings:
-            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            from .plots import plot_diagnostics
+
+            plot_diagnostics(self)
         return result
-
-    def _draw_region(self, n, rng):
-        if self.restriction is None:
-            return latin_hypercube(self.solver.num_parameters, n, rng)
-        return self.restriction.region.sample(
-            n, rng, max_candidates=self.restriction.config.max_candidates,
-        )
-
-    def _time(self, name, started):
-        self.timers[name] = self.timers.get(name, 0.0) + time.perf_counter() - started
 
     def sample(self, n: int) -> np.ndarray:
         """Resample the final weighted posterior, returning physical parameters."""
         if self.posterior is None:
-            raise RuntimeError("Run SIXSA before drawing posterior samples.")
-        rows, _ = resample(self.posterior.u, self.posterior.log_w_smoothed, n, self._sample_rng)
-        return to_physical(self.solver.base_prior, rows)
+            raise RuntimeError("No SIXSA posterior yet: call solver.run() first.")
+        rows, _ = resample(self.posterior.u, self.posterior.log_w_smoothed, n, self.rng)
+        return self._to_physical(rows)
 
-    def weighted_samples(self):
-        """Return physical posterior points and normalised PSIS weights."""
+    def weighted_samples(self) -> tuple[np.ndarray, np.ndarray]:
+        """Physical posterior points and their normalised PSIS weights."""
         if self.posterior is None:
-            raise RuntimeError("Run SIXSA before requesting weighted samples.")
+            raise RuntimeError("No SIXSA posterior yet: call solver.run() first.")
         keep = np.isfinite(self.posterior.log_w_smoothed)
-        return (to_physical(self.solver.base_prior, self.posterior.u[keep]),
-                np.exp(self.posterior.log_w_smoothed[keep]))
+        return self._to_physical(self.posterior.u[keep]), np.exp(self.posterior.log_w_smoothed[keep])
 
-    def _save(self):
-        directory = Path(self.solver.outputfiles_basename) / "sixsa"
-        directory.mkdir(parents=True, exist_ok=True)
+    def _save(self, result: FitResults) -> None:
+        """Write `summary.json` and the weighted posterior draws under the output directory."""
+        self.outdir.mkdir(parents=True, exist_ok=True)
         post = self.posterior
-        summary = dict(exit_reason=self.exit_reason, best_round=self.best_round,
-                       k_hat=post.k_hat, ess=post.ess, n_unique=post.n_unique,
-                       certified=post.certified, log_Z=post.log_z, log_Z_err=post.log_z_err,
-                       log_Z_err_reliable=post.log_z_err_reliable,
-                       n_raw=post.n_raw, shortfall=post.shortfall,
-                       evidence_n_raw=post.evidence_n_raw, evidence_k_hat=post.evidence_k_hat,
-                       fold_counts=self.fold_counts, timers=self.timers,
-                       history=self.history, config=self.config.model_dump(mode="json"))
-        def clean(value):
-            if isinstance(value, dict):
-                return {k: clean(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [clean(v) for v in value]
-            if isinstance(value, np.ndarray):
-                return clean(value.tolist())
-            if isinstance(value, np.generic):
-                return clean(value.item())
-            if isinstance(value, float) and not np.isfinite(value):
-                return None
-            return value
-        (directory / "summary.json").write_text(json.dumps(clean(summary), indent=2))
-        np.savez_compressed(directory / "posterior.npz", u=post.u, cstat=post.cstat,
-                            log_w=post.log_w, log_w_smoothed=post.log_w_smoothed)
+        summary = {
+            "exit_reason": self.exit_reason, "best_round": self.best_round, "time": result.time,
+            "n_likelihood_evaluations": result.n_likelihood_evaluations, "fold_counts": self.solver.fold_counts,
+            "posterior": dict(post.summary(), n_unique=self.n_unique),
+            "rounds": [{k: v for k, v in record.items() if k != "certificate"} for record in self.history],
+            "config": self.config.model_dump(mode="json"),
+        }
+        (self.outdir / "summary.json").write_text(json.dumps(summary, indent=2, default=_jsonable))
+        np.savez_compressed(self.outdir / "posterior.npz", u=post.u, cstat=post.cstat, log_w=post.log_w,
+                            log_w_smoothed=post.log_w_smoothed)
 
-    def plot_diagnostics(self):
-        """Write diagnostic figures; plotting failures do not discard inference."""
-        try:
-            from .plots import plot_diagnostics
-            return plot_diagnostics(self)
-        except Exception as exc:
-            warnings.warn(f"SIXSA diagnostic plotting failed: {exc}", RuntimeWarning, stacklevel=2)
-            return []
+
+def _jsonable(value):
+    """JSON encoder fallback for numpy values."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"{type(value).__name__} is not JSON serialisable")

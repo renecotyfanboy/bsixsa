@@ -1,141 +1,143 @@
-from xspec import Xset, Model, Component, Parameter, AllModels
+"""Helpers around PyXspec: iterate over model parameters, silence XSPEC, count CPUs."""
+
 import os
 import re
-from dataclasses import dataclass
-from typing import Iterator
-from collections.abc import Callable
+from collections.abc import Iterator
 from contextlib import contextmanager
-from time import perf_counter
+from dataclasses import dataclass
+
+from xspec import AllData, AllModels, Component, Model, Parameter, Xset
 
 
 def available_cpu_count() -> int:
-    """CPUs actually available to this process.
-
-    Respects cgroup/cpuset/SLURM affinity on Linux; falls back to the full
-    core count on platforms without ``sched_getaffinity`` (e.g. macOS).
-    """
+    """Number of CPUs available to this process (respects SLURM/cgroup affinity on Linux)."""
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
 
 
-# Components defined more than once (e.g. ``tbabs*(powerlaw + powerlaw)``) are
-# reported by XSPEC as ``powerlaw`` and ``powerlaw_3``: an ``_<int>`` suffix.
-_COMPONENT_INDEX_RE = re.compile(r'.*_\d+$')
+def base_component_name(name: str) -> str:
+    """Strip the ``_<position>`` suffix XSPEC adds to a repeated component.
 
-
-def has_indexed_suffix(name: str) -> bool:
-    """True if a component name ends in an ``_<int>`` index suffix."""
-    return bool(_COMPONENT_INDEX_RE.fullmatch(name))
-
-
-@contextmanager
-def catchtime(desc="Task", print_time=True) -> Callable[[], float]:
-    """Context manager to measure time taken by a task.
-
-    Parameters:
-        desc: Description of the task.
-        print_time: Whether to print the time taken by the task.
-
-    Returns:
-        Callable that returns the time taken by the task in seconds.
+    For example ``powerlaw_3`` becomes ``powerlaw``.
     """
-
-    t1 = t2 = perf_counter()
-    yield lambda: t2 - t1
-    t2 = perf_counter()
-    if print_time:
-        print(f"{desc}: {t2 - t1:.3f} seconds")
+    return re.sub(r"_\d+$", "", name)
 
 
 @dataclass
 class XspecParameter:
-    """Class for keeping track of xspec parameters."""
+    """One parameter of a loaded XSPEC model.
+
+    Attributes:
+        name: Unique name ``<component>_<position>_<parameter>``, prefixed by
+            ``<model>_`` for a named model, e.g. ``TBabs_1_nH`` or
+            ``cluster_bapec_2_kT``. ``<position>`` is the 1-based position of
+            the component in the model expression. These names are the columns
+            of the fit results.
+        model: The PyXspec model (its copy in its first data group, see
+            [`first_model_copy`][bsixsa.convenience.first_model_copy]).
+        component: The PyXspec component.
+        parameter: The PyXspec parameter.
+    """
+
     name: str
     model: Model
     component: Component
     parameter: Parameter
-    absolute_idx: int # Model independent index for thawn parameters
+
+
+def model_data_groups(model_name: str) -> list[int]:
+    """Data groups holding a copy of a loaded model (`''` for the unnamed one), in increasing order.
+
+    XSPEC keeps one copy of a model per data group whose spectra have a
+    response for its source: a background model of the third spectrum only
+    exists in that spectrum's data group. Without data, the only copy is in
+    data group 1.
+    """
+    groups = []
+    for group in range(1, max(AllData.nGroups, 1) + 1):
+        try:
+            AllModels(group, model_name)
+        except Exception:  # PyXspec: "No model object exists for model name ..."
+            continue
+        groups.append(group)
+    return groups
+
+
+def first_model_copy(model_name: str) -> Model:
+    """The copy of a loaded model in its first data group, whose parameters bsixsa fits.
+
+    Its parameter numbers are XSPEC's `<model>:<number>`; the parameters of
+    the copies in later data groups must be frozen or linked.
+
+    Raises:
+        ValueError: If no data group holds a copy of the model.
+    """
+    groups = model_data_groups(model_name)
+    if not groups:
+        raise ValueError(f"No data group holds a copy of the XSPEC model {model_name!r}.")
+    return AllModels(groups[0], model_name)
 
 
 def iter_components(model: Model, additive_only: bool = False) -> Iterator[Component]:
-    """Iterate over components of a given xspec model.
+    """Iterate over the components of an XSPEC model, in expression order.
 
     Parameters:
-        additive_only: If ``True``, yield only additive components as
-            identified by the presence of a ``norm`` parameter.
+        model: A PyXspec model.
+        additive_only: Yield only components with a ``norm`` parameter.
     """
-
     for component_name in model.componentNames:
         component = getattr(model, component_name)
         if additive_only and "norm" not in component.parameterNames:
             continue
         yield component
-def iter_parameters(component: Component) -> Iterator[Parameter]:
-    """Iterate over all parameters of a given xspec model component."""
-
-    for parameter_name in component.parameterNames:
-        yield getattr(component, parameter_name)
 
 
 def iter_all_parameters() -> Iterator[XspecParameter]:
+    """Iterate over every parameter of every loaded model, frozen and linked ones included.
+
+    Each model is read from its first data group (see
+    [`first_model_copy`][bsixsa.convenience.first_model_copy]).
+
+    Yields:
+        One [`XspecParameter`][bsixsa.convenience.XspecParameter] per parameter.
     """
-    Iterate over all possible parameters as defined in the Xspec models.
+    for model_name in AllModels.sources.values():
+        model = first_model_copy(model_name)
+        for position, component in enumerate(iter_components(model), start=1):
+            component_name = f"{base_component_name(component.name)}_{position}"
+            prefix = f"{model_name}_" if model_name else ""
+            for parameter_name in component.parameterNames:
+                parameter = getattr(component, parameter_name)
+                name = f"{prefix}{component_name}_{parameter.name}"
+                yield XspecParameter(name, model, component, parameter)
+
+
+def iter_free_parameters() -> Iterator[XspecParameter]:
+    """Iterate over the free parameters (neither frozen nor linked), i.e. the prior axes.
+
+    Yields:
+        One [`XspecParameter`][bsixsa.convenience.XspecParameter] per free parameter.
     """
-
-    absolute_idx_tracker = -1
-
-    for model_idx, model_name in AllModels.sources.items():
-
-        # Assume a single datagroup is active
-        model = AllModels(1, model_name)
-
-        for component_index, component in enumerate(iter_components(model)):
-
-            component_name = component.name
-
-            # Handle the weird situation where a component is defined multiple times
-            # EG tbabs*(powerlaw + powerlaw) will yield tbabs, powerlaw & powerlaw_3 as component names
-            # We explicitly remove the _index if it is here and reapply it so that every component has an index
-            if has_indexed_suffix(component.name):
-                component_name = component_name.split('_')[0]
-
-            component_name = f"{component_name}_{component_index + 1}"
-
-            for parameter in iter_parameters(component):
-
-                if not parameter.frozen:
-                    absolute_idx_tracker += 1
-                    absolute_idx = absolute_idx_tracker
-
-                else:
-                    absolute_idx = -1
-
-                if model_name == "":
-                    name = f"{component_name}_{parameter.name}"
-                else:
-                    name = f"{model_name}_{component_name}_{parameter.name}"
-
-                yield XspecParameter(name, model, component, parameter, absolute_idx)
-
-
-def iter_thawn_parameters() -> Iterator[XspecParameter]:
-    """
-    Iterate over all thawn parameters as defined in the Xspec models.
-    """
-
     for xspec_parameter in iter_all_parameters():
-        if not (xspec_parameter.parameter.frozen or bool(xspec_parameter.parameter.link)):
+        if not (xspec_parameter.parameter.frozen or xspec_parameter.parameter.link):
             yield xspec_parameter
 
 
-class XSilence(object):
-    """Context for temporarily making xspec quiet."""
+@contextmanager
+def XSilence() -> Iterator[None]:
+    """Silence XSPEC's console and log output inside a ``with`` block.
 
-    def __enter__(self):
-        self.oldchatter = Xset.chatter, Xset.logChatter
-        Xset.chatter, Xset.logChatter = 0, 0
-
-    def __exit__(self, *args):
-        Xset.chatter, Xset.logChatter = self.oldchatter
+    Example:
+        ```python
+        with XSilence():
+            xspec.AllData("spectrum.pha")
+        ```
+    """
+    previous = Xset.chatter, Xset.logChatter
+    Xset.chatter, Xset.logChatter = 0, 0
+    try:
+        yield
+    finally:
+        Xset.chatter, Xset.logChatter = previous

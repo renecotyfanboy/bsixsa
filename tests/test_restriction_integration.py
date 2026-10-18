@@ -36,7 +36,6 @@ from _analytic import AnalyticSolver, AnalyticSpectrum, grid_truth, marginal_cdf
 import bsixsa.backend as backend_package  # noqa: E402
 from bsixsa.backend.abc import Backend  # noqa: E402
 from bsixsa.backend.config import BackendConfig, Nautilus  # noqa: E402
-from bsixsa.exceptions import BoxEdgeWarning  # noqa: E402
 from bsixsa.restriction import HistoryMatching, Restriction  # noqa: E402
 from bsixsa.solver import FitResults  # noqa: E402
 
@@ -121,7 +120,6 @@ class _OracleBackend(Backend):
     by mass and jittered within their cell.
     """
 
-    name = "oracle"
     config_cls = _OracleBoxConfig
 
     def __init__(self, *, solver, config):
@@ -208,7 +206,7 @@ def restricted(tmp_path_factory, spectrum) -> SimpleNamespace:
 
 
 def _box_edge_warnings(caught) -> list[str]:
-    return [str(w.message) for w in caught if issubclass(w.category, BoxEdgeWarning)]
+    return [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +220,6 @@ def test_restrict_keeps_the_posterior_and_writes_its_outputs(restricted, truth, 
     assert isinstance(restriction, Restriction)
     assert solver.restriction is restriction
     assert restriction.config == _small_config()
-    restriction.check_fingerprint(solver.fingerprint())
 
     # Posterior coverage of the region and of its bounding box.
     accepted = restriction.region.accepts(posterior_u)
@@ -247,7 +244,6 @@ def test_restrict_keeps_the_posterior_and_writes_its_outputs(restricted, truth, 
         assert "box_lo" not in saved.files
     history = json.loads((outdir / "history.json").read_text())
     assert history["n_simulations"] == restriction.n_simulations
-    assert history["fingerprint"] == solver.fingerprint()
     assert len(history["history"]) == len(restriction.history)
     assert not list(outdir.glob("*.pdf"))
 

@@ -13,19 +13,12 @@ import pytest
 
 sys.modules.setdefault("xspec", MagicMock())
 
-from scipy.stats import qmc
-
-from bsixsa import _cube
-from bsixsa._cube import (
-    child_rng,
-    child_seed,
+from bsixsa._cube import (  # noqa: E402
     in_cube,
     latin_hypercube,
-    make_seed_sequence,
-    to_cube,
     to_physical,
 )
-from bsixsa.priors import MultipleIndependent, loguniform, norm, uniform
+from bsixsa.priors import MultipleIndependent, loguniform, norm, uniform  # noqa: E402
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "bsixsa"
 
@@ -93,7 +86,7 @@ def test_to_physical_maps_non_finite_coordinates_to_nan():
     assert not np.any(in_cube(u[:2]))
 
 
-# ------------------------------------------------------- to_physical / to_cube
+# ----------------------------------------------------------------- to_physical
 
 
 def test_to_physical_clips_u_outside_the_cube_to_the_support():
@@ -135,16 +128,6 @@ def test_to_physical_clips_a_ppf_that_leaves_the_support():
     np.testing.assert_allclose(theta, [[0.0, 2.0], [1.0, 3.0], [0.5, 2.5]])
 
 
-def test_to_physical_falls_back_to_dist_support_without_bounds():
-    dists = [uniform(-1.0, 1.0)]
-    prior = SimpleNamespace(
-        dists=dists,
-        from_unit_cube=lambda u: 3.0 * u - 1.5,
-    )
-    theta = to_physical(prior, [[0.0], [1.0]])
-    np.testing.assert_allclose(theta, [[-1.0], [1.0]])
-
-
 def test_to_physical_casts_float32_input_to_float64():
     prior = _example_prior()
     u = np.full((2, 3), 0.25, dtype=np.float32)
@@ -158,25 +141,17 @@ def test_to_physical_accepts_one_dimensional_input_and_checks_width():
         to_physical(prior, [[0.5, 0.5]])
 
 
-def test_to_cube_round_trips_to_physical():
+def test_to_physical_round_trips_with_to_unit_cube():
     prior = _example_prior()
     rng = np.random.default_rng(0)
     u = rng.uniform(0.01, 0.99, size=(512, prior.ndim))
 
     theta = to_physical(prior, u)
-    u_back = to_cube(prior, theta)
+    u_back = prior.to_unit_cube(theta)
 
     assert u_back.dtype == np.float64 and u_back.shape == u.shape
     np.testing.assert_allclose(u_back, u, rtol=0, atol=1e-9)
     np.testing.assert_allclose(to_physical(prior, u_back), theta, rtol=1e-9, atol=0)
-
-
-def test_to_cube_is_clipped_to_the_unit_cube():
-    prior = _example_prior()
-    theta = np.array([[-10.0, 1e-9, -50.0], [10.0, 1.0, 50.0]])
-    u = to_cube(prior, theta)
-    np.testing.assert_array_equal(u, [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
-    assert in_cube(u).all()
 
 
 # ------------------------------------------------------------- latin_hypercube
@@ -201,22 +176,6 @@ def test_latin_hypercube_is_deterministic_for_a_seed():
     assert not np.array_equal(a, c)
 
 
-def test_latin_hypercube_falls_back_to_legacy_seed_keyword(monkeypatch):
-    real = qmc.LatinHypercube
-    calls = []
-
-    def legacy(d, *, seed=None):
-        calls.append(seed)
-        return real(d, rng=seed)
-
-    monkeypatch.setattr(_cube.qmc, "LatinHypercube", legacy)
-    points = latin_hypercube(2, 16, np.random.default_rng(5))
-    monkeypatch.undo()
-
-    assert len(calls) == 1 and isinstance(calls[0], np.random.Generator)
-    np.testing.assert_array_equal(points, latin_hypercube(2, 16, np.random.default_rng(5)))
-
-
 def test_latin_hypercube_rejects_empty_designs():
     with pytest.raises(ValueError):
         latin_hypercube(0, 10, np.random.default_rng(0))
@@ -224,102 +183,13 @@ def test_latin_hypercube_rejects_empty_designs():
         latin_hypercube(2, 0, np.random.default_rng(0))
 
 
-# ------------------------------------------------------------- seed sequences
 
 
-def test_make_seed_sequence_normalises_inputs():
-    seq = np.random.SeedSequence(42)
-    assert make_seed_sequence(seq) is seq
-    assert make_seed_sequence(42).entropy == 42
-    assert make_seed_sequence(np.int64(42)).entropy == 42
-    assert make_seed_sequence(None).entropy != make_seed_sequence(None).entropy
-    with pytest.raises(TypeError):
-        make_seed_sequence(1.5)
-    with pytest.raises(TypeError):
-        make_seed_sequence("42")
-
-
-def test_child_rng_is_deterministic():
-    a = child_rng(make_seed_sequence(7), 1, 2, 3).random(16)
-    b = child_rng(make_seed_sequence(7), 1, 2, 3).random(16)
-    np.testing.assert_array_equal(a, b)
-
-
-def test_child_rng_gives_independent_streams_for_different_keys():
-    seq = make_seed_sequence(7)
-    draws = {
-        keys: child_rng(seq, *keys).standard_normal(20_000)
-        for keys in [(0,), (1,), (0, 1), (1, 0), ()]
-    }
-    streams = list(draws.values())
-    for i in range(len(streams)):
-        for j in range(i + 1, len(streams)):
-            assert not np.array_equal(streams[i], streams[j])
-            assert abs(np.corrcoef(streams[i], streams[j])[0, 1]) < 0.05
-
-
-def test_child_rng_depends_on_the_parent_seed_and_spawn_key():
-    a = child_rng(make_seed_sequence(7), 0).random(8)
-    b = child_rng(make_seed_sequence(8), 0).random(8)
-    spawned = make_seed_sequence(7).spawn(2)[1]
-    c = child_rng(spawned, 0).random(8)
-    assert not np.array_equal(a, b)
-    assert not np.array_equal(a, c)
-    # The keys extend the spawn key, so (1, 0) under the root addresses the same stream.
-    np.testing.assert_array_equal(c, child_rng(make_seed_sequence(7), 1, 0).random(8))
-
-
-def test_child_keys_must_be_32_bit_integers():
-    """Regression: SeedSequence splits a key >= 2**32 into words, aliasing (2**32,) with (0, 1)."""
-    seq = make_seed_sequence(7)
-    for function in (child_rng, child_seed):
-        with pytest.raises(ValueError, match=r"2\*\*32"):
-            function(seq, 2**32)
-        with pytest.raises(ValueError, match=r"2\*\*32"):
-            function(seq, 0, -1)
-        with pytest.raises(TypeError, match="integers"):
-            function(seq, 1.5)
-    top = 2**32 - 1
-    assert child_seed(seq, np.uint32(top)) == child_seed(seq, top)
-    assert child_seed(seq, top) != child_seed(seq, 0, 1)
-
-
-def test_child_rng_does_not_mutate_the_parent():
-    seq = make_seed_sequence(7)
-    reference = make_seed_sequence(7)
-
-    for k in range(5):
-        child_rng(seq, k)
-        child_seed(seq, k)
-
-    assert seq.n_children_spawned == 0
-    assert seq.spawn_key == reference.spawn_key
-    # Order of calls does not matter either.
-    np.testing.assert_array_equal(child_rng(seq, 3).random(4), child_rng(reference, 3).random(4))
-    np.testing.assert_array_equal(
-        seq.spawn(1)[0].generate_state(4), reference.spawn(1)[0].generate_state(4)
-    )
-
-
-def test_child_seed_is_a_deterministic_32_bit_int():
-    seq = make_seed_sequence(123)
-    seeds = [child_seed(seq, k) for k in range(200)]
-
-    assert all(type(s) is int for s in seeds)
-    assert all(0 <= s < 2**32 for s in seeds)
-    assert len(set(seeds)) == len(seeds)
-    assert seeds == [child_seed(make_seed_sequence(123), k) for k in range(200)]
-    assert child_seed(seq, 0, 1) != child_seed(seq, 1, 0)
-
-
-# ------------------------------------------------------------------- imports
-
-
-def test_cube_and_exceptions_import_without_xspec_or_torch():
+def test_cube_utilities_import_without_xspec_or_torch():
     """Loaded by file path, so the package `__init__` (which imports XSPEC) is bypassed."""
     code = f"""
 import importlib.util, sys
-for name in ("_cube", "exceptions", "_torch_utils"):
+for name in ("_cube", "_torch_utils"):
     spec = importlib.util.spec_from_file_location("m_" + name, {str(SRC_DIR)!r} + "/" + name + ".py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -328,11 +198,3 @@ assert not bad, bad
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-
-
-def test_exceptions_hierarchy():
-    from bsixsa.exceptions import BoxEdgeWarning, FoldError, TruncationBudgetError
-
-    assert issubclass(BoxEdgeWarning, UserWarning)
-    assert issubclass(FoldError, RuntimeError)
-    assert issubclass(TruncationBudgetError, RuntimeError)

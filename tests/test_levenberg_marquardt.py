@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import warnings
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -9,15 +10,15 @@ import pytest
 
 sys.modules.setdefault("xspec", MagicMock())
 
-from bsixsa.backend.config import LevenbergMarquardt
-from bsixsa.backend.levenberg_marquart import (
+from bsixsa.backend.config import LevenbergMarquardt  # noqa: E402
+from bsixsa.backend.levenberg_marquardt import (  # noqa: E402
     LevenbergMarquardtBackend,
     _delta_method_to_unconstrained,
     _log_prior_residuals,
     _poisson_deviance_residuals,
     covariance_from_jacobian,
 )
-from bsixsa.priors import MultipleIndependent, loguniform, norm, uniform
+from bsixsa.priors import MultipleIndependent, loguniform, norm, uniform  # noqa: E402
 
 
 # -----------------------------------------------------------------------------
@@ -30,7 +31,7 @@ def _make_stub_solver(prior, *, output_dir, observed=None, simulate=None, n_bins
     solver = MagicMock()
     solver.num_parameters = n_params
     solver.parameter_names = [f"p{i}" for i in range(n_params)]
-    solver.observed_spectrum = (
+    solver.observed_counts = (
         observed if observed is not None else np.full(n_bins, 5.0)
     )
     solver.outputfiles_basename = str(output_dir)
@@ -59,7 +60,7 @@ def _make_backend(prior, tmp_path, *, simulate=None, observed=None, n_bins=3, **
 
 
 # -----------------------------------------------------------------------------
-# Existing tests (kept)
+# Poisson deviance residuals
 # -----------------------------------------------------------------------------
 
 def test_poisson_deviance_residuals_match_closed_form_for_positive_bins():
@@ -95,7 +96,7 @@ def test_poisson_deviance_residuals_stay_finite_for_zero_model_counts():
 
 
 # -----------------------------------------------------------------------------
-# New tests
+# Covariance, logit-of-CDF map and fit results
 # -----------------------------------------------------------------------------
 
 def test_covariance_no_chi2_rescale():
@@ -149,7 +150,7 @@ def test_run_uses_trf_with_bounds_when_reparametrise_false(tmp_path):
     fake_result.jac = np.eye(2)
 
     with patch(
-        "bsixsa.backend.levenberg_marquart.least_squares",
+        "bsixsa.backend.levenberg_marquardt.least_squares",
         return_value=fake_result,
     ) as mock_ls:
         backend.run()
@@ -170,7 +171,7 @@ def test_run_uses_trf_with_bounds_when_reparametrise_false(tmp_path):
 
 
 def test_run_uses_lm_without_bounds_when_reparametrise_true(tmp_path):
-    """Legacy mode forwards method='lm' and no bounds (lmder cannot handle them)."""
+    """reparametrise=True forwards method='lm' and no bounds (lmder cannot handle them)."""
     prior = MultipleIndependent([uniform(0.0, 1.0), uniform(-2.0, 5.0)])
     backend = _make_backend(prior, tmp_path, reparametrise=True)
 
@@ -179,7 +180,7 @@ def test_run_uses_lm_without_bounds_when_reparametrise_true(tmp_path):
     fake_result.jac = np.eye(2)
 
     with patch(
-        "bsixsa.backend.levenberg_marquart.least_squares",
+        "bsixsa.backend.levenberg_marquardt.least_squares",
         return_value=fake_result,
     ) as mock_ls:
         backend.run()
@@ -213,7 +214,7 @@ def test_fit_results_expose_best_fit_and_stat(tmp_path):
     fake_result.jac = np.eye(2)
 
     with patch(
-        "bsixsa.backend.levenberg_marquart.least_squares",
+        "bsixsa.backend.levenberg_marquardt.least_squares",
         return_value=fake_result,
     ):
         fit_result = backend.run()
@@ -373,7 +374,7 @@ def test_best_fit_stat_includes_xspec_bayes_term(tmp_path):
     fake_result.jac = np.eye(1)
 
     with patch(
-        "bsixsa.backend.levenberg_marquart.least_squares",
+        "bsixsa.backend.levenberg_marquardt.least_squares",
         return_value=fake_result,
     ):
         fit_result = backend.run()
@@ -414,14 +415,196 @@ def test_physical_mode_samples_stay_in_prior_support(tmp_path):
     fake_result.cost = 0.0
 
     with patch(
-        "bsixsa.backend.levenberg_marquart.least_squares",
+        "bsixsa.backend.levenberg_marquardt.least_squares",
         return_value=fake_result,
-    ):
+    ), pytest.warns(UserWarning, match="at its prior bound") as caught:
         fit_result = backend.run()
 
+    # An uncertainty this much wider than the distance to the bounds makes
+    # the draws pile up on them, which run() reports for both parameters.
+    warned = {str(w.message).split()[0] for w in caught if "prior bound" in str(w.message)}
+    assert warned == {"p0", "p1"}
     samples = fit_result.posterior_samples.values
     assert samples.shape[0] == 10_000
     # Every sample sits inside the prior support — the unconstrained-space
     # Gaussian + sigmoid + inverse-CDF cannot escape it by construction.
     assert np.all(samples[:, 0] >= 0.0) and np.all(samples[:, 0] <= 1.0)
     assert np.all(samples[:, 1] >= -2.0) and np.all(samples[:, 1] <= 5.0)
+
+
+def test_best_fit_on_an_upper_prior_bound_warns_and_samples_stay_inside(tmp_path):
+    """Regression: a CDF of exactly 1 used to map to u = +inf and crash in the SVD."""
+    prior = MultipleIndependent([uniform(0.0, 1.0), loguniform(0.1, 10.0)])
+    backend = _make_backend(prior, tmp_path, reparametrise=False)
+
+    fake_result = MagicMock()
+    fake_result.x = np.array([1.0, 5.0])  # p0 sits on its upper bound
+    fake_result.jac = np.eye(2)
+
+    with patch(
+        "bsixsa.backend.levenberg_marquardt.least_squares",
+        return_value=fake_result,
+    ), pytest.warns(UserWarning, match="p0 is at its prior bound") as caught:
+        fit_result = backend.run()
+
+    assert not [w for w in caught if "p1" in str(w.message)]
+    assert np.all(np.isfinite(backend.best_fit_unconstrained))
+    samples = fit_result.posterior_samples.to_numpy()
+    assert np.all((samples[:, 0] >= 0.0) & (samples[:, 0] <= 1.0))
+    assert np.all((samples[:, 1] >= 0.1) & (samples[:, 1] <= 10.0))
+
+
+def test_best_fit_just_inside_a_prior_bound_warns(tmp_path):
+    """trf stops a few ulp inside a bound (here 1 - 5.6e-16, above the eps clip), so
+    the best fit alone does not reveal the pegged parameter: its draws do."""
+    prior = MultipleIndependent([uniform(0.0, 1.0), loguniform(0.1, 10.0)])
+    backend = _make_backend(prior, tmp_path, reparametrise=False)
+
+    fake_result = MagicMock()
+    fake_result.x = np.array([1.0 - 5.551115123125783e-16, 5.0])
+    fake_result.jac = 10.0 * np.eye(2)
+
+    with patch(
+        "bsixsa.backend.levenberg_marquardt.least_squares",
+        return_value=fake_result,
+    ), pytest.warns(UserWarning, match="p0 is at its prior bound") as caught:
+        backend.run()
+
+    assert not [w for w in caught if "p1" in str(w.message)]
+
+
+def test_interior_best_fit_does_not_warn(tmp_path):
+    prior = MultipleIndependent([uniform(0.0, 1.0), loguniform(0.1, 10.0)])
+    backend = _make_backend(prior, tmp_path, reparametrise=False)
+
+    fake_result = MagicMock()
+    fake_result.x = np.array([0.02, 5.0])  # near p0's lower bound, but well constrained
+    fake_result.jac = 100.0 * np.eye(2)
+
+    with patch(
+        "bsixsa.backend.levenberg_marquardt.least_squares",
+        return_value=fake_result,
+    ), warnings.catch_warnings():
+        warnings.simplefilter("error")
+        backend.run()
+
+
+def test_best_fit_far_in_a_gaussian_prior_tail_is_not_a_prior_bound(tmp_path):
+    """Regression: a best fit ~9 prior sigmas below a Gaussian prior's mean (CDF ~6e-20,
+    far from the truncation bound 1.0) was clipped to the eps logit, so the draws
+    collapsed onto one wrong point and run() warned about a prior bound."""
+    prior = MultipleIndependent([norm(loc=2.75, scale=0.1, low=1.0, high=4.0), loguniform(0.1, 10.0)])
+    backend = _make_backend(prior, tmp_path, reparametrise=False)
+
+    fake_result = MagicMock()
+    fake_result.x = np.array([1.8436, 1.0])
+    fake_result.jac = 50.0 * np.eye(2)  # physical sigma 0.02
+
+    with patch(
+        "bsixsa.backend.levenberg_marquardt.least_squares",
+        return_value=fake_result,
+    ), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fit_result = backend.run()
+
+    assert not [w for w in caught if "prior bound" in str(w.message)]
+    assert backend.best_fit_unconstrained[0] < -40
+    draws = fit_result.posterior_samples["p0"].to_numpy()
+    assert draws.mean() == pytest.approx(1.8436, abs=0.005)
+    assert 0.01 < draws.std() < 0.04
+
+
+def test_reparametrised_fit_starts_exactly_at_the_prior_median(tmp_path):
+    """Without a start, `lm` starts at u = 0 exactly; a given start is mapped to its logit."""
+    prior = MultipleIndependent([uniform(1.2, 2.9), loguniform(0.1, 10.0)])
+    fake_result = MagicMock()
+    fake_result.x = np.zeros(2)
+    fake_result.jac = np.eye(2)
+
+    backend = _make_backend(prior, tmp_path / "median", reparametrise=True)
+    with patch("bsixsa.backend.levenberg_marquardt.least_squares", return_value=fake_result) as mock_ls:
+        backend.run()
+    np.testing.assert_array_equal(mock_ls.call_args.args[1], [0.0, 0.0])
+
+    start = np.array([2.0, 3.0])
+    backend = _make_backend(prior, tmp_path / "start", reparametrise=True, x0_physical=start)
+    with patch("bsixsa.backend.levenberg_marquardt.least_squares", return_value=fake_result) as mock_ls:
+        backend.run()
+    np.testing.assert_array_equal(mock_ls.call_args.args[1], backend._physical_to_unconstrained(start))
+
+
+def test_reparametrised_fit_leaves_the_prior_median(tmp_path):
+    """Regression: with a uniform(1.2, 2.9) prior, logit(F(median)) is -1.1e-16, and `lm`
+    stopped at the prior median after two evaluations (C-stat 195 instead of 52.4)."""
+    from _analytic import AnalyticSolver, AnalyticSpectrum
+
+    class Spectrum(AnalyticSpectrum):
+        def prior_list(self):
+            return [uniform(1.2, 2.9), loguniform(0.1, 10.0)]
+
+    fits = {}
+    for reparametrise in (False, True):
+        solver = AnalyticSolver(
+            Spectrum(d=2),
+            backend=LevenbergMarquardt(trace=False, reparametrise=reparametrise),
+            outputfiles_basename=tmp_path / f"reparametrise_{reparametrise}",
+            restrict_prior=False,
+        )
+        fits[reparametrise] = solver.run()
+
+    trf, lm = fits[False], fits[True]
+    assert trf.best_fit_stat == pytest.approx(52.41, abs=0.05)
+    assert lm.best_fit_stat == pytest.approx(trf.best_fit_stat, abs=0.01)
+    np.testing.assert_allclose(lm.best_fit.to_numpy(), trf.best_fit.to_numpy(), rtol=1e-3)
+
+
+def test_physical_to_unconstrained_is_finite_on_both_prior_bounds(tmp_path):
+    prior = MultipleIndependent([uniform(0.0, 1.0), loguniform(0.1, 10.0)])
+    backend = _make_backend(prior, tmp_path)
+
+    lower = backend._physical_to_unconstrained(np.array([0.0, 0.1]))
+    upper = backend._physical_to_unconstrained(np.array([1.0, 10.0]))
+
+    assert np.all(np.isfinite(lower)) and np.all(lower < -30)
+    assert np.all(np.isfinite(upper)) and np.all(upper > 30)
+    cov = _delta_method_to_unconstrained(prior, np.array([1.0, 10.0]), np.eye(2))
+    assert np.all(np.isfinite(cov))
+
+
+def test_residuals_use_the_rounded_observed_counts(tmp_path):
+    """The deviance residuals read `solver.observed_counts`, not the float32 `observed_spectrum`."""
+    prior = MultipleIndependent([uniform(0.0, 1.0)])
+    observed_counts = np.array([3.0, 0.0, 7.0])
+    model_counts = np.array([[2.0, 1.0, 9.0]])
+    simulate = MagicMock(return_value={"total_model_counts": model_counts, "cstat": np.zeros(1)})
+    backend = _make_backend(prior, tmp_path, simulate=simulate, observed=observed_counts)
+    backend.solver.observed_spectrum = np.array([3.1, 0.2, 6.9], dtype=np.float32)
+    seen = {}
+
+    def fake_least_squares(fun, x0, **kwargs):
+        seen["residuals"] = fun(x0)
+        result = MagicMock()
+        result.x = np.asarray(x0, dtype=float)
+        result.jac = np.eye(1)
+        return result
+
+    with patch("bsixsa.backend.levenberg_marquardt.least_squares", side_effect=fake_least_squares):
+        backend.run()
+
+    expected = _poisson_deviance_residuals(observed_counts, model_counts.ravel())
+    np.testing.assert_allclose(seen["residuals"][:3], expected)
+
+
+def test_likelihood_evaluations_are_counted_without_trace(tmp_path):
+    """Regression: with trace=False the backend reported 0 evaluations."""
+    from _analytic import AnalyticSolver, AnalyticSpectrum
+
+    solver = AnalyticSolver(
+        AnalyticSpectrum(d=2),
+        backend=LevenbergMarquardt(trace=False),
+        outputfiles_basename=tmp_path / "run",
+        restrict_prior=False,
+    )
+    result = solver.run()
+
+    assert result.n_likelihood_evaluations == solver.fold_counts["backend"] > 0

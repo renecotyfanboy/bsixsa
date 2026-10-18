@@ -15,7 +15,7 @@ from scipy.stats import chi2
 from bsixsa.restriction.rules import (
     pad_box,
     posterior_span,
-    recall_override,
+    recall_check,
     stop_reason,
     threshold_rule,
 )
@@ -47,7 +47,7 @@ _PROBE = np.linspace(0.0, 1000.0, 1001)  # quantile q of the probe is 1000 * q
 
 
 @pytest.mark.parametrize(
-    ("rmse", "mass_floor", "prev", "expected", "wall"),
+    ("rmse", "min_sampleable_mass", "prev", "expected", "wall"),
     [
         # request binds: safety 110 + 3 = 113, cost 10
         (1.0, 0.01, None, 130.0, "request"),
@@ -62,7 +62,7 @@ _PROBE = np.linspace(0.0, 1000.0, 1001)  # quantile q of the probe is 1000 * q
         (1.0, 0.01, 500.0, 130.0, "request"),
     ],
 )
-def test_threshold_rule_table(rmse, mass_floor, prev, expected, wall):
+def test_threshold_rule_table(rmse, min_sampleable_mass, prev, expected, wall):
     thr, got_wall = threshold_rule(
         best=100.0,
         span=10.0,
@@ -71,7 +71,7 @@ def test_threshold_rule_table(rmse, mass_floor, prev, expected, wall):
         min_margin_sigma=3.0,
         prev_threshold=prev,
         pred_probe=_PROBE,
-        mass_floor=mass_floor,
+        min_sampleable_mass=min_sampleable_mass,
     )
     assert thr == pytest.approx(expected)
     assert got_wall == wall
@@ -86,13 +86,13 @@ def test_threshold_rule_reports_the_request_on_a_tie():
         min_margin_sigma=2.0,  # safety 110 + 20 == request 130
         prev_threshold=None,
         pred_probe=_PROBE,
-        mass_floor=0.01,
+        min_sampleable_mass=0.01,
     )
     assert (thr, wall) == (130.0, "request")
 
 
-@pytest.mark.parametrize(("mass_floor", "quantile"), [(0.0, 1e-9), (-1.0, 1e-9), (5.0, 1.0)])
-def test_threshold_rule_clips_the_mass_floor(mass_floor, quantile):
+@pytest.mark.parametrize(("min_sampleable_mass", "quantile"), [(0.0, 1e-9), (-1.0, 1e-9), (5.0, 1.0)])
+def test_threshold_rule_clips_the_min_sampleable_mass(min_sampleable_mass, quantile):
     probe = np.linspace(0.0, 1e6, 10_001)
     thr, wall = threshold_rule(
         best=0.0,
@@ -102,7 +102,7 @@ def test_threshold_rule_clips_the_mass_floor(mass_floor, quantile):
         min_margin_sigma=0.0,
         prev_threshold=None,
         pred_probe=probe,
-        mass_floor=mass_floor,
+        min_sampleable_mass=min_sampleable_mass,
     )
     assert thr == pytest.approx(max(1.0, np.quantile(probe, quantile)))
     assert wall == ("cost" if quantile == 1.0 else "request")
@@ -118,11 +118,11 @@ def test_threshold_rule_refuses_an_empty_probe():
             min_margin_sigma=3.0,
             prev_threshold=None,
             pred_probe=np.array([]),
-            mass_floor=1e-3,
+            min_sampleable_mass=1e-3,
         )
 
 
-# ------------------------------------------------------------ recall_override
+# ------------------------------------------------------------ recall_check
 
 
 def _validation_set(rng, n=400, best=100.0, span=10.0, noise=0.5):
@@ -131,10 +131,10 @@ def _validation_set(rng, n=400, best=100.0, span=10.0, noise=0.5):
     return pred, cstat
 
 
-def test_recall_override_does_nothing_when_recall_is_perfect():
+def test_recall_check_does_nothing_when_recall_is_perfect():
     rng = np.random.default_rng(0)
     pred, cstat = _validation_set(rng, noise=0.0)
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=0.5
     )
     assert not triggered
@@ -145,13 +145,13 @@ def test_recall_override_does_nothing_when_recall_is_perfect():
     assert info["threshold_after"] == 130.0
 
 
-def test_recall_override_widens_on_a_planted_core_miss():
+def test_recall_check_widens_on_a_planted_core_miss():
     rng = np.random.default_rng(1)
     pred, cstat = _validation_set(rng, noise=0.0)
     core = np.flatnonzero(cstat <= 120.0)
     pred[core[0]] = 400.0  # a core point the surrogate predicts far outside
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=2.0
     )
 
@@ -163,7 +163,7 @@ def test_recall_override_widens_on_a_planted_core_miss():
     assert info["threshold_after"] == thr
 
 
-def test_recall_override_widens_on_a_low_recall_below_threshold():
+def test_recall_check_widens_on_a_low_recall_below_threshold():
     rng = np.random.default_rng(2)
     cstat = 100.0 + rng.uniform(0.0, 200.0, 2000)
     pred = cstat.copy()
@@ -172,7 +172,7 @@ def test_recall_override_widens_on_a_low_recall_below_threshold():
     miss = band[: max(1, int(0.3 * band.size))]
     pred[miss] = 135.0
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=1.0
     )
 
@@ -187,14 +187,14 @@ def test_recall_override_widens_on_a_low_recall_below_threshold():
 
 
 @pytest.mark.parametrize("seed", range(20))
-def test_recall_override_never_lowers_the_threshold(seed):
+def test_recall_check_never_lowers_the_threshold(seed):
     rng = np.random.default_rng(seed)
     n = int(rng.integers(5, 300))
     cstat = 100.0 + rng.exponential(30.0, n)
     pred = cstat + rng.normal(0.0, rng.uniform(0.0, 40.0), n)
     threshold = float(100.0 + rng.uniform(0.0, 80.0))
 
-    thr, triggered, _ = recall_override(
+    thr, triggered, _ = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=threshold, rmse_cstat=0.0
     )
 
@@ -203,11 +203,11 @@ def test_recall_override_never_lowers_the_threshold(seed):
         assert thr == threshold
 
 
-def test_recall_override_is_skipped_with_fewer_than_five_core_points():
+def test_recall_check_is_skipped_with_fewer_than_five_core_points():
     cstat = np.array([101.0, 105.0, 110.0, 115.0, 500.0, 600.0])  # 4 points <= 120
     pred = np.array([900.0, 900.0, 900.0, 900.0, 500.0, 600.0])  # all core points missed
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=1.0
     )
 
@@ -215,13 +215,13 @@ def test_recall_override_is_skipped_with_fewer_than_five_core_points():
     assert info["skipped"] is True
     assert (info["n_core"], info["n_threshold"]) == (4, 4)
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=1.0, min_core=4
     )
     assert triggered and thr > 130.0
 
 
-def test_recall_override_core_stops_three_rmse_below_a_low_request():
+def test_recall_check_core_stops_three_rmse_below_a_low_request():
     # target_spans = 1: threshold = best + span + 3 * rmse = 113. A perfect
     # surrogate predicts the points in (113, 120] above it, rightly: the core
     # C <= best + 2 * span would fail them, forcing ~2 spans whatever was asked.
@@ -229,7 +229,7 @@ def test_recall_override_core_stops_three_rmse_below_a_low_request():
     cstat = 100.0 + rng.uniform(0.0, 40.0, 2000)
     pred = cstat.copy()
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=113.0, rmse_cstat=1.0
     )
 
@@ -238,13 +238,13 @@ def test_recall_override_core_stops_three_rmse_below_a_low_request():
     assert info["recall_core"] == 1.0 and info["recall_threshold"] == 1.0
 
 
-def test_recall_override_core_always_holds_the_posterior_span():
+def test_recall_check_core_always_holds_the_posterior_span():
     # A threshold below best + span + 3 * rmse (e.g. clamped): the core never
     # shrinks below best + span, so a posterior point cut by it still widens.
     cstat = np.array([101.0, 102.0, 103.0, 104.0, 105.0, 109.0, 150.0])
     pred = np.array([101.0, 102.0, 103.0, 104.0, 105.0, 111.0, 150.0])
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=110.0, rmse_cstat=2.0
     )
 
@@ -252,14 +252,14 @@ def test_recall_override_core_always_holds_the_posterior_span():
     assert info["core_top"] == pytest.approx(110.0) and info["recall_core"] < 1.0
 
 
-def test_recall_override_threshold_test_runs_without_enough_core_points():
+def test_recall_check_threshold_test_runs_without_enough_core_points():
     # 3 core points (C <= 120), but 20 points below the threshold 130 with 2
     # of them predicted above it: the 99 % test must still run and widen.
     cstat = np.concatenate([[101.0, 110.0, 119.0], np.linspace(121.0, 129.0, 17), [300.0, 400.0]])
     pred = cstat.copy()
     pred[[5, 9]] = [131.0, 133.0]
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred, cstat_val=cstat, best=100.0, span=10.0, threshold=130.0, rmse_cstat=0.1
     )
 
@@ -270,7 +270,7 @@ def test_recall_override_threshold_test_runs_without_enough_core_points():
 
 
 @pytest.mark.parametrize("n", [7, 20, 60, 99, 100, 101, 250, 1000])
-def test_recall_override_restores_99_percent_recall_for_any_count(n):
+def test_recall_check_restores_99_percent_recall_for_any_count(n):
     # n points below the threshold, the highest 2 % (at least 1) predicted
     # above it: the widened threshold must recall at least 99 % of them.
     rng = np.random.default_rng(n)
@@ -281,7 +281,7 @@ def test_recall_override_restores_99_percent_recall_for_any_count(n):
     core = np.array([101.0, 102.0, 103.0, 104.0, 105.0])
     pred_all, cstat_all = np.concatenate([core, pred]), np.concatenate([core, cstat])
 
-    thr, triggered, info = recall_override(
+    thr, triggered, info = recall_check(
         pred_val=pred_all, cstat_val=cstat_all, best=100.0, span=10.0, threshold=130.0, rmse_cstat=0.1
     )
 
@@ -290,9 +290,9 @@ def test_recall_override_restores_99_percent_recall_for_any_count(n):
     assert np.mean(pred_all[below] <= thr) >= 0.99
 
 
-def test_recall_override_refuses_mismatched_lengths():
+def test_recall_check_refuses_mismatched_lengths():
     with pytest.raises(ValueError, match="same length"):
-        recall_override(
+        recall_check(
             pred_val=np.zeros(3), cstat_val=np.zeros(4), best=0.0, span=1.0, threshold=1.0, rmse_cstat=0.0
         )
 

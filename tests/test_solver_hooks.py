@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import os
 from types import SimpleNamespace
 from typing import ClassVar
@@ -13,7 +14,8 @@ import pytest
 from _analytic import AnalyticSolver, AnalyticSpectrum
 
 import bsixsa.solver as solver_module
-from bsixsa.backend.config import BackendConfig
+import bsixsa.xspec as xspec_module
+from bsixsa.backend.config import BackendConfig, Nessai
 from bsixsa.priors import MultipleIndependent, loguniform, uniform
 from bsixsa.restriction import HistoryMatching
 from bsixsa.solver import Solver
@@ -57,9 +59,8 @@ def _prior_draws(solver, n, seed=0):
 
 
 def _bare_solver():
-    """A `Solver` built without `__init__`, as the existing test fixtures do."""
-    with patch.object(Solver, "__init__", lambda self, *args, **kwargs: None):
-        return Solver.__new__(Solver)
+    """A `Solver` built without `__init__` or `_setup`: only what a test sets exists."""
+    return Solver.__new__(Solver)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,8 @@ def test_analytic_solver_builds(tmp_path):
 
     assert solver.num_parameters == 2
     assert solver.parameter_names == ["Gamma", "norm"]
+    assert solver.parameter_indices == [1, 2] and solver.indexes is solver.parameter_indices
+    assert solver.model_names == ["analytic"] * 2 and solver.model_indexes is solver.model_names
     assert solver.n_bins == 64
     assert solver.backend_name == "dummy"
     assert solver.base_prior is solver.prior
@@ -80,14 +83,16 @@ def test_analytic_solver_builds(tmp_path):
     assert solver.restriction is None
     # `True` resolves to a default history-matching configuration.
     assert solver.restriction_config == HistoryMatching()
-    assert solver._restrict_prior_arg is True
+    assert solver.fit_result is None and solver.posterior_samples is None
     assert solver.pool is None and solver._pool_depth == 0
     assert solver._n_jobs == 1
     assert os.path.isdir(solver.outputfiles_basename)
     assert solver.outputfiles_basename.endswith(os.sep)
     assert solver.observed_counts.dtype == np.float64
-    assert solver.observed_spectrum.dtype == np.float32
     np.testing.assert_array_equal(solver.observed_counts, solver.spectrum.observed)
+    # `observed_spectrum` is the old name of the same exact counts.
+    assert solver.observed_spectrum.dtype == np.float64
+    np.testing.assert_array_equal(solver.observed_spectrum, solver.observed_counts)
 
 
 def test_setup_validates_backend_after_full_initialisation(tmp_path):
@@ -101,17 +106,16 @@ def test_setup_validates_backend_after_full_initialisation(tmp_path):
     }
 
 
-def test_setup_is_pure_and_does_not_touch_prior_dists(tmp_path):
-    # A prior without `dists`: the finite-support check of a requested
-    # restriction must not probe it.
-    prior = SimpleNamespace(ndim=2, bounds=[(0.0, 1.0), (1.0, 2.0)])
+def test_setup_initialises_every_attribute_without_xspec(tmp_path):
+    prior = MultipleIndependent([uniform(0.0, 1.0), uniform(1.0, 2.0)])
     sentinel = HistoryMatching(n_waves=2)
     solver = _bare_solver()
 
     solver._setup(
         prior=prior,
-        indexes=[1, 2],
-        model_indexes=["m", "m"],
+        parameter_indices=[1, 2],
+        model_names=["m", "m"],
+        parameter_names=["a", "b"],
         outputfiles_basename=str(tmp_path / "pure"),
         overwrite=False,
         n_jobs=None,
@@ -123,15 +127,33 @@ def test_setup_is_pure_and_does_not_touch_prior_dists(tmp_path):
 
     assert solver.base_prior is prior and solver.prior is prior
     assert solver.distributions == {"prior": prior}
-    assert solver.indexes == [1, 2] and solver.model_indexes == ["m", "m"]
+    assert solver.parameter_indices == [1, 2] and solver.model_names == ["m", "m"]
+    assert solver.parameter_names == ["a", "b"]
     assert solver.posterior_samples is None and solver.fit_result is None
     assert solver.backend is None and solver.backend_name == "dummy"
     assert solver._n_jobs == available_cpu_count()
     assert solver._fold_phase_name == "backend"
     assert solver.fold_counts == {}
-    assert solver._restrict_prior_arg is sentinel
     assert solver.restriction_config is sentinel and solver.restriction is None
     assert (tmp_path / "pure").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("parameter_names", "model_names"), [(["a"], ["m", "m"]), (["a", "b", "c"], ["m", "m"]), (["a", "b"], ["m"])]
+)
+def test_setup_refuses_names_not_aligned_with_the_indices(tmp_path, parameter_names, model_names):
+    with pytest.raises(ValueError, match="one entry per fitted parameter"):
+        _bare_solver()._setup(
+            prior=MultipleIndependent([uniform(0.0, 1.0), uniform(1.0, 2.0)]),
+            parameter_indices=[1, 2],
+            model_names=model_names,
+            parameter_names=parameter_names,
+            outputfiles_basename=str(tmp_path / "out"),
+            overwrite=False,
+            n_jobs=1,
+            backend=_config(),
+        )
+    assert not (tmp_path / "out").exists()
 
 
 def test_setup_respects_overwrite_guard(tmp_path):
@@ -141,23 +163,6 @@ def test_setup_respects_overwrite_guard(tmp_path):
 
     with pytest.raises(FileExistsError, match="not empty"):
         _make_solver(tmp_path, name="busy", overwrite=False)
-
-
-def test_bare_solver_class_defaults():
-    solver = _bare_solver()
-
-    assert solver.fold_counts == {}
-    assert solver.restriction is None
-    assert solver.restriction_config is None
-    assert solver._fold_phase_name == "backend"
-    assert solver._restrict_prior_arg is None
-
-    solver._count_folds(4)
-    with solver.fold_phase("post"):
-        solver._count_folds(2)
-    assert solver.fold_counts == {"backend": 4, "post": 2}
-    # The lazily created dict belongs to the instance, not the class.
-    assert _bare_solver().fold_counts == {}
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +262,7 @@ def test_fold_phase_restores_on_error_and_counts_are_copies(tmp_path):
                 raise RuntimeError("fail")
     assert solver._fold_phase_name == "backend"
 
-    solver._count_folds(3)
+    solver.simulate(_prior_draws(solver, 3), return_kind="cstat")
     counts = solver.fold_counts
     counts["backend"] = 999
     assert solver.fold_counts == {"backend": 3}
@@ -301,6 +306,9 @@ def test_log_prob_fn_combines_likelihood_and_prior(tmp_path):
 
     expected = -0.5 * solver.spectrum.cstat(theta) + solver.prior.log_prob(theta)
     np.testing.assert_allclose(solver.log_prob_fn(theta, None), expected)
+    # `x_o` is optional: it is ignored.
+    np.testing.assert_allclose(solver.log_prob_fn(theta), expected)
+    np.testing.assert_array_equal(solver.log_likelihood_fn(theta), -0.5 * solver.spectrum.cstat(theta))
 
 
 def test_log_prior_fn_reads_working_prior(tmp_path):
@@ -316,14 +324,17 @@ def test_log_prior_fn_reads_working_prior(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Base Solver._fold (parallel_folding patched)
+# Base Solver.simulate (parallel_folding patched)
 # ---------------------------------------------------------------------------
 
 
 def _patched_bare_solver():
     solver = _bare_solver()
-    solver.indexes = [1, 2]
-    solver.model_indexes = ["m", "m"]
+    solver.parameter_indices = [1, 2]
+    solver.model_names = ["m", "m"]
+    solver._parameter_names = ("a", "b")
+    solver._fold_counts = collections.Counter()
+    solver._fold_phase_name = "backend"
     solver.pool = None
     solver._pool_depth = 0
     solver._n_jobs = 1
@@ -335,9 +346,9 @@ def test_base_fold_routes_through_parallel_folding():
     pool = object()
     calls = []
 
-    def fake_parallel_folding(params, indexes, model_indexes, **kwargs):
+    def fake_parallel_folding(parameter_batch, parameter_indices, model_names, **kwargs):
         calls.append(kwargs)
-        return {"cstat": np.arange(len(params), dtype=np.float64)}
+        return {"cstat": np.arange(len(parameter_batch), dtype=np.float64)}
 
     theta = np.ones((4, 2))
     with patch.object(solver_module, "parallel_folding", side_effect=fake_parallel_folding), patch.object(
@@ -373,9 +384,9 @@ def test_base_fold_reports_non_finite_parameter_names():
 
 
 def test_analytic_solver_runs_the_production_fold():
-    """Regression: AnalyticSolver used to re-implement `_fold`, so the real one went untested."""
-    assert "_fold" not in AnalyticSolver.__dict__
-    assert AnalyticSolver._fold is Solver._fold
+    """Regression: AnalyticSolver used to re-implement the fold, so the real one went untested."""
+    assert "simulate" not in AnalyticSolver.__dict__
+    assert AnalyticSolver.simulate is Solver.simulate
     assert "_fold_batch" in AnalyticSolver.__dict__
 
 
@@ -486,6 +497,50 @@ def test_constructor_checks_the_output_directory_before_build_prior(tmp_path, lo
     assert not (tmp_path / "new").exists()
 
 
+def test_parameter_names_are_read_once_at_construction(tmp_path, loaded_fake_xspec):
+    """Regression: the names were re-read from XSPEC at every access, so freezing a
+    parameter after construction silently relabelled the posterior columns."""
+    free = [SimpleNamespace(name="TBabs_1_nH"), SimpleNamespace(name="powerlaw_2_PhoIndex")]
+    prior = MultipleIndependent([uniform(0.0, 1.0), uniform(1.0, 3.0)])
+
+    with patch.object(solver_module, "build_prior", return_value=(prior, [1, 2], ["", ""])), patch.object(
+        solver_module, "iter_free_parameters", side_effect=lambda: iter(list(free))
+    ) as iter_free:
+        solver = Solver([], outputfiles_basename=str(tmp_path / "run"), backend=_config())
+        free.pop()  # the user freezes PhoIndex after building the solver
+
+        assert solver.parameter_names == ["TBabs_1_nH", "powerlaw_2_PhoIndex"]
+    iter_free.assert_called_once_with()
+    assert solver.parameter_indices == [1, 2] and solver.model_names == ["", ""]
+
+
+@pytest.mark.parametrize(
+    ("backend", "message"),
+    [
+        (Nessai, r"write backend=Nessai\(\) \(with any options\), not backend=Nessai\."),
+        ("nautilus", r"backend must be a backend configuration such as bsixsa\.Nautilus\(\).*got 'nautilus'"),
+        (BackendConfig(), "backend must be a backend configuration"),
+    ],
+)
+def test_constructor_explains_a_wrong_backend_argument(tmp_path, loaded_fake_xspec, backend, message):
+    with patch.object(solver_module, "build_prior") as build_prior:
+        with pytest.raises(TypeError, match=message):
+            Solver([], outputfiles_basename=str(tmp_path / "run"), backend=backend)
+    build_prior.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [("nSpectra", 0, r"No spectrum is loaded.*xspec\.Spectrum"), ("sources", {}, r"No model is defined.*xspec\.Model")],
+)
+def test_constructor_explains_an_empty_xspec_session(tmp_path, loaded_fake_xspec, attribute, value, message):
+    owner = loaded_fake_xspec.AllData if attribute == "nSpectra" else loaded_fake_xspec.AllModels
+    setattr(owner, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        Solver([], outputfiles_basename=str(tmp_path / "run"), backend=_config())
+
+
 @pytest.mark.parametrize("value", ["yes", 1, 0, 0.5, [True], {"n": 1}, np.float64(1.0)])
 def test_restrict_prior_rejects_plain_values_before_touching_the_directory(tmp_path, value):
     target = tmp_path / "out"
@@ -497,115 +552,18 @@ def test_restrict_prior_rejects_plain_values_before_touching_the_directory(tmp_p
     assert (target / "keep.txt").exists()
 
 
-@pytest.mark.parametrize("value", [None, True, False, np.True_])
-def test_restrict_prior_accepts_none_and_bools(tmp_path, value):
-    assert _make_solver(tmp_path, restrict_prior=value)._restrict_prior_arg is value
+@pytest.mark.parametrize(("value", "restricted"), [(None, False), (True, True), (False, False), (np.True_, True)])
+def test_restrict_prior_accepts_none_and_bools(tmp_path, value, restricted):
+    solver = _make_solver(tmp_path, restrict_prior=value)
+
+    assert solver.restriction is None
+    assert solver.restriction_config == (HistoryMatching() if restricted else None)
 
 
 def test_restrict_prior_accepts_configuration_objects(tmp_path):
     config = HistoryMatching(n_waves=2)
     solver = _make_solver(tmp_path, restrict_prior=config)
-    assert solver._restrict_prior_arg is config
     assert solver.restriction_config is config
-
-
-# ---------------------------------------------------------------------------
-# Fingerprint
-# ---------------------------------------------------------------------------
-
-
-class _WiderGammaSpectrum(AnalyticSpectrum):
-    def prior_list(self):
-        dists = super().prior_list()
-        dists[0] = uniform(1.0, 3.5)
-        return dists
-
-
-class _FloatBoundsSpectrum(AnalyticSpectrum):
-    def prior_list(self):
-        dists = super().prior_list()
-        dists[0] = uniform(np.float64(1.0), np.float64(3.0))
-        return dists
-
-
-def test_fingerprint_is_stable_for_identical_problems(tmp_path):
-    first = _make_solver(tmp_path, name="a")
-    second = _make_solver(tmp_path, name="b", spectrum=_FloatBoundsSpectrum(d=2))
-
-    assert len(first.fingerprint()) == 64
-    assert first.fingerprint() == first.fingerprint()
-    assert first.fingerprint() == second.fingerprint()
-
-
-def test_fingerprint_changes_with_spectrum_or_prior(tmp_path):
-    reference = _make_solver(tmp_path, name="ref").fingerprint()
-
-    other_seed = _make_solver(tmp_path, name="seed", spectrum=AnalyticSpectrum(d=2, seed=1)).fingerprint()
-    wider = _make_solver(tmp_path, name="wider", spectrum=_WiderGammaSpectrum(d=2)).fingerprint()
-    three_d = _make_solver(tmp_path, name="d3", spectrum=AnalyticSpectrum(d=3)).fingerprint()
-
-    assert len({reference, other_seed, wider, three_d}) == 4
-
-
-def test_fingerprint_ignores_the_working_prior(tmp_path):
-    solver = _make_solver(tmp_path)
-    before = solver.fingerprint()
-
-    solver.prior = MultipleIndependent([uniform(1.5, 2.0), loguniform(0.5, 2.0)])
-
-    assert solver.fingerprint() == before
-
-
-def test_fingerprint_changes_with_n_spectra(tmp_path):
-    solver = _make_solver(tmp_path)
-    before = solver.fingerprint()
-
-    with patch.object(
-        AnalyticSolver,
-        "_xspec_constraints",
-        lambda self: {"n_spectra": 2, "stat_method": "cstat", "has_background": False},
-    ):
-        assert solver.fingerprint() != before
-
-
-def _fingerprint_with_base(solver, dists):
-    solver.base_prior = MultipleIndependent(dists)
-    return solver.fingerprint()
-
-
-def test_fingerprint_normalises_positional_and_keyword_loc_scale(tmp_path):
-    from scipy import stats
-
-    solver = _make_solver(tmp_path)
-    positional = _fingerprint_with_base(solver, [stats.uniform(1.0, 2.0), loguniform(0.1, 10.0)])
-    keyword = _fingerprint_with_base(solver, [stats.uniform(loc=1.0, scale=2.0), loguniform(0.1, 10.0)])
-    shifted = _fingerprint_with_base(solver, [stats.uniform(loc=1.5, scale=1.5), loguniform(0.1, 10.0)])
-
-    assert positional == keyword
-    assert shifted != positional
-
-
-def test_fingerprint_describes_the_base_of_a_truncated_marginal(tmp_path):
-    """A `TruncatedMarginal` has empty `args`: the base family must enter the hash."""
-    from scipy import stats
-
-    from bsixsa.priors import TruncatedMarginal
-
-    solver = _make_solver(tmp_path)
-    # Both marginals have support [0, 1]; only the wrapped family differs.
-    beta_23 = TruncatedMarginal(stats.beta(2.0, 3.0), 0.0, 1.0)
-    beta_32 = TruncatedMarginal(stats.beta(3.0, 2.0), 0.0, 1.0)
-    assert beta_23.support() == beta_32.support()
-
-    first = _fingerprint_with_base(solver, [beta_23, loguniform(0.1, 10.0)])
-    second = _fingerprint_with_base(solver, [beta_32, loguniform(0.1, 10.0)])
-    narrower = _fingerprint_with_base(
-        solver, [TruncatedMarginal(stats.beta(2.0, 3.0), 0.0, 0.5), loguniform(0.1, 10.0)]
-    )
-
-    assert first != second
-    assert narrower not in (first, second)
-    assert first == _fingerprint_with_base(solver, [TruncatedMarginal(stats.beta(2, 3), 0, 1), loguniform(0.1, 10.0)])
 
 
 # ---------------------------------------------------------------------------
@@ -628,15 +586,9 @@ def test_check_xspec_state_rejects_bayes_on(fake_xspec, value):
         _bare_solver()._check_xspec_state()
 
 
-@pytest.mark.parametrize("value", ["off", "OFF", None])
+@pytest.mark.parametrize("value", ["off", "OFF"])
 def test_check_xspec_state_accepts_off(fake_xspec, value):
     fake_xspec.Fit.bayes = value
-
-    _bare_solver()._check_xspec_state()
-
-
-def test_check_xspec_state_is_inert_under_magicmock(fake_xspec):
-    assert isinstance(fake_xspec.Fit.bayes, MagicMock)
 
     _bare_solver()._check_xspec_state()
 
@@ -645,14 +597,6 @@ def test_analytic_solver_check_is_a_noop(tmp_path, fake_xspec):
     fake_xspec.Fit.bayes = "on"
 
     assert _make_solver(tmp_path)._check_xspec_state() is None
-
-
-def test_xspec_constraints_are_none_under_magicmock(fake_xspec):
-    assert _bare_solver()._xspec_constraints() == {
-        "n_spectra": None,
-        "stat_method": None,
-        "has_background": None,
-    }
 
 
 class _PyXspecSpectrum:
@@ -689,178 +633,15 @@ def test_xspec_constraints_read_real_types(fake_xspec):
     assert _bare_solver()._xspec_constraints()["has_background"] is False
 
 
-def test_xspec_constraints_other_background_errors_stay_unknown(fake_xspec):
-    class _Broken:
-        @property
-        def background(self):
-            raise Exception("Error: Cannot parse getBackgrnd arguments.")
-
-    fake_xspec.AllData.return_value = _Broken()
-    assert _bare_solver()._xspec_constraints()["has_background"] is None
+def _load_fake_spectra(monkeypatch, fake_xspec, *spectra) -> None:
+    """Make the fake session hold *spectra*; bsixsa.xspec reads the spectra for the solver."""
+    monkeypatch.setattr(xspec_module, "xspec", fake_xspec)
+    fake_xspec.AllData.nSpectra = len(spectra)
+    fake_xspec.AllData.side_effect = lambda index: spectra[index - 1]
 
 
-# ---------------------------------------------------------------------------
-# Problem state entering the fingerprint
-# ---------------------------------------------------------------------------
-
-
-class _FakeParameter(SimpleNamespace):
-    pass
-
-
-class _FakeModel:
-    def __init__(self, expression, parameters):
-        self.expression = expression
-        self.nParameters = len(parameters)
-        self._parameters = parameters
-
-    def __call__(self, index):
-        return self._parameters[index - 1]
-
-
-def _install_problem(fake_xspec, *, exposure=1000.0, rmf="pn.rmf", nh=0.05, thawed=1.9, abund="wilm"):
-    spectrum = _PyXspecSpectrum(
-        fileName="obs.pha",
-        exposure=exposure,
-        response=SimpleNamespace(rmf=rmf, arf="pn.arf"),
-        noticed=[3, 4, 5],
-    )
-    model = _FakeModel(
-        "TBabs*powerlaw",
-        [
-            _FakeParameter(frozen=True, link="", values=[nh, 0.01]),  # 1 nH, fixed
-            _FakeParameter(frozen=False, link="", values=[thawed, 0.01]),  # 2 PhoIndex, folded
-            _FakeParameter(frozen=False, link="", values=[3e-3, 0.01]),  # 3 norm, folded
-            _FakeParameter(frozen=False, link="= 2", values=[thawed, 0.0]),  # 4 linked
-            _FakeParameter(frozen=False, link="", values=[7.0, 0.01]),  # 5 thawed, no prior
-        ],
-    )
-    fake_xspec.AllData.nSpectra = 1
-    fake_xspec.AllData.side_effect = lambda index: spectrum
-    fake_xspec.AllModels.sources = {1: "src"}
-    fake_xspec.AllModels.side_effect = lambda group, modName="": model
-    fake_xspec.Xset.abund = abund
-    fake_xspec.Xset.xsect = "vern"
-    fake_xspec.Xset.cosmo = "70.0 0.0 0.73"
-
-
-def _problem_state(fake_xspec, **kwargs):
-    _install_problem(fake_xspec, **kwargs)
-    solver = _bare_solver()
-    solver.indexes = [2, 3]
-    solver.model_indexes = ["src", "src"]
-    return solver._xspec_problem_state()
-
-
-def test_xspec_problem_state_reads_responses_and_fixed_parameters(fake_xspec):
-    state = _problem_state(fake_xspec)
-
-    assert state == {
-        "spectra": [
-            {
-                "file": "obs.pha",
-                "exposure": 1000.0,
-                "rmf": "pn.rmf",
-                "arf": "pn.arf",
-                "background": False,
-                "noticed": [3, 4, 5],
-            }
-        ],
-        "models": [
-            {
-                "source": 1,
-                "name": "src",
-                "expression": "TBabs*powerlaw",
-                # Folded (2, 3) and plain thawed (5) parameters are excluded;
-                # the linked one contributes its link only.
-                "fixed": [[1, 0.05, ""], [4, None, "= 2"]],
-            }
-        ],
-        "settings": {"abund": "wilm", "xsect": "vern", "cosmo": "70.0 0.0 0.73"},
-    }
-
-
-def test_xspec_problem_state_tracks_what_changes_the_likelihood(fake_xspec):
-    reference = _problem_state(fake_xspec)
-
-    assert _problem_state(fake_xspec, exposure=2000.0) != reference
-    assert _problem_state(fake_xspec, rmf="mos.rmf") != reference
-    assert _problem_state(fake_xspec, nh=0.5) != reference
-    assert _problem_state(fake_xspec, abund="angr") != reference
-    # Folding moves the thawed values; they must not change the state.
-    assert _problem_state(fake_xspec, thawed=2.7) == reference
-
-
-def test_xspec_problem_state_is_inert_under_magicmock(fake_xspec):
-    solver = _bare_solver()
-    solver.indexes, solver.model_indexes = [1], ["m"]
-
-    assert solver._xspec_problem_state() == {
-        "spectra": [],
-        "models": [],
-        "settings": {"abund": None, "xsect": None, "cosmo": None},
-    }
-
-
-def test_fingerprint_changes_with_statistic_background_and_problem_state(tmp_path):
-    """Regression: the hash ignored everything but the counts, names, priors and nSpectra."""
-    solver = _make_solver(tmp_path)
-    reference = solver.fingerprint()
-    constraints = {"n_spectra": 1, "stat_method": "cstat", "has_background": False}
-
-    with patch.object(AnalyticSolver, "_xspec_constraints", lambda self: {**constraints, "stat_method": "pstat"}):
-        assert solver.fingerprint() != reference
-    with patch.object(AnalyticSolver, "_xspec_constraints", lambda self: {**constraints, "has_background": True}):
-        assert solver.fingerprint() != reference
-    assert solver.fingerprint() == reference
-
-    # Same observed counts, different forward model (an exposure-like rescale).
-    rescaled = _make_solver(tmp_path, name="rescaled")
-    rescaled.spectrum.amplitude *= 1.5
-    np.testing.assert_array_equal(rescaled.observed_counts, solver.observed_counts)
-    assert rescaled.fingerprint() != reference
-
-
-def test_fingerprint_separates_opaque_families_by_their_quantiles(tmp_path):
-    """`rv_histogram` keeps its histogram out of `args`; only its values tell two apart."""
-    from scipy import stats
-
-    solver = _make_solver(tmp_path)
-    edges = np.linspace(0.0, 1.0, 5)
-    rising = stats.rv_histogram((np.array([1.0, 2.0, 3.0, 4.0]), edges))
-    falling = stats.rv_histogram((np.array([4.0, 3.0, 2.0, 1.0]), edges))
-    assert rising.support() == falling.support()
-
-    first = _fingerprint_with_base(solver, [rising, loguniform(0.1, 10.0)])
-    second = _fingerprint_with_base(solver, [falling, loguniform(0.1, 10.0)])
-    again = _fingerprint_with_base(
-        solver, [stats.rv_histogram((np.array([1.0, 2.0, 3.0, 4.0]), edges)), loguniform(0.1, 10.0)]
-    )
-
-    assert first != second
-    assert first == again
-
-
-def test_canonical_form_drops_memory_addresses():
-    first, second = object(), object()
-    assert solver_module._canonical(first) == solver_module._canonical(second) == "object"
-    assert solver_module._canonical(SimpleNamespace(a=1)) == "namespace(a=1)"
-
-
-def test_xspec_constraints_tolerate_errors_and_bools(fake_xspec):
-    fake_xspec.AllData.nSpectra = True
-    fake_xspec.AllData.side_effect = RuntimeError("no spectrum")
-
-    constraints = _bare_solver()._xspec_constraints()
-
-    assert constraints["n_spectra"] is None
-    assert constraints["has_background"] is None
-
-
-def test_observed_counts_are_rounded_float64(fake_xspec):
-    spectrum = fake_xspec.AllData.return_value
-    spectrum.values = [0.12, 0.26, 0.0]
-    spectrum.exposure = 100.0 + 1e-9
+def test_observed_counts_are_rounded_float64(fake_xspec, monkeypatch):
+    _load_fake_spectra(monkeypatch, fake_xspec, SimpleNamespace(values=[0.12, 0.26, 0.0], exposure=100.0 + 1e-9))
 
     solver = _bare_solver()
     counts = solver.observed_counts
@@ -868,3 +649,20 @@ def test_observed_counts_are_rounded_float64(fake_xspec):
     assert counts.dtype == np.float64
     np.testing.assert_array_equal(counts, [12.0, 26.0, 0.0])
     assert solver.n_bins == 3
+    # The old name returns the same exact counts (it used to be float32 rate x exposure).
+    np.testing.assert_array_equal(solver.observed_spectrum, counts)
+    assert solver.observed_spectrum.dtype == np.float64
+
+
+def test_observed_counts_concatenate_the_spectra(fake_xspec, monkeypatch):
+    _load_fake_spectra(
+        monkeypatch,
+        fake_xspec,
+        SimpleNamespace(values=[0.12, 0.26], exposure=100.0),
+        SimpleNamespace(values=[0.5, 0.25, 0.0], exposure=20.0),
+    )
+
+    solver = _bare_solver()
+
+    np.testing.assert_array_equal(solver.observed_counts, [12.0, 26.0, 10.0, 5.0, 0.0])
+    assert solver.n_bins == 5

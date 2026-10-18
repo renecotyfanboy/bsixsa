@@ -1,11 +1,4 @@
-"""SIXSA backend and its independently testable inference components."""
+"""SIXSA backend: flow proposals learned from simulations, certified against exact folds."""
+from ._sixsa import SIXSABackend
 
 __all__ = ["SIXSABackend"]
-
-
-def __getattr__(name):
-    if name == "SIXSABackend":
-        from ._sixsa import SIXSABackend
-
-        return SIXSABackend
-    raise AttributeError(name)
