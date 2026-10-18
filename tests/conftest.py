@@ -10,6 +10,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 LOW_RES_DATA_DIR = TESTS_DIR / "low_res_data"
 HIGH_RES_DATA_DIR = TESTS_DIR / "high_res_data"
 
+# test_xspec_template.py imports a helper (save_bare_model_template) that exists
+# in no commit; it is left untracked and kept out of collection.
+collect_ignore = ["test_xspec_template.py"]
+
 try:
     import xspec
 except ModuleNotFoundError:  # pragma: no cover - depends on local HEASoft install
@@ -80,6 +84,13 @@ def xspec_session():
 @pytest.fixture
 def low_res_xspec_setup(xspec_session, low_res_data_dir: Path, monkeypatch):
     monkeypatch.chdir(low_res_data_dir)
+
+    # This optional dataset references an unbundled background. Do not let
+    # XSPEC enter its interactive missing-file prompt during automated tests.
+    from astropy.io import fits
+    background = fits.getheader(low_res_data_dir / "PN_spectrum_grp20_opt.pha", 1).get("BACKFILE", "")
+    if background and background.lower() != "none" and not (low_res_data_dir / background).exists():
+        pytest.skip(f"Optional low-resolution background is missing: {background}")
 
     observation = xspec_session.Spectrum(
         "PN_spectrum_grp20_opt.pha",

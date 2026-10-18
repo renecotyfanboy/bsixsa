@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 from pydantic import ValidationError
 
 sys.modules.setdefault("xspec", MagicMock())
 
-from bsixsa import (
+from bsixsa import (  # noqa: E402
+    SIXSA,
     BackendConfig,
     Emcee,
+    HistoryMatching,
     Iminuit,
     LevenbergMarquardt,
     Nautilus,
     Nessai,
     Ultranest,
 )
-from bsixsa.backend.abc import Backend
-from bsixsa.solver import FitResults, Solver
+from bsixsa.backend.abc import Backend  # noqa: E402
+from bsixsa.solver import FitResults, Solver  # noqa: E402
 
 
 @pytest.fixture
@@ -36,22 +42,37 @@ def solver_stub(tmp_path):
 
 @pytest.fixture
 def mock_solver(tmp_path):
+    import collections
+
+    from bsixsa.priors import MultipleIndependent, uniform
+
     with patch.object(Solver, "__init__", lambda self, *args, **kwargs: None):
         solver = Solver.__new__(Solver)
 
-    solver.backend_name = "nessai"
     solver.backend_config = Nessai(trace=False)
     solver.outputfiles_basename = str(tmp_path)
+    solver.prior = MultipleIndependent([uniform(0.0, 1.0), uniform(0.0, 1.0)])
     solver.distributions = {}
-    solver.indexes = [1, 2]
+    solver.parameter_indices = [1, 2]
     solver._parameter_names = ["par_a", "par_b"]
-    solver.posterior_samples = None
     solver.fit_result = None
+    solver._fold_counts = collections.Counter()
+    solver._fold_phase_name = "backend"
     solver.pool = None
     solver._pool_depth = 0
     solver._n_jobs = 1
+    # `run` checks the xspec session and forks the folding pool up front;
+    # these fakes never fold.
+    solver._check_xspec_state = lambda: None
+    solver._get_pool = lambda: None
 
     return solver
+
+
+@pytest.fixture
+def without_sampler_check(monkeypatch):
+    """The fake backends need no sampler package, so `run` must not look for one."""
+    monkeypatch.setattr("bsixsa.solver._check_sampler_installed", lambda config: None)
 
 
 def _fit_result() -> FitResults:
@@ -153,7 +174,6 @@ def test_iminuit_validate_for_solver_rejects_wrong_x0_length(solver_stub):
 
 def test_backend_base_class_rejects_mismatched_config_type(solver_stub):
     class FakeBackend(Backend):
-        name = "nessai"
         config_cls = Nessai
 
         def run(self):
@@ -166,14 +186,12 @@ def test_backend_base_class_rejects_mismatched_config_type(solver_stub):
         FakeBackend(solver=solver_stub, config=Iminuit(x0_physical=[1.0, 2.0]))
 
 
-def test_solver_run_uses_constructor_backend_config(mock_solver):
+def test_solver_run_uses_constructor_backend_config(mock_solver, without_sampler_check):
     created = {}
     config = Nessai(num_live_points=321, trace=False)
     mock_solver.backend_config = config
-    mock_solver.backend_name = config.backend_name
 
     class FakeBackend(Backend):
-        name = "nessai"
         config_cls = Nessai
 
         def __init__(self, *, solver, config):
@@ -206,12 +224,10 @@ def test_solver_run_uses_constructor_backend_config(mock_solver):
     assert mock_solver.distributions["posterior"] is mock_solver.backend
 
 
-def test_solver_run_rejects_mismatched_backend_config(mock_solver):
-    mock_solver.backend_name = "nessai"
+def test_solver_run_rejects_mismatched_backend_config(mock_solver, without_sampler_check):
     mock_solver.backend_config = Iminuit(x0_physical=[1.0, 2.0])
 
     class FakeBackend(Backend):
-        name = "nessai"
         config_cls = Nessai
 
         def __init__(self, *, solver, config):
@@ -226,92 +242,6 @@ def test_solver_run_rejects_mismatched_backend_config(mock_solver):
     with patch("bsixsa.backend.get_backend_class", return_value=FakeBackend):
         with pytest.raises(TypeError, match="Nessai"):
             mock_solver.run()
-
-
-def test_sixsa_backend_run_mock(tmp_path):
-    import torch
-    import numpy as np
-    from unittest.mock import MagicMock, patch
-    from bsixsa.backend.sixsa import SIXSABackend
-    from bsixsa.backend.config import SIXSA
-
-    # Mock Solver
-    solver = MagicMock()
-    solver.prior.ndim = 2
-    solver.prior.from_unit_cube = lambda x: x * 10.0
-    solver.prior.to_unit_cube = lambda x: x / 10.0
-    solver.outputfiles_basename = str(tmp_path)
-    solver.parameter_names = ["p1", "p2"]
-
-    # Mock simulations results
-    def mock_simulate(params, *args, **kwargs):
-        n = len(params)
-        return {
-            "total_model_counts": np.ones((n, 50), dtype=np.float32),
-            "cstat": np.random.uniform(50, 100, size=n).astype(np.float32)
-        }
-    solver.simulate.side_effect = mock_simulate
-    solver.observed_spectrum = np.ones(50, dtype=np.float32)
-
-    # Mock embedding
-    from bsixsa.backend.sixsa.embedding import IdentityEmbedding
-    class MockEmbedding(IdentityEmbedding):
-        pass
-    embedding = MockEmbedding()
-    embedding.transform = MagicMock(return_value=np.ones(50, dtype=np.float32))
-
-    config = SIXSA(
-        trace=False,
-        num_simulations_per_round=[10, 10],
-        embedding=embedding,
-        n_ensemble=1,
-        is_filter_fraction=0.2,
-        khat_threshold=None,      # disable early stopping for a deterministic run
-        plot_diagnostics=False,   # skip the xspec-backed diagnostic plots under mocks
-    )
-    backend = SIXSABackend(solver=solver, config=config)
-
-    # Patch training_job to return mock posteriors
-    mock_post = MagicMock()
-    def mock_log_prob(theta, *args, **kwargs):
-        n = theta.shape[0] if hasattr(theta, "shape") else 1
-        return torch.ones(n, dtype=torch.float32)
-    mock_post.log_prob.side_effect = mock_log_prob
-    def mock_sample(shape, *args, **kwargs):
-        n = shape[0] if isinstance(shape, (tuple, list, torch.Size)) else shape
-        # Interior of the unit cube so the prior log-prob is finite and the
-        # importance weights are well-defined (boundary points give -inf).
-        return torch.full((n, 2), 0.5, dtype=torch.float32)
-    mock_post.sample.side_effect = mock_sample
-    mock_post.potential_fn = MagicMock()
-    mock_post.potential_fn.device = "cpu"
-    mock_post._device = "cpu"
-
-    # Each training job now returns (posterior, training_stats); mock that shape.
-    mock_stats = {
-        "nde_index": 0,
-        "training_time_s": 0.0,
-        "best_val_loss": 1.0,
-        "best_train_loss": 1.0,
-        "n_epochs": 1,
-    }
-    mock_parallel = MagicMock()
-    mock_parallel.return_value = [(mock_post, mock_stats)]
-    with patch("bsixsa.backend.sixsa._sixsa.Parallel", return_value=mock_parallel):
-        results = backend.run()
-
-    assert results is not None
-    assert results.posterior_samples.shape == (10000, 2)
-    # The run records a per-round history that drives the diagnostics.
-    assert len(backend.history) >= 1
-    assert backend.history[0]["nde_stats"] == [mock_stats]
-    # The returned posterior is importance-resampled (no flow rejection sampling).
-    assert backend.best_weighted is not None
-    # sample() returns physical-space parameters, not the unit cube. The mock
-    # `from_unit_cube` scales by 10, so physical values exceed the unit cube.
-    physical = np.asarray(backend.sample(50))
-    assert physical.shape == (50, 2)
-    assert float(physical.max()) > 1.0
 
 
 def test_available_cpu_count_is_positive_int():
@@ -347,34 +277,238 @@ def _nautilus_mock_solver(tmp_path):
     return solver
 
 
+def _run_mock_nautilus(tmp_path, config, *, cpu_count=8):
+    """Run NautilusBackend with nautilus and the process pool mocked; return (sampler class, pool class)."""
+    from bsixsa.backend.nautilus import NautilusBackend
+
+    with patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
+         patch("bsixsa.backend.nautilus.available_cpu_count", return_value=cpu_count), \
+         patch("bsixsa.backend.nautilus.Pool") as pool_cls, \
+         patch("bsixsa.backend.nautilus.NestedSampler") as sampler_cls:
+        sampler = sampler_cls.return_value
+        sampler.posterior.return_value = (np.zeros((3, 2)), np.zeros(3), np.zeros(3))
+        sampler.n_like, sampler.log_z, sampler.n_eff = 10, -1.0, 100.0
+        NautilusBackend(solver=_nautilus_mock_solver(tmp_path), config=config).run()
+    return sampler_cls, pool_cls
+
+
 def test_nautilus_backend_sizes_pool_from_config_not_cpu_count(tmp_path):
     """The sampler must be built from config (not os.cpu_count()), and the
     sampler pool must be capped at the available CPU count."""
+    # Defaults: n_networks=4, n_pool=4 -> a 4-process pool for nautilus' own work
+    sampler_cls, pool_cls = _run_mock_nautilus(tmp_path, Nautilus(trace=False))
+    pool_cls.assert_called_once_with(4)
+    kwargs = sampler_cls.call_args.kwargs
+    assert kwargs["n_networks"] == 4
+    assert kwargs["pool"] == (None, pool_cls.return_value)
+    assert kwargs["n_live"] == Nautilus().num_live_points
+    assert kwargs["seed"] is None
+
+    # n_pool larger than available cores is capped at available_cpu_count()
+    sampler_cls, pool_cls = _run_mock_nautilus(
+        tmp_path, Nautilus(trace=False, n_networks=16, n_pool=100, num_live_points=500, seed=3)
+    )
+    pool_cls.assert_called_once_with(8)  # min(100, 8)
+    kwargs = sampler_cls.call_args.kwargs
+    assert kwargs["n_networks"] == 16
+    assert kwargs["n_live"] == 500
+    assert kwargs["seed"] == 3
+    assert kwargs["pool"] == (None, pool_cls.return_value)
+
+    # One process: nautilus runs its own work serially, without a pool.
+    sampler_cls, pool_cls = _run_mock_nautilus(tmp_path, Nautilus(trace=False, n_pool=1))
+    pool_cls.assert_not_called()
+    assert sampler_cls.call_args.kwargs["pool"] == (None, None)
+
+
+def test_nautilus_backend_shuts_down_its_pool_after_the_run(tmp_path):
+    """Regression: nautilus never closes its pool, so its worker processes outlived
+    every run and printed a `Pool.__del__` traceback at exit."""
     from bsixsa.backend.nautilus import NautilusBackend
 
-    params = [SimpleNamespace(name="p1"), SimpleNamespace(name="p2")]
+    _, pool_cls = _run_mock_nautilus(tmp_path, Nautilus(trace=False))
+    pool = pool_cls.return_value
+    pool.terminate.assert_called_once_with()
+    pool.join.assert_called_once_with()
 
-    with patch("bsixsa.backend.nautilus.iter_thawn_parameters", return_value=params), \
-         patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
+    # Also when the run fails.
+    with patch("bsixsa.backend.nautilus.Prior", return_value=MagicMock()), \
          patch("bsixsa.backend.nautilus.available_cpu_count", return_value=8), \
+         patch("bsixsa.backend.nautilus.Pool") as pool_cls, \
          patch("bsixsa.backend.nautilus.NestedSampler") as sampler_cls:
+        sampler_cls.return_value.run.side_effect = RuntimeError("likelihood failed")
+        backend = NautilusBackend(solver=_nautilus_mock_solver(tmp_path), config=Nautilus(trace=False))
+        with pytest.raises(RuntimeError, match="likelihood failed"):
+            backend.run()
+    pool_cls.return_value.terminate.assert_called_once_with()
+    pool_cls.return_value.join.assert_called_once_with()
 
-        # Defaults: n_networks=4, n_pool=4 -> pool=(None, 4)
-        NautilusBackend(
-            solver=_nautilus_mock_solver(tmp_path),
-            config=Nautilus(trace=False),
-        )
-        kwargs = sampler_cls.call_args.kwargs
-        assert kwargs["n_networks"] == 4
-        assert kwargs["pool"] == (None, 4)
 
-        # n_pool larger than available cores is capped at available_cpu_count()
-        sampler_cls.reset_mock()
-        NautilusBackend(
-            solver=_nautilus_mock_solver(tmp_path),
-            config=Nautilus(trace=False, n_networks=16, n_pool=100),
-        )
-        kwargs = sampler_cls.call_args.kwargs
-        assert kwargs["n_networks"] == 16
-        assert kwargs["pool"] == (None, 8)  # min(100, 8)
+# Library each backend module needs, besides bsixsa's own dependencies.
+_BACKEND_LIBRARIES = {
+    "nautilus": "nautilus",
+    "nessai": "nessai",
+    "ultranest": "ultranest",
+    "levenberg_marquardt": "scipy",
+    "iminuit": "iminuit",
+    "emcee": "emcee",
+    "sixsa": "sbi",
+}
 
+
+@pytest.mark.parametrize("name", sorted(_BACKEND_LIBRARIES))
+def test_every_registered_backend_resolves_to_its_config(name):
+    from bsixsa import backend as backend_package
+
+    pytest.importorskip(_BACKEND_LIBRARIES[name])
+    backend_cls = backend_package.get_backend_class(name)
+
+    assert issubclass(backend_cls, Backend)
+    assert backend_cls.config_cls.backend_name == name
+
+
+def test_registry_lists_every_backend_config():
+    from bsixsa import SIXSA
+    from bsixsa.backend import BACKEND_REGISTRY
+
+    configs = [Nautilus, Nessai, Ultranest, LevenbergMarquardt, Iminuit, Emcee, SIXSA]
+    assert sorted(config.backend_name for config in configs) == sorted(BACKEND_REGISTRY)
+
+
+def test_unknown_backend_name_lists_the_available_ones():
+    """Regression: the message listed only the backends imported so far ('(none)' at first)."""
+    from bsixsa.backend import get_backend_class
+
+    with pytest.raises(ValueError, match="Unknown backend 'nautlius'.*emcee, iminuit, levenberg_marquardt"):
+        get_backend_class("nautlius")
+
+
+def test_star_import_of_the_backend_package_works():
+    namespace = {}
+    exec("from bsixsa.backend import *", namespace)
+
+    assert namespace["Nautilus"] is Nautilus
+    assert "get_backend_class" in namespace
+
+
+def _sixsa_solver(**constraints):
+    from bsixsa.priors import MultipleIndependent, uniform
+
+    values = {"n_spectra": 1, "stat_method": "cstat", "has_background": False, **constraints}
+    return SimpleNamespace(
+        prior=MultipleIndependent([uniform(0.0, 1.0)]),
+        _xspec_constraints=lambda: values,
+    )
+
+
+@pytest.mark.parametrize(
+    "constraints, message",
+    [
+        ({"n_spectra": 2}, "exactly one spectrum, but 2 are loaded"),
+        ({"n_spectra": None}, "number of loaded spectra could not be read"),
+        ({"has_background": True}, "does not model a background"),
+        ({"stat_method": "chi"}, "statMethod is 'chi'"),
+        ({"stat_method": None}, "statMethod could not be read"),
+    ],
+)
+def test_sixsa_session_errors_say_what_was_found(constraints, message):
+    from bsixsa import SIXSA
+
+    with pytest.raises(ValueError, match=message):
+        SIXSA().validate_for_solver(_sixsa_solver(**constraints))
+
+
+def test_sixsa_accepts_a_single_cstat_spectrum_without_background():
+    from bsixsa import SIXSA
+
+    SIXSA().validate_for_solver(_sixsa_solver())
+
+
+def test_config_errors_quote_the_offending_values(solver_stub):
+    from bsixsa import SIXSA
+
+    with pytest.raises(ValidationError, match=r"n_training \(60000\) must not exceed train_max \(50000\)"):
+        SIXSA(n_training=60_000)
+    with pytest.raises(ValueError, match="got 3"):
+        Emcee(init_from_prior=True, num_walkers=3).validate_for_solver(solver_stub)
+
+
+@pytest.mark.parametrize("config_cls", [Nautilus, Nessai, Ultranest, Iminuit, Emcee, LevenbergMarquardt, SIXSA])
+def test_required_package_is_the_sampler_of_the_backend_and_its_extra(config_cls):
+    if config_cls in (LevenbergMarquardt, SIXSA):
+        # scipy, torch and sbi are dependencies of bsixsa itself.
+        assert config_cls.required_package is None
+        return
+    module, pip_name = config_cls.required_package
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    extra = pyproject["project"]["optional-dependencies"][config_cls.backend_name]
+
+    assert module == _BACKEND_LIBRARIES[config_cls.backend_name]
+    assert [requirement.split(">")[0] for requirement in extra] == [pip_name]
+
+
+def test_missing_sampler_package_is_reported_before_anything_is_touched(tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "previous_run.txt").write_text("kept")
+    looked_up = []
+    # Not installed: every lookup fails. The package is looked up, never imported.
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: looked_up.append(name))
+
+    expected = r"Nautilus backend needs the 'nautilus-sampler' package.*pip install nautilus-sampler"
+    with pytest.raises(ImportError, match=expected):
+        Solver([("powerlaw", "PhoIndex", None)], outputfiles_basename=str(output), overwrite=True, backend=Nautilus())
+
+    assert looked_up == ["nautilus"]
+    assert (output / "previous_run.txt").read_text() == "kept"
+
+
+def test_missing_sampler_package_is_reported_by_run_when_the_config_was_replaced(mock_solver, monkeypatch):
+    mock_solver.backend_config = Nautilus(trace=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None)
+    mock_solver._get_pool = lambda: pytest.fail("the pool must not be forked")
+
+    with pytest.raises(ImportError, match="pip install nautilus-sampler"):
+        mock_solver.run()
+    assert mock_solver.fit_result is None and mock_solver._pool_depth == 0
+
+
+@pytest.mark.parametrize(
+    "config_cls, field, value, expected",
+    [
+        (Nautilus, "num_live_points", 1e3, 1000),
+        (Nautilus, "seed", np.int64(3), 3),
+        (BackendConfig, "plot_step_percent", 20.0, 20),
+        (Iminuit, "strategy", 2.0, 2),
+        (SIXSA, "train_max", 5e4, 50_000),
+        (SIXSA, "check_draws", np.float64(1e3), 1000),
+        (SIXSA, "truncated_support_draws", np.float32(4096.0), 4096),
+        (SIXSA, "n_training", 2e3, 2000),
+        (SIXSA, "refresh_compressor", 2.0, 2),
+        (HistoryMatching, "simulations_per_parameter", 1e3, 1000),
+        (HistoryMatching, "max_candidates", 2e9, 2_000_000_000),
+        (HistoryMatching, "seed", np.int64(7), 7),
+    ],
+)
+def test_integer_options_accept_whole_numbers_written_as_floats(config_cls, field, value, expected):
+    stored = getattr(config_cls(**{field: value}), field)
+
+    assert stored == expected and type(stored) is int
+
+
+@pytest.mark.parametrize(
+    "value", [True, np.True_, "1000", 1000.5, np.float32(2.5), float("inf"), float("nan"), np.float32("inf")]
+)
+@pytest.mark.parametrize(
+    "config_cls, field",
+    [(Nautilus, "num_live_points"), (SIXSA, "check_draws"), (HistoryMatching, "n_waves"), (HistoryMatching, "seed")],
+)
+def test_integer_options_refuse_booleans_strings_and_fractions(config_cls, field, value):
+    with pytest.raises(ValidationError, match=field):
+        config_cls(**{field: value})
+
+
+def test_refresh_compressor_keeps_booleans_apart_from_integers():
+    assert SIXSA(refresh_compressor=True).refresh_compressor is True
+    assert SIXSA(refresh_compressor=False).refresh_compressor is False
+    assert type(SIXSA(refresh_compressor=1.0).refresh_compressor) is int

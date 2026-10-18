@@ -1,18 +1,19 @@
+"""Backend configurations: pass one of them as `Solver(backend=...)` to choose how to fit."""
+
 from __future__ import annotations
 
-"""Pydantic-backed configuration models for bsixsa backends."""
-
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
+from .._config_types import Integer, NonNegativeInt, PositiveFloat, PositiveInt
+from ..restriction.config import HistoryMatching
+
 if TYPE_CHECKING:
     from ..solver import Solver
 
-PositiveInt = Annotated[int, Field(strict=True, gt=0)]
-PositiveFloat = Annotated[float, Field(strict=True, gt=0)]
-PlotStepPercent = Annotated[int, Field(strict=True, gt=0, le=100)]
+# `extra="forbid"` turns a misspelled option into an error.
 MODEL_CONFIG = ConfigDict(
     arbitrary_types_allowed=True,
     extra="forbid",
@@ -21,88 +22,61 @@ MODEL_CONFIG = ConfigDict(
 
 
 class BackendConfig(BaseModel):
-    """Backend config models with shared tracing options."""
+    """Settings shared by every backend: the evaluation trace and its progress plot.
+
+    Pass one of its subclasses ([`Nautilus`][bsixsa.Nautilus],
+    [`SIXSA`][bsixsa.SIXSA], ...) as `Solver(backend=...)`.
+
+    Attributes:
+        backend_name: Class-level. Key of the backend in
+            `bsixsa.backend.BACKEND_REGISTRY`, e.g. `"nautilus"`.
+        required_package: Class-level. `(module, pip name)` of the sampler
+            package the backend needs, or `None`.
+    """
 
     model_config = MODEL_CONFIG
 
+    backend_name: ClassVar[str]
+    required_package: ClassVar[tuple[str, str] | None] = None
+
     trace: StrictBool = Field(
         default=True,
-        description="Whether to actively trace the run or not.",
+        description=(
+            "Record every likelihood evaluation in `evaluation_trace.npz` and redraw "
+            "`progress.png` in the output directory during the run."
+        ),
     )
-
     plot_every: PositiveInt = Field(
         default=50,
-        description=(
-            "Write the first progress plot after this many evaluations. "
-            "Later plots follow `plot_step_percent` on a log-scaled schedule."
-        ),
+        description="Evaluations before the first progress plot.",
     )
-    plot_step_percent: PlotStepPercent = Field(
+    plot_step_percent: PositiveInt = Field(
         default=10,
+        le=100,
         description=(
-            "Relative plotting cadence after the first plot. "
-            "The default of 10 reproduces the current 10%-per-decade schedule."
+            "Spacing of the later progress plots, in percent of the next power of ten "
+            "(with 10: at 60, 70, ..., 100, 200, ... evaluations)."
         ),
     )
 
-    def validate_for_solver(self, solver: "Solver") -> None:
-        """Validate solver-dependent config constraints."""
+    def validate_for_solver(self, solver: Solver) -> None:
+        """Check the options that depend on the solver.
 
-    def create_tracer(
-        self,
-        *,
-        output_dir: str,
-        parameter_names: list[str],
-    ):
-        from .tracer import DummyTracer, EvaluationTracer
-
-        tracer_cls = EvaluationTracer if self.trace else DummyTracer
-        return tracer_cls(
-            output_dir=output_dir,
-            parameter_names=parameter_names,
-            plot_every=self.plot_every,
-            plot_step_percent=self.plot_step_percent,
-        )
+        Raises:
+            ValueError: If an option does not fit the solver.
+        """
 
 
-def _validate_x0_length_for_solver(
-    x0_physical: np.ndarray | None,
-    solver: "Solver",
-) -> None:
-    if x0_physical is not None and x0_physical.size != solver.num_parameters:
-        raise ValueError(
-            "`x0_physical` must have one value per free parameter "
-            f"({solver.num_parameters} expected, got {x0_physical.size})."
-        )
-
-
-def _ensure_init_not_overspecified(
-    x0_physical: np.ndarray | None,
-    init_from_prior: bool,
-) -> None:
-    if x0_physical is not None and init_from_prior:
-        raise ValueError(
-            "`x0_physical` and `init_from_prior=True` are mutually exclusive."
-        )
-
-
-class _OptimizerInitConfig(BackendConfig):
-    """Shared starting-point options for optimiser-style backends.
-
-    Holds the ``x0_physical`` / ``init_from_prior`` fields and their validation,
-    deduplicated across the iminuit, Levenberg-Marquardt and emcee configs.
-    """
+class _StartingPointConfig(BackendConfig):
+    """Starting point: `x0_physical`, a prior draw, or (optimisers only) the prior median."""
 
     x0_physical: np.ndarray | None = Field(
         default=None,
-        description=(
-            "Initial parameter vector in physical parameter space. "
-            "Must contain one value per free parameter."
-        ),
+        description="Starting point in physical units, one value per free parameter.",
     )
     init_from_prior: StrictBool = Field(
         default=False,
-        description="Initialise the optimizer from a draw from the prior.",
+        description="Start from a random draw from the prior (unseeded) instead.",
     )
 
     @field_validator("x0_physical", mode="before")
@@ -121,51 +95,65 @@ class _OptimizerInitConfig(BackendConfig):
         return vector
 
     @model_validator(mode="after")
-    def _validate_initialisation_strategy(self) -> _OptimizerInitConfig:
-        _ensure_init_not_overspecified(self.x0_physical, self.init_from_prior)
+    def _validate_initialisation_strategy(self) -> _StartingPointConfig:
+        if self.x0_physical is not None and self.init_from_prior:
+            raise ValueError("`x0_physical` and `init_from_prior=True` are mutually exclusive.")
         return self
 
-    def validate_for_solver(self, solver: "Solver") -> None:
-        _validate_x0_length_for_solver(self.x0_physical, solver)
+    def validate_for_solver(self, solver: Solver) -> None:
+        """Check that `x0_physical` has one value per free parameter."""
+        if self.x0_physical is not None and self.x0_physical.size != solver.num_parameters:
+            raise ValueError(
+                "`x0_physical` must have one value per free parameter "
+                f"({solver.num_parameters} expected, got {self.x0_physical.size})."
+            )
 
 
 class Nautilus(BackendConfig):
-    """Configuration for the [`nautilus`](https://nautilus-sampler.readthedocs.io/en/latest/) backend."""
+    """Nested sampling with [`nautilus`](https://nautilus-sampler.readthedocs.io/en/latest/), boosted by neural networks.
+
+    `FitResults` holds equal-weight posterior samples and `log_Z`. Needs the
+    `nautilus-sampler` package.
+    """
 
     backend_name: ClassVar[str] = "nautilus"
+    required_package: ClassVar[tuple[str, str] | None] = ("nautilus", "nautilus-sampler")
 
     num_live_points: PositiveInt = Field(
         default=3_000,
         description="Number of live points used by the nested sampler.",
     )
-
     n_batch: PositiveInt = Field(
         default=100,
-        description="Minimal number of likelihood evaluation performed at once.",
+        description="Points proposed and folded together on the solver's pool; keep it above `n_jobs`.",
     )
-
     n_networks: PositiveInt = Field(
         default=4,
-        description=(
-            "Number of neural-network emulators nautilus trains per bound "
-            "(nautilus `n_networks`). Default 4 matches the library."
-        ),
+        description="Number of neural networks trained for each bound.",
     )
-
     n_pool: PositiveInt = Field(
         default=4,
         description=(
-            "Worker processes for nautilus's sampler / NN-training pool. "
-            "Bounded so it does not add a full node-wide fleet on top of the "
-            "solver's likelihood pool. Set to 1 for serial."
+            "Processes for nautilus' own work (likelihoods run on the solver's pool); "
+            "on macOS and Windows a `.py` script must guard its code with "
+            "`if __name__ == \"__main__\":` or set `n_pool=1`, otherwise the run hangs."
         ),
+    )
+    seed: NonNegativeInt | None = Field(
+        default=None,
+        description="Random seed of the sampler and of `sample`; `None` is not reproducible.",
     )
 
 
 class Nessai(BackendConfig):
-    """Configuration for the [`nessai`](https://nessai.readthedocs.io/en/latest/) backend."""
+    """Nested sampling with [`nessai`](https://nessai.readthedocs.io/en/latest/), driven by normalising flows.
+
+    Runs nessai's importance nested sampler. `FitResults` holds equal-weight
+    posterior samples and `log_Z`. Needs the `nessai` package.
+    """
 
     backend_name: ClassVar[str] = "nessai"
+    required_package: ClassVar[tuple[str, str] | None] = ("nessai", "nessai")
     _protected_engine_keys: ClassVar[set[str]] = {
         "nlive",
         "output",
@@ -179,9 +167,8 @@ class Nessai(BackendConfig):
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Additional keyword arguments forwarded to nessai's FlowSampler. "
-            "Reserved keys such as 'nlive', 'output', and "
-            "'importance_nested_sampler' are not allowed."
+            "Extra keyword arguments for nessai's `FlowSampler`, e.g. `{'seed': 1}`, "
+            "except `nlive`, `output` and `importance_nested_sampler`."
         ),
     )
 
@@ -197,286 +184,323 @@ class Nessai(BackendConfig):
 
 
 class Ultranest(BackendConfig):
-    """Configuration for the [`ultranest`](https://johannesbuchner.github.io/UltraNest/index.html) backend."""
+    """Nested sampling with [`ultranest`](https://johannesbuchner.github.io/UltraNest/index.html) (MLFriends regions).
+
+    `FitResults` holds equal-weight posterior samples and `log_Z`. Plots and
+    checkpoints go to `<outputfiles_basename>/ultranest_outputs`. Needs the
+    `ultranest` package.
+    """
 
     backend_name: ClassVar[str] = "ultranest"
+    required_package: ClassVar[tuple[str, str] | None] = ("ultranest", "ultranest")
 
     num_live_points: PositiveInt = Field(
         default=1_000,
-        description="Number of live points used by the nested sampler.",
+        description="Minimum number of live points; UltraNest may add more.",
     )
     resume: StrictBool = Field(
         default=True,
-        description="Resume a previous UltraNest run if checkpoint files exist.",
+        description="Resume a previous run from its checkpoints.",
     )
     use_step_sampler: StrictBool = Field(
         default=False,
-        description="Enable UltraNest's population step sampler.",
+        description="Use a population slice sampler instead of region sampling, usually faster with many parameters.",
     )
 
 
-class Iminuit(_OptimizerInitConfig):
-    """Configuration for the [`iminuit`](https://scikit-hep.org/iminuit/) backend."""
+class Iminuit(_StartingPointConfig):
+    """Optimiser: MINUIT's MIGRAD algorithm through [`iminuit`](https://scikit-hep.org/iminuit/).
+
+    Finds the maximum a posteriori parameters (`best_fit`, and `best_fit_stat`
+    as XSPEC's statistic with `Fit.bayes = "on"`). `posterior_samples` are
+    draws from a Gaussian (Laplace) approximation around it, and `log_Z` is NaN.
+    Needs the `iminuit` package.
+    """
 
     backend_name: ClassVar[str] = "iminuit"
+    required_package: ClassVar[tuple[str, str] | None] = ("iminuit", "iminuit")
 
     run_hesse: StrictBool = Field(
         default=True,
-        description="Run HESSE after MIGRAD to estimate parameter covariance.",
+        description="Run HESSE after MIGRAD to estimate the covariance.",
     )
-    strategy: Annotated[int, Field(strict=True, ge=0, le=2)] = Field(
+    strategy: Integer = Field(
         default=1,
-        description=(
-            "MIGRAD strategy level (0, 1, or 2). Higher values trade more "
-            "function evaluations for more accurate gradient and Hessian "
-            "estimates. ``2`` is recommended for noisy or strongly "
-            "correlated likelihood surfaces."
-        ),
+        ge=0, le=2,
+        description="MIGRAD strategy (0, 1 or 2); higher is slower but more accurate, 2 suits noisy or correlated fits.",
     )
     tol: PositiveFloat | None = Field(
         default=None,
-        description=(
-            "MIGRAD EDM stopping tolerance. The actual stop threshold is "
-            "``0.002 * tol * errordef`` (so iminuit's default ``tol=0.1`` "
-            "with ``errordef=1`` gives an EDM threshold of ``2e-4``). Set "
-            "to ``None`` to keep iminuit's default."
-        ),
+        description="MIGRAD stopping tolerance (EDM below `0.002 * tol`); `None` keeps iminuit's default.",
     )
     precision: PositiveFloat | None = Field(
         default=None,
         description=(
-            "Declared precision of the objective function "
-            "(``Minuit.precision``)."
+            "Relative precision of the C-stat, e.g. `1e-5` for noisy table models; "
+            "`None` keeps iminuit's default."
         ),
     )
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
-        description="Additional keyword arguments forwarded to Minuit.migrad().",
+        description="Extra keyword arguments for `Minuit.migrad()`.",
     )
 
 
-class LevenbergMarquardt(_OptimizerInitConfig):
-    """Configuration for the [Levenberg-Marquardt](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.least_squares.html) backend."""
+class LevenbergMarquardt(_StartingPointConfig):
+    """Optimiser: least squares on the Poisson deviance with [SciPy](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.least_squares.html), like XSPEC's `fit`.
+
+    Finds the maximum a posteriori parameters (`best_fit`, and `best_fit_stat`
+    as XSPEC's statistic with `Fit.bayes = "on"`). `posterior_samples` are
+    draws from a Gaussian (Laplace) approximation around it, and `log_Z` is NaN.
+    """
 
     backend_name: ClassVar[str] = "levenberg_marquardt"
 
     reparametrise: StrictBool = Field(
         default=False,
         description=(
-            "If True, search in unconstrained logit-of-CDF space. If False "
-            "(default), search in physical space with explicit prior bounds "
-            "via scipy's `trf` method — matches XSPEC's `leven`."
+            "Search the unbounded logit-of-CDF space with SciPy's `lm` instead of "
+            "physical units within the prior bounds with `trf` (like XSPEC's `leven`)."
         ),
     )
     engine_kwargs: dict[str, Any] = Field(
         default_factory=dict,
-        description="Additional keyword arguments forwarded to scipy.optimize.least_squares().",
+        description="Extra keyword arguments for `scipy.optimize.least_squares()`, overriding bsixsa's defaults.",
     )
 
 
-class Emcee(_OptimizerInitConfig):
-    """Configuration for the [`emcee`](https://emcee.readthedocs.io/en/stable/index.html) backend."""
+class Emcee(_StartingPointConfig):
+    """Ensemble MCMC with [`emcee`](https://emcee.readthedocs.io/en/stable/index.html).
+
+    `posterior_samples` is the chain after burn-in (correlated draws); `log_Z`
+    is NaN. Requires `x0_physical` or `init_from_prior=True`, and the `emcee`
+    package.
+    """
 
     backend_name: ClassVar[str] = "emcee"
+    required_package: ClassVar[tuple[str, str] | None] = ("emcee", "emcee")
 
     num_warmup: PositiveInt = Field(
         default=100,
-        description="Number of warmup or burn-in steps to discard.",
+        description="Burn-in steps per walker, discarded.",
     )
     num_samples: PositiveInt = Field(
         default=10_000,
-        description="Number of production samples to draw after warmup.",
+        description="Recorded steps per walker; the posterior holds `num_samples * num_walkers` draws.",
     )
     num_walkers: PositiveInt = Field(
         default=32,
-        description="Number of walkers in the ensemble sampler.",
+        description="Number of walkers in the ensemble, at least twice the number of free parameters.",
     )
     init_spread: PositiveFloat = Field(
         default=1e-3,
-        description=(
-            "Relative Gaussian spread applied to the initial point to generate "
-            "the walker ensemble."
-        ),
+        description="Relative scatter of the walkers around the start, `x0 * (1 + init_spread * N(0, 1))`.",
     )
 
     @model_validator(mode="after")
-    def _validate_initialisation_strategy(self) -> Emcee:
-        _ensure_init_not_overspecified(self.x0_physical, self.init_from_prior)
+    def _require_a_starting_point(self) -> Emcee:
         if self.x0_physical is None and not self.init_from_prior:
             raise ValueError(
-                "EmceeConfig requires either `x0_physical` or `init_from_prior=True`."
+                "Emcee requires either `x0_physical` (one value per free parameter) or "
+                "`init_from_prior=True` to place its walkers."
             )
         return self
 
-    def validate_for_solver(self, solver: "Solver") -> None:
+    def validate_for_solver(self, solver: Solver) -> None:
+        """Check `x0_physical` and that `num_walkers` is at least twice the number of free parameters."""
         super().validate_for_solver(solver)
         if self.num_walkers < 2 * solver.num_parameters:
             raise ValueError(
                 "`num_walkers` must be at least twice the number of free "
-                f"parameters ({2 * solver.num_parameters} minimum)."
+                f"parameters ({2 * solver.num_parameters} minimum), got {self.num_walkers}."
             )
 
 
-class SIXSA(BackendConfig):
-    """Configuration for the SIXSA simulation-based inference (SBI) backend.
+class FlowConfig(BaseModel):
+    """Size and training budget of each SIXSA flow (a masked autoregressive flow trained with sbi)."""
 
-    SIXSA fits spectra with neural posterior estimation (NPE) over several
-    sequential rounds: each round draws parameters from the current proposal,
-    simulates the corresponding spectra, and trains an ensemble of neural
-    density estimators to refine the posterior. Importance-sampling
-    diagnostics computed each round are used to select the best round and can
-    trigger early stopping. See the
-    [SBI-with-NPE paper series](https://ui.adsabs.harvard.edu/abs/2025A%26A...699A.179D/abstract)
-    for the underlying methodology.
+    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
+
+    hidden_features: PositiveInt = Field(default=50, description="Width of the hidden layers.")
+    num_transforms: PositiveInt = Field(default=5, description="Number of stacked transforms.")
+    training_batch_size: PositiveInt = Field(default=1024, description="Training pairs per gradient step.")
+    max_num_epochs: PositiveInt = Field(default=25, description="Maximum number of epochs.")
+    stop_after_epochs: PositiveInt = Field(
+        default=10,
+        description="Epochs without validation improvement before stopping (patience).",
+    )
+
+
+class CompressorConfig(BaseModel):
+    """Cash-loss autoencoder that compresses each spectrum before the SIXSA flows."""
+
+    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
+
+    latent_dim: PositiveInt | None = Field(
+        default=None,
+        description="Size of the compressed spectrum; `None` picks it from the number of parameters.",
+    )
+    hidden_dims: list[PositiveInt] | None = Field(
+        default=None,
+        description="Encoder hidden widths (mirrored in the decoder); `None` picks them from the number of channels.",
+    )
+    n_layers: PositiveInt = Field(default=3, description="Hidden layers when `hidden_dims` is `None`.")
+    epochs: PositiveInt = Field(default=1000, description="Maximum number of epochs per fit.")
+    batch_size: PositiveInt = Field(default=512, description="Spectra per gradient step.")
+    learning_rate: PositiveFloat = Field(default=1e-3, description="Adam learning rate.")
+    patience: PositiveInt = Field(default=20, description="Epochs without validation improvement before stopping.")
+    validation_fraction: float = Field(
+        default=0.2,
+        gt=0, lt=1,
+        description="Fraction of the spectra held out for early stopping.",
+    )
+    warm_start: StrictBool = Field(default=True, description="Start each refit from the previous weights.")
+    device: Literal["auto", "cpu", "cuda", "mps"] = Field(
+        default="cpu",
+        description="Device of the autoencoder; `auto` picks cuda, then mps, then cpu.",
+    )
+
+
+class SIXSA(BackendConfig):
+    """SIXSA: history matching, a Cash-loss autoencoder and certified NPE proposals.
+
+    History matching first restricts the prior to the region worth
+    sampling. Each round then trains `n_nde` flows and certifies their
+    equal-weight mixture by importance sampling on exact folds (Pareto k-hat
+    below `khat_threshold`, efficiency at least `min_efficiency`). Until one
+    passes, the next training set is drawn inside the proposal's
+    highest-density region, intersected with the history-matching region.
+    SIXSA fits one spectrum with the C-statistic, without background, and
+    finite priors.
+
+    `FitResults` holds equal-weight posterior samples, `log_Z`, and the best
+    fold as `best_fit`.
     """
+
+    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
     backend_name: ClassVar[str] = "sixsa"
 
-    num_simulations_per_round: list[PositiveInt] = Field(
-        ...,
-        min_length=1,
+    history_matching: HistoryMatching | None = Field(
+        default_factory=HistoryMatching,
         description=(
-            "Number of simulations to run in each sequential inference round; the "
-            "list length sets the number of rounds. Round 1 trains on all of them; "
-            "later rounds keep the top `1 - is_filter_fraction` by importance "
-            "weight. A front-loaded schedule like `[10_000, 1000, 1000, 1000]` "
-            "trains a solid base flow, then refines cheaply. Note this is the "
-            "*simulated* (pool) count per round: `_sixsa_dev` instead controls the "
-            "*kept* count and inflates the pool, so to reproduce a reference kept "
-            "count `K` set the list entry to `ceil(K / (1 - is_filter_fraction))`."
+            "History matching run before the first round; the training sets are drawn in its "
+            "region. `None` skips it."
         ),
     )
-    n_ensemble: PositiveInt = Field(
-        default=8,
-        description="Number of neural posterior estimators trained per round.",
+    n_nde: PositiveInt = Field(
+        default=5,
+        description="Flows trained per round from different seeds; their equal-weight mixture is the round's proposal.",
     )
-    first_round_sampling: str = Field(
-        default="qmc",
-        description=(
-            "Round-1 design in the unit-Gaussian latent N(0, I): 'qmc' draws a "
-            "Sobol-based quasi-Monte-Carlo design (`MultivariateNormalQMC`) for even "
-            "space-filling coverage at a fixed simulation budget; 'prior' draws i.i.d. "
-            "standard-normal samples."
-        ),
-    )
-    embedding: Any = Field(
-        default=None,
-        description=(
-            "Embedding network(s) used to compress spectra. Accepts a single "
-            "`Embedding`, a list of one `Embedding` per round, or `None` to use "
-            "the identity embedding."
-        ),
-    )
-    embedding_net: Any = Field(
-        default=None,
-        description=(
-            "Embedding network trained jointly with the NPE via sbi's `embedding_net` "
-            "(an `EmbeddingNet`, a list of one per round, or `None`). `None` uses the "
-            "built-in default `FCEmbeddingNet()` (an `FCEmbeddingAPD` geometric pyramid "
-            "compressing the spectrum to `output_dim=32`, linear)."
-        ),
-    )
-    training_kwargs: dict[str, Any] | list[dict[str, Any]] | None = Field(
-        default=None,
-        description=(
-            "Keyword arguments forwarded to the NPE training step, either shared "
-            "across rounds (single dict) or per round (list). `None` uses the "
-            "backend defaults."
-        ),
-    )
-    nde_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Keyword arguments forwarded to sbi's `posterior_nn` building the "
-            "density estimator (the normalizing flow). `None` uses the reference "
-            "defaults: a MAF with `hidden_features=100`, `num_transforms=10`, and "
-            "independent z-scoring of theta and x."
-        ),
-    )
-    max_num_epochs: PositiveInt = Field(
+    n_rounds: PositiveInt = Field(
         default=20,
-        description=(
-            "Maximum number of training epochs for each neural density estimator. "
-            "Forwarded to sbi's `train(max_num_epochs=...)`. An explicit "
-            "`max_num_epochs` inside `training_kwargs` takes precedence."
-        ),
+        description="Maximum number of rounds; the run stops once a proposal is certified.",
     )
-    plot_diagnostics: StrictBool = Field(
-        default=True,
-        description=(
-            "Write SIXSA diagnostic plots: a per-round coverage band and an "
-            "ensemble-posterior corner under each `round_<n>/` directory, plus a "
-            "`training_history.pdf` summary at the end of the run."
-        ),
+    check_draws: Integer = Field(
+        default=1000,
+        ge=100,
+        description="Proposal draws (one exact fold each) that certify the proposal of each round.",
     )
-    ensemble_corner_samples: PositiveInt = Field(
-        default=2_000,
-        description=(
-            "Samples drawn from each NDE posterior when building the per-round "
-            "ensemble-posterior corner plot."
-        ),
+    khat_threshold: float = Field(
+        default=0.7,
+        ge=0, le=1,
+        description="Largest Pareto k-hat of the importance weights for certification (0.7 is the usual PSIS limit).",
     )
-    device: str = Field(
-        default="cpu",
-        description="Torch device used for the restricted proposal.",
+    min_efficiency: float = Field(
+        default=5.0,
+        ge=0, le=100,
+        description="Smallest importance-sampling efficiency (effective sample size per fold) for certification, in percent.",
     )
-    is_filter_fraction: float = Field(
-        default=0.5,
-        strict=True,
-        ge=0.0,
-        lt=1.0,
-        description=(
-            "Fraction of each round's simulations discarded by importance-sampling "
-            "filtering before training; the top `1 - is_filter_fraction` by weight "
-            "are kept. `0.0` disables filtering."
-        ),
+    truncated_quantile: float = Field(
+        default=1e-3,
+        gt=0, lt=1,
+        description="The next training set is drawn in the proposal's `1 - truncated_quantile` highest-density region.",
     )
-    khat_threshold: float | None = Field(
-        default=0.5,
-        description=(
-            "Pareto k-hat threshold for early stopping. A round whose IS "
-            "diagnostics fall below this value triggers convergence. `None` "
-            "disables the early-stopping check."
-        ),
-    )
-    force_last_round: StrictBool = Field(
-        default=True,
-        description="Run one extra round after the k-hat threshold is crossed.",
-    )
-    truncated_quantile: PositiveFloat = Field(
-        default=1e-4,
-        description="Density quantile used to truncate the restricted proposal.",
-    )
-    truncated_num_samples_to_estimate_support: PositiveInt = Field(
+    truncated_support_draws: Integer = Field(
         default=10_000,
-        description="Number of samples used to estimate the restricted-proposal support.",
+        ge=100,
+        description="Proposal draws used to place that density threshold.",
     )
-    truncated_max_sampling_batch_size: PositiveInt = Field(
-        default=1_000,
-        description=(
-            "Batch size for SIR sampling from the truncated proposal, forwarded to "
-            "sbi's `RestrictedPrior.sample(max_sampling_batch_size=...)`. Each "
-            "iteration draws `batch_size * 32` candidates from the ensemble posterior "
-            "and resamples `batch_size`, so a smaller value caps peak memory/compute "
-            "at the cost of more iterations. This is purely a performance knob -- it "
-            "does not change the sampled distribution. sbi's default is 10_000; SIXSA "
-            "uses a smaller batch by default, mirroring `_sixsa_dev`'s small-batch SIR. "
-            "(Note: sbi 0.25.0 ignores the related `oversampling_factor`; "
-            "candidates-per-sample is fixed at 32.)"
-        ),
+    truncated_oversampling: PositiveInt = Field(
+        default=32,
+        description="Flow candidates per training draw when sampling that region; more gives more uniform draws.",
+    )
+    n_training: Annotated[Integer, Field(ge=20)] | None = Field(
+        default=None,
+        description="Size of the first training set; `None` picks it from the number of parameters and channels.",
+    )
+    train_ramp: float = Field(
+        default=1.25,
+        ge=1,
+        description="Growth factor of the training set per round.",
+    )
+    train_max: PositiveInt = Field(default=50_000, description="Largest training set.")
+    refresh_compressor: StrictBool | NonNegativeInt = Field(
+        default=True,
+        description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
+    )
+    flow: FlowConfig = Field(default_factory=FlowConfig, description="Size and training budget of the flows.")
+    compressor: CompressorConfig = Field(default_factory=CompressorConfig, description="Spectrum autoencoder.")
+    target_ess: PositiveFloat = Field(
+        default=2000.0,
+        description="Effective sample size at which the final importance sample stops.",
+    )
+    max_sampling_draws: PositiveInt = Field(
+        default=200_000,
+        description="Largest number of draws of the final importance sample.",
     )
     num_posterior_samples: PositiveInt = Field(
         default=10_000,
-        description="Number of posterior samples drawn into the returned results.",
+        description="Equal-weight rows in `FitResults.posterior_samples`.",
+    )
+    seed: NonNegativeInt | None = Field(
+        default=None,
+        description="Seed of every random draw of the run, except history matching's; `None` is not reproducible.",
     )
 
+    @model_validator(mode="after")
+    def _validate_budgets(self) -> SIXSA:
+        if self.n_training is not None and self.n_training > self.train_max:
+            raise ValueError(
+                f"n_training ({self.n_training}) must not exceed train_max ({self.train_max})."
+            )
+        return self
 
-Backend = (
-        Nautilus
-        | Nessai
-        | Ultranest
-        | Iminuit
-        | LevenbergMarquardt
-        | Emcee
-        | SIXSA
-)
+    def validate_for_solver(self, solver: Solver) -> None:
+        """Check that the prior is finite and XSPEC holds one spectrum, no background, and uses cstat.
+
+        Raises:
+            ValueError: If SIXSA cannot fit this solver.
+        """
+        from ..priors import validate_finite_support
+
+        validate_finite_support(solver.prior)
+        constraints = solver._xspec_constraints()
+        n_spectra = constraints["n_spectra"]
+        if n_spectra is None:
+            raise ValueError(
+                "SIXSA fits exactly one spectrum, but the number of loaded spectra "
+                "could not be read from XSPEC."
+            )
+        if n_spectra != 1:
+            raise ValueError(
+                f"SIXSA fits exactly one spectrum, but {n_spectra} are loaded; use another "
+                "backend (e.g. Nautilus) for joint fits."
+            )
+        if constraints["has_background"]:
+            raise ValueError(
+                "SIXSA does not model a background, and with one loaded XSPEC's cstat "
+                "becomes W-stat: remove it (xspec.AllData(1).background = None) and model "
+                "the background instead, or use another backend."
+            )
+        stat_method = constraints["stat_method"]
+        if stat_method is None:
+            raise ValueError(
+                "SIXSA needs the C-statistic, but xspec.Fit.statMethod could not be read; "
+                "set xspec.Fit.statMethod = 'cstat'."
+            )
+        if stat_method != "cstat":
+            raise ValueError(
+                f"SIXSA needs the C-statistic, but xspec.Fit.statMethod is {stat_method!r}: "
+                "set xspec.Fit.statMethod = 'cstat'."
+            )

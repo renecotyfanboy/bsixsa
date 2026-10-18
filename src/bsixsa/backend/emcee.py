@@ -1,100 +1,70 @@
-"""Ensemble MCMC backend using *emcee*."""
+"""Ensemble MCMC with emcee."""
 
 from __future__ import annotations
 
-import typing
+import time
 
 import emcee
 import numpy as np
 
-from . import register_backend
-from .abc import Backend
-from .config import Emcee
 from ..solver import FitResults
+from .abc import Backend, random_rows
+from .config import Emcee
 
-if typing.TYPE_CHECKING:
-    from ..solver import Solver
 
-
-@register_backend
 class EmceeBackend(Backend):
+    """Ensemble MCMC with emcee (half differential-evolution, half stretch moves).
 
-    name = "emcee"
+    Attributes:
+        sampler: The `emcee.EnsembleSampler` after `run`, for emcee's diagnostics.
+    """
+
     config_cls = Emcee
 
-    def __init__(
-        self,
-        *,
-        solver: Solver,
-        config: Emcee,
-    ):
-        super().__init__(solver=solver, config=config)
+    def log_prob(self, theta: np.ndarray) -> np.ndarray:
+        """Log posterior `-C/2 + log prior` (up to a constant) of each walker, shape `(n_walkers,)`.
 
-
-    def log_prob(self, parameters):
-
-        log_prior = self.solver.log_prior_fn(parameters, None)
-        in_prior_parameters = np.isfinite(log_prior)
-        log_likelihood = -np.inf * np.empty_like(log_prior)
-        log_likelihood[in_prior_parameters] = self.solver.log_likelihood_fn(
-            parameters[in_prior_parameters], None, progress_bar=False
-        )
-
-        self.tracer.record(parameters, -2 * log_likelihood)
-
-        with np.errstate(all='ignore'):
-            log_prob = np.nan_to_num(log_likelihood + log_prior, nan=-np.inf, posinf=-np.inf)
-
-        return log_prob
+        Walkers outside the prior are not folded.
+        """
+        log_prior = self.solver.log_prior_fn(theta)
+        inside = np.isfinite(log_prior)
+        log_like = np.full(len(theta), -np.inf)
+        log_like[inside] = self._log_likelihood(theta[inside])
+        # Outside the prior: the most negative finite float, so that a move outside is
+        # always rejected. A NaN statistic (failed evaluation): -inf, never accepted.
+        with np.errstate(all="ignore"):
+            return np.nan_to_num(
+                log_like + log_prior, nan=-np.inf, posinf=-np.inf, neginf=np.finfo(float).min
+            )
 
     def run(self) -> FitResults:
-
-        from ..convenience import catchtime
-
-        num_warmup = self.config.num_warmup
-        num_samples = self.config.num_samples
-        num_walkers = self.config.num_walkers
-        x0_physical = self.config.x0_physical
-        init_from_prior = self.config.init_from_prior
-        init_spread = self.config.init_spread
-
+        """Run the chain and return the steps after the burn-in as the posterior."""
+        config = self.config
+        d = self.solver.num_parameters
+        folds_before = sum(self.solver.fold_counts.values())
         self.sampler = emcee.EnsembleSampler(
-            num_walkers,
-            self.solver.num_parameters,
+            config.num_walkers,
+            d,
             self.log_prob,
             vectorize=True,
-            moves=[
-                (emcee.moves.DEMove(), 0.5),
-                (emcee.moves.StretchMove(), 0.5),
-            ]
+            moves=[(emcee.moves.DEMove(), 0.5), (emcee.moves.StretchMove(), 0.5)],
         )
+        x0 = config.x0_physical if config.x0_physical is not None else self.solver.prior.sample(size=1).ravel()
+        walkers = x0 * np.random.normal(loc=1, scale=config.init_spread, size=(config.num_walkers, d))
 
-        if x0_physical is not None:
-            x0 = np.asarray(x0_physical, dtype=np.float64)
-        elif init_from_prior:
-            x0 = self.solver.prior.sample(size=1).ravel()
-        else:
-            raise ValueError("Either x0_physical or init_from_prior must be specified.")
+        start = time.perf_counter()
+        self.sampler.run_mcmc(walkers, config.num_warmup + config.num_samples, progress=True)
+        seconds = time.perf_counter() - start
 
-        x0 = np.asarray(x0, dtype=np.float64).ravel()
-        x0 = x0 * np.random.normal(loc=1, scale=init_spread, size=(num_walkers, self.solver.num_parameters))
-
-        with catchtime("Run emcee", print_time=False) as run_time:
-            self.sampler.run_mcmc(x0, num_warmup + num_samples, progress=True)
-
-        chain = self.sampler.get_chain(discard=num_warmup, thin=1, flat=True)
-
-        self.fit_result = FitResults(
-            time=float(run_time()),
-            posterior_samples=self._posterior_dataframe(chain),
-            n_likelihood_evaluations=int(self.tracer.n_evals),
+        self._chain = self.sampler.get_chain(discard=config.num_warmup, flat=True)
+        return FitResults(
+            time=seconds,
+            posterior_samples=self._posterior_dataframe(self._chain),
+            n_likelihood_evaluations=sum(self.solver.fold_counts.values()) - folds_before,
             log_Z=float("nan"),
             log_Z_err=float("nan"),
         )
 
-        return self.fit_result
-
     def sample(self, n: int) -> np.ndarray:
-        samples = self.fit_result.posterior_samples
-        size = min(n, samples.shape[0])
-        return samples[:size]
+        """Up to *n* random rows of the chain after burn-in (not its first, most correlated steps)."""
+        return random_rows(self._chain, n)
