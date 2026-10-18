@@ -222,7 +222,7 @@ class Restriction:
         n_simulations: Number of exact folds spent.
         seconds: Wall time of the run.
         config: Settings of the run.
-        param_names: Parameter names, for reports.
+        param_names: Parameter names, saved in ``history.json``.
     """
 
     region: Region

@@ -15,7 +15,7 @@ from _analytic import AnalyticSolver, AnalyticSpectrum
 
 import bsixsa.solver as solver_module
 import bsixsa.xspec as xspec_module
-from bsixsa.backend.config import BackendConfig, Nessai
+from bsixsa.backend.config import SIXSA, BackendConfig, Nessai
 from bsixsa.priors import MultipleIndependent, loguniform, uniform
 from bsixsa.solver import Solver
 
@@ -36,6 +36,7 @@ class _RecordingConfig(BackendConfig):
             "fold_counts": solver.fold_counts,
             "has_pool_attr": hasattr(solver, "pool"),
             "has_prior": hasattr(solver, "prior"),
+            "has_output_directory": hasattr(solver, "outputfiles_basename"),
         }
 
 
@@ -90,7 +91,7 @@ def test_analytic_solver_builds(tmp_path):
     np.testing.assert_array_equal(solver.observed_spectrum, solver.observed_counts)
 
 
-def test_setup_validates_backend_after_full_initialisation(tmp_path):
+def test_setup_validates_backend_before_preparing_the_output_directory(tmp_path):
     _make_solver(tmp_path, backend=_RecordingConfig(trace=False))
 
     assert _RecordingConfig.seen == {
@@ -98,7 +99,33 @@ def test_setup_validates_backend_after_full_initialisation(tmp_path):
         "fold_counts": {},
         "has_pool_attr": True,
         "has_prior": True,
+        "has_output_directory": False,
     }
+
+
+class _NormalPriorSpectrum(AnalyticSpectrum):
+    """An infinite-support Gaussian prior on Gamma."""
+
+    def prior_list(self):
+        from scipy.stats import norm
+
+        dists = super().prior_list()
+        dists[0] = norm(2.0, 0.5)
+        return dists
+
+
+def test_sixsa_refuses_an_infinite_prior_before_clearing_the_output_directory(tmp_path):
+    target = tmp_path / "out"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    spectrum = _NormalPriorSpectrum(d=2)
+
+    for config in (SIXSA(trace=False), SIXSA(trace=False, history_matching=None)):
+        with pytest.raises(ValueError, match="finite"):
+            _make_solver(tmp_path, spectrum=spectrum, backend=config, overwrite=True)
+    assert (target / "keep.txt").exists()
+    # A backend without this requirement accepts the same prior.
+    assert _make_solver(tmp_path, name="other", spectrum=spectrum).num_parameters == 2
 
 
 def test_setup_initialises_every_attribute_without_xspec(tmp_path):

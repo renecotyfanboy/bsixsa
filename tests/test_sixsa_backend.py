@@ -64,6 +64,12 @@ def test_public_run_recovers_grid_and_accounts_for_every_fold(completed):
     assert np.all((0.85 < ratio) & (ratio < 1.15)), ratio
     assert fit.n_likelihood_evaluations == sum(solver.fold_counts.values())
     assert solver.fold_counts["restriction"] == backend.restriction.n_simulations
+    # History matching folds inside run()'s pool scope, with the solver's parameter names.
+    assert all(entry["pool_depth"] >= 1 for entry in solver.fold_log if entry["phase"] == "restriction")
+    assert backend.restriction.param_names == solver.parameter_names
+    # Each round certifies the mixture of its flows, once.
+    assert all(record["name"] == f"round{record['round']}/mixture" for record in backend.history)
+    assert solver.fold_counts["gate"] == sum(record["n_in"] for record in backend.history)
     assert solver.fold_counts["harvest"] == 1500
     assert fit.best_fit_stat >= truth["c_min"] - 0.05
     assert fit.best_fit_stat <= truth["c_min"] + 2

@@ -17,8 +17,10 @@ This run is not distributed with bsixsa: it comes from the author's analysis
 notebooks. A simulated 100 ks X-IFU spectrum of the Perseus cluster,
 `tbabs*bvapec` with 11 free parameters (nH, kT, six abundances, redshift,
 velocity broadening and a log-uniform normalisation) on 3197 channels, was fitted
-with the default configuration
-(`SIXSA(n_nde=5, seed=0, history_matching=HistoryMatching(seed=0))`). The reference is a nessai importance nested
+with a previous version of SIXSA, which certified every flow of a round and
+their mixture before gating the best of them, and ran history matching before
+the backend; it used the default settings, `n_nde=5`, `seed=0` and
+`HistoryMatching(seed=0)`. The reference is a nessai importance nested
 sampling run (log Z −1531.599 ± 0.010).
 
 | round | training set | k-hat | efficiency |

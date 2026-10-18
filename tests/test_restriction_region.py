@@ -324,12 +324,11 @@ def test_prior_mass_measures_a_region_below_the_old_fixed_cap(quad):
 # ------------------------------------------------------------ Restriction
 
 
-def _restriction(quad, *, r2=4.0, n=3000, seed=123, rmse=0.5, **cfg_kwargs):
-    rng = np.random.default_rng(11)
-    u = rng.random((n, 2))
+def _restriction(quad):
+    n, rmse = 3000, 0.5
+    u = np.random.default_rng(11).random((n, 2))
     cstat = quad.cstat(u)
-    threshold = quad.c0 + r2
-    cfg = HistoryMatching(seed=seed, **cfg_kwargs)
+    threshold = quad.c0 + 4.0
     history = [
         {
             "wave": 1,
@@ -360,7 +359,7 @@ def _restriction(quad, *, r2=4.0, n=3000, seed=123, rmse=0.5, **cfg_kwargs):
         stop_reason="n_waves",
         n_simulations=n,
         seconds=1.5,
-        config=cfg,
+        config=HistoryMatching(seed=123),
         param_names=["nH", "norm"],
     )
 

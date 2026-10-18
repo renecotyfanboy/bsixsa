@@ -85,7 +85,7 @@ def run_history_matching(
             ``(n,)``, finite or ``+inf``.
         d: Dimension of the cube.
         cfg: History-matching settings.
-        param_names: Parameter names, stored in the result for its reports.
+        param_names: Parameter names, stored in the result (and its ``history.json``).
         log: Receives one summary line per wave; silent by default.
 
     Returns:
