@@ -6,11 +6,9 @@ icon: lucide/footprints
 
 This page fits the XMM-Newton spectra of the ultraluminous X-ray source NGC 7793 ULX-4 with the [`Emcee`][bsixsa.backend.config.Emcee] ensemble sampler. The walkers start in a small ball around the best fit, which is found first with the [`LevenbergMarquardt`][bsixsa.backend.config.LevenbergMarquardt] optimiser on the same `Solver`. The three EPIC spectra (PN, MOS1 and MOS2) and their backgrounds are fitted together.
 
-The data are available in the [jaxspec-database](https://github.com/renecotyfanboy/jaxspec-database/tree/main/example_data/NGC7793_ULX4) repository. Download the content of the folder and run the snippets from it: the headers of the spectra point to their background and response files.
-
 ## Data loading with PyXSPEC
 
-The three spectra are loaded in data group 1, so that they share the model parameters. Each of them has a background file, so XSPEC's `cstat` becomes the W-statistic.
+The three spectra are loaded in data group 1, so that they share the model parameters.
 
 ``` python title="Load the three EPIC spectra"
 import xspec
