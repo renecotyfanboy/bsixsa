@@ -19,6 +19,7 @@ nav = [
     { "Examples" = [
         {"Simple fit" = "examples/demo.md"},
         {"NXB / Multi-response" = "examples/nxb.md"},
+        {"MCMC from the best fit" = "examples/ulx.md"},
     ]},
     { "Reference" = [
         {"Solver" = "reference/solver.md"},
