@@ -38,15 +38,12 @@ class UltranestBackend(Backend):
             resume="resume" if config.resume else "overwrite",
         )
         if config.use_step_sampler:
-            directions = {
-                "region": ultranest.popstepsampler.generate_region_oriented_direction,
-                "mixture": ultranest.popstepsampler.generate_mixture_random_direction,
-            }
+            nsteps = 2 * len(solver.parameter_names) if config.nsteps is None else config.nsteps
             self._reactive_sampler.stepsampler = ultranest.popstepsampler.PopulationSimpleSliceSampler(
                 popsize=config.popsize,
-                nsteps=config.nsteps,
+                nsteps=nsteps,
                 scale=1,
-                generate_direction=directions[config.direction],
+                generate_direction=ultranest.popstepsampler.generate_mixture_random_direction,
             )
 
     def _transform(self, cube: np.ndarray) -> np.ndarray:

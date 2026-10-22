@@ -150,11 +150,11 @@ def test_ultranest_config_rejects_unknown_extras():
         Ultranest(foo="bar")
 
 
-def test_ultranest_step_sampler_defaults_and_directions():
+def test_ultranest_step_sampler_defaults():
     config = Ultranest()
-    assert (config.nsteps, config.popsize, config.direction) == (50, 100, "region")
+    assert (config.nsteps, config.popsize) == (None, 128)
     with pytest.raises(ValidationError):
-        Ultranest(direction="cube")
+        Ultranest(nsteps=0)
 
 
 def test_trace_config_exposes_shared_plot_settings():
