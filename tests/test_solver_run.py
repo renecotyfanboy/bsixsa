@@ -194,6 +194,23 @@ def test_ultranest_backend_uses_solver_names(tmp_path):
     assert sampler_cls.call_args.kwargs["resume"] == "overwrite"
 
 
+def test_ultranest_backend_configures_step_sampler(tmp_path):
+    pytest.importorskip("ultranest")
+    import ultranest.popstepsampler
+
+    from bsixsa.backend.config import Ultranest
+    from bsixsa.backend.ultranest import UltranestBackend
+
+    solver = SimpleNamespace(outputfiles_basename=str(tmp_path), parameter_names=["alpha", "beta"])
+    config = Ultranest(trace=False, use_step_sampler=True, nsteps=4, popsize=64, direction="mixture")
+    with patch("bsixsa.backend.ultranest.ultranest.ReactiveNestedSampler"):
+        backend = UltranestBackend(solver=solver, config=config)
+
+    stepsampler = backend._reactive_sampler.stepsampler
+    assert (stepsampler.nsteps, stepsampler.popsize) == (4, 64)
+    assert stepsampler.generate_direction is ultranest.popstepsampler.generate_mixture_random_direction
+
+
 def test_package_import_does_not_load_torch_and_exports_history_matching():
     code = f"""
 import sys

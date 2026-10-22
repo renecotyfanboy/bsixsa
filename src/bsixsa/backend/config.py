@@ -206,6 +206,29 @@ class Ultranest(BackendConfig):
         default=False,
         description="Use a population slice sampler instead of region sampling, usually faster with many parameters.",
     )
+    nsteps: PositiveInt = Field(
+        default=50,
+        description=(
+            "Slice-sampling steps per new live point, with `use_step_sampler`. Buchner (2022, "
+            "arXiv:2211.09426) finds at least 2 x the number of parameters necessary with "
+            "`direction='mixture'`, and 4 x with `'region'`."
+        ),
+    )
+    popsize: PositiveInt = Field(
+        default=100,
+        description=(
+            "Walkers advanced together, with `use_step_sampler`. Each likelihood call folds this many "
+            "points, so a multiple of the solver's `n_jobs` keeps every worker busy."
+        ),
+    )
+    direction: Literal["region", "mixture"] = Field(
+        default="region",
+        description=(
+            "Slice directions, with `use_step_sampler`: `'region'` follows a principal axis of the live "
+            "points; `'mixture'` alternates it with the difference of two live points, UltraNest's "
+            "recommended proposal."
+        ),
+    )
 
 
 class Iminuit(_StartingPointConfig):
