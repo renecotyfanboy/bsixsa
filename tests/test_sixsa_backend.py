@@ -12,8 +12,10 @@ from scipy.stats import chi2
 
 from _analytic import AnalyticSolver, AnalyticSpectrum, grid_truth
 from bsixsa import HistoryMatching, SIXSA
-from bsixsa.backend.config import CompressorConfig, FlowConfig
+from bsixsa.backend.config import AutoencoderConfig, FlowConfig, ScoreCompressorConfig
 from bsixsa.backend.sixsa._sixsa import SIXSABackend
+from bsixsa.backend.sixsa.compressor import Compressor
+from bsixsa.backend.sixsa.score import ScoreCompressor
 from bsixsa.priors import MultipleIndependent, loguniform
 
 _SUMMARY_SCALARS = {"name", "round_index", "n_raw", "n_in", "k_hat", "ess", "efficiency", "log_z", "log_z_err",
@@ -26,6 +28,10 @@ def small_restriction():
                            mass_probe=20000, seed=0)
 
 
+# A small autoencoder, for the runs that check the alternative compressor.
+SMALL_AUTOENCODER = dict(latent_dim=8, n_layers=2, epochs=80, patience=8, batch_size=256)
+
+
 def small_config(**changes):
     values = dict(
         seed=0, n_nde=2, n_rounds=4, check_draws=1000,
@@ -33,7 +39,6 @@ def small_config(**changes):
         history_matching=small_restriction(),
         flow=dict(hidden_features=32, num_transforms=3, max_num_epochs=20, training_batch_size=256,
                   stop_after_epochs=5),
-        compressor=dict(latent_dim=8, n_layers=2, epochs=80, patience=8, batch_size=256),
         target_ess=1500, num_posterior_samples=3000, max_sampling_draws=30000,
     )
     values.update(changes)
@@ -71,6 +76,10 @@ def test_public_run_recovers_grid_and_accounts_for_every_fold(completed):
     assert all(record["name"] == f"round{record['round']}/mixture" for record in backend.history)
     assert solver.fold_counts["gate"] == sum(record["n_in"] for record in backend.history)
     assert solver.fold_counts["harvest"] == 1500
+    # The score map is built once, at the fitted fiducial.
+    assert isinstance(backend.compressor, ScoreCompressor) and backend.compressor.u_star is not None
+    assert solver.fold_counts["compressor"] == backend.compressor.n_folds
+    assert backend.compressor.cstat_star <= truth["c_min"] + 0.5
     assert fit.best_fit_stat >= truth["c_min"] - 0.05
     assert fit.best_fit_stat <= truth["c_min"] + 2
     assert list(fit.posterior_samples.columns) == solver.parameter_names
@@ -95,7 +104,11 @@ def test_public_sampling_and_saved_diagnostics(completed):
     assert summary["posterior"]["passed"] and summary["rounds"][-1]["passed"]
     # The persisted keys, which notebooks read.
     assert set(summary) == {"exit_reason", "best_round", "time", "n_likelihood_evaluations", "fold_counts",
-                            "posterior", "rounds", "config"}
+                            "posterior", "gate", "rounds", "config"}
+    # small_config sets check_draws and target_ess; the efficiency gate comes from the schedule (d = 2).
+    assert summary["gate"] == {"khat_threshold": 0.7, "min_efficiency": 10.0, "check_draws": 1000,
+                               "target_ess": 1500.0}
+    assert (backend.min_efficiency, backend.target_ess) == (10.0, 1500.0)
     assert set(summary["posterior"]) == _SUMMARY_SCALARS | {"n_unique"}
     round_keys = _SUMMARY_SCALARS | {"round", "n_train", "compressor", "nde", "truncation"}
     assert all(set(record) == round_keys for record in summary["rounds"])
@@ -110,7 +123,7 @@ def test_public_sampling_and_saved_diagnostics(completed):
 
 @pytest.mark.parametrize("field,value", [
     ("n_nde", 0), ("check_draws", 10), ("truncated_sampling", "flow"), ("fold_chunk", 1000),
-    ("training_n_jobs", 2), ("khat_safe", 0.5), ("refresh_compressor", "True"),
+    ("training_n_jobs", 2), ("khat_safe", 0.5), ("refresh_compressor", True),
     ("n_ensemble", 2), ("run_emulator_pass", True),
 ])
 def test_config_rejects_invalid_and_retired_fields(field, value):
@@ -138,38 +151,114 @@ def test_internal_budgets_are_validated_at_configuration_boundary(field, value):
     ("flow", "training_batch_size", 0), ("flow", "max_num_epochs", 0),
     ("flow", "stop_after_epochs", 0), ("flow", "model", "nsf"),
     ("history_matching", "n_waves", 0),
-    ("compressor", "latent_dim", 0), ("compressor", "hidden_dims", [16, 0]),
-    ("compressor", "batch_size", "auto"), ("compressor", "batch_size", 0), ("compressor", "epochs", 0),
-    ("compressor", "learning_rate", 0.0), ("compressor", "learning_rate", float("inf")),
-    ("compressor", "patience", 0), ("compressor", "validation_fraction", 1.0),
-    ("compressor", "device", "tpu"),
 ])
 def test_network_options_are_validated_at_configuration_boundary(section, field, value):
     with pytest.raises(ValidationError) as exc:
         SIXSA(**{section: {field: value}})
-    assert exc.value.errors()[0]["loc"][:2] == (section, field)
+    # One FlowConfig stands for a one-entry list, so its errors carry the index 0.
+    expected = (section, 0, field) if section == "flow" else (section, field)
+    assert exc.value.errors()[0]["loc"][:len(expected)] == expected
+
+
+@pytest.mark.parametrize("member,field,value", [
+    ("AutoencoderConfig", "latent_dim", 0), ("AutoencoderConfig", "hidden_dims", [16, 0]),
+    ("AutoencoderConfig", "batch_size", "auto"), ("AutoencoderConfig", "batch_size", 0),
+    ("AutoencoderConfig", "epochs", 0), ("AutoencoderConfig", "learning_rate", 0.0),
+    ("AutoencoderConfig", "learning_rate", float("inf")), ("AutoencoderConfig", "patience", 0),
+    ("AutoencoderConfig", "validation_fraction", 1.0), ("AutoencoderConfig", "device", "tpu"),
+    ("AutoencoderConfig", "refresh", "True"), ("ScoreCompressorConfig", "fiducial", "mle"),
+    ("ScoreCompressorConfig", "recentre", "yes"),
+])
+def test_compressor_options_are_validated_by_the_compressor_they_belong_to(member, field, value):
+    with pytest.raises(ValidationError) as exc:
+        SIXSA(compressor={field: value})
+    # Each compressor reports on the dictionary; the one owning the field says what is wrong with the value.
+    owner = [e for e in exc.value.errors() if e["loc"][:3] == ("compressor", member, field)]
+    assert owner and owner[0]["type"] != "extra_forbidden"
 
 
 def test_reference_training_defaults_are_preserved():
     from bsixsa.backend.sixsa import flows
 
     cfg = SIXSA()
-    assert cfg.n_nde == 5
-    assert cfg.flow.model_dump() == dict(
-        hidden_features=50, num_transforms=5, training_batch_size=1024, max_num_epochs=25, stop_after_epochs=10,
-    )
+    assert cfg.n_nde == 7 and cfg.flow_torch_threads == 1
+    budget = dict(training_batch_size=1024, max_num_epochs=500, stop_after_epochs=10)
+    assert [member.model_dump() for member in cfg.flow_members()] == [
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=40, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=4, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=40, num_transforms=4, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=10, **budget),
+        dict(model="zuko_maf", hidden_features=30, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_maf", hidden_features=40, num_transforms=4, num_bins=8, **budget),
+    ]
+    assert (cfg.check_draws, cfg.train_ramp, cfg.train_max) == (2000, 1.1, 100_000)
+    assert cfg.min_efficiency is None and cfg.target_ess is None
     assert (flows._LEARNING_RATE, flows._VALIDATION_FRACTION, flows._CLIP_MAX_NORM) == (1e-3, 0.2, 1.0)
+
+
+@pytest.mark.parametrize("d, efficiency, ess", [
+    (1, 10.0, 5000), (4, 10.0, 5000), (5, 5.0, 3000), (9, 5.0, 3000), (10, 2.5, 2000),
+    (14, 2.5, 2000), (15, 1.0, 1000), (24, 1.0, 1000),
+])
+def test_gate_and_final_ess_follow_the_reference_schedules(d, efficiency, ess):
+    cfg = SIXSA()
+    assert cfg.gate_efficiency(d) == efficiency and cfg.final_ess(d) == ess
+    explicit = SIXSA(min_efficiency=7.5, target_ess=1234)
+    assert explicit.gate_efficiency(d) == 7.5 and explicit.final_ess(d) == 1234
+
+
+def test_custom_schedules_and_their_validation():
+    cfg = SIXSA(efficiency_schedule=[(3, 20.0), (None, 4.0)], ess_schedule=[[8, 900], [None, 300]])
+    assert (cfg.gate_efficiency(2), cfg.gate_efficiency(3)) == (20.0, 4.0)
+    assert (cfg.final_ess(7), cfg.final_ess(8)) == (900.0, 300.0)
+    assert SIXSA.model_validate_json(cfg.model_dump_json()) == cfg
+    for schedule in ([], [(5, 10.0)], [(None, 1.0), (5, 10.0)], [(10, 5.0), (5, 2.0), (None, 1.0)],
+                     [(5, 101.0), (None, 1.0)], [(5, float("nan")), (None, 1.0)]):
+        with pytest.raises(ValidationError):
+            SIXSA(efficiency_schedule=schedule)
+    with pytest.raises(ValidationError):
+        SIXSA(ess_schedule=[(5, 0.0), (None, 100.0)])
+    with pytest.raises(ValidationError):
+        SIXSA(min_efficiency=150.0)
+
+
+def test_flow_members_cycle_through_the_flow_list():
+    cfg = SIXSA(n_nde=3, flow=[{"model": "zuko_maf"}, {"hidden_features": 64}])
+    assert [(m.model, m.hidden_features) for m in cfg.flow_members()] == [
+        ("zuko_maf", 30), ("zuko_nsf", 64), ("zuko_maf", 30)]
+    assert [m.hidden_features for m in SIXSA(n_nde=2).flow_members()] == [30, 40]
+    single = SIXSA(n_nde=4, flow=FlowConfig(model="zuko_maf", hidden_features=50, num_transforms=5))
+    assert len(single.flow) == 1 and len(single.flow_members()) == 4
+    assert all(m == single.flow[0] for m in single.flow_members())
+    with pytest.raises(ValidationError):
+        SIXSA(flow=[])
 
 
 def test_config_nested_defaults():
     cfg = SIXSA(flow={"hidden_features": 32})
-    assert cfg.flow.num_transforms == 5
+    assert len(cfg.flow) == 1 and cfg.flow[0].num_transforms == 3 and cfg.flow[0].model == "zuko_nsf"
     assert cfg.truncated_oversampling == 32
-    assert cfg.compressor.device == "cpu" and cfg.compressor.batch_size == 512
-    assert isinstance(cfg.flow, FlowConfig)
-    assert isinstance(cfg.compressor, CompressorConfig)
+    assert isinstance(cfg.flow[0], FlowConfig)
+    assert cfg.compressor == ScoreCompressorConfig(fiducial="fit")
+    autoencoder = AutoencoderConfig()
+    assert autoencoder.device == "cpu" and autoencoder.batch_size == 512 and autoencoder.refresh is True
     assert cfg.history_matching == HistoryMatching()
     assert SIXSA(history_matching=None).history_matching is None
+    assert SIXSA.model_validate_json(cfg.model_dump_json()) == cfg
+
+
+@pytest.mark.parametrize("compressor,expected", [
+    ({}, ScoreCompressorConfig()),
+    ({"fiducial": "best_fold"}, ScoreCompressorConfig(fiducial="best_fold")),
+    ({"recentre": True}, ScoreCompressorConfig(recentre=True)),
+    ({"latent_dim": 8}, AutoencoderConfig(latent_dim=8)),
+    ({"refresh": 2}, AutoencoderConfig(refresh=2)),
+    (AutoencoderConfig(device="auto"), AutoencoderConfig(device="auto")),
+])
+def test_compressor_dictionaries_select_the_compressor_by_their_fields(compressor, expected):
+    cfg = SIXSA(compressor=compressor)
+    assert type(cfg.compressor) is type(expected) and cfg.compressor == expected
     assert SIXSA.model_validate_json(cfg.model_dump_json()) == cfg
 
 
@@ -228,10 +317,11 @@ def test_uncertified_final_sample_after_a_passed_gate_gives_gate_advice(tmp_path
 
     solver = AnalyticSolver(
         AnalyticSpectrum(), outputfiles_basename=tmp_path,
-        backend=small_config(n_nde=1, n_rounds=1, history_matching=None, max_sampling_draws=1000, target_ess=100),
+        backend=small_config(n_nde=1, n_rounds=1, history_matching=None, max_sampling_draws=1000, target_ess=100,
+                             min_efficiency=100),
     )
-    # Force the round-1 gate to pass; its proposal is still far from the
-    # posterior, so the final sample fails certification.
+    # Force the round-1 gate to pass; no sample reaches 100% efficiency, so the
+    # final sample fails certification.
     real = _sixsa.certify
 
     def gate_passes(*args, **kwargs):
@@ -246,6 +336,24 @@ def test_uncertified_final_sample_after_a_passed_gate_gives_gate_advice(tmp_path
     assert "the gate passed on 1000 draws" in message and "check_draws" in message
     assert "n_rounds" not in message
     assert not any("capped at" in m for m, _ in emitted)
+
+
+@pytest.mark.e2e
+def test_autoencoder_run_recovers_grid(tmp_path):
+    spectrum = AnalyticSpectrum(d=2)
+    solver = AnalyticSolver(spectrum, backend=small_config(compressor=SMALL_AUTOENCODER), outputfiles_basename=tmp_path)
+    fit = solver.run()
+    truth = grid_truth(spectrum)
+    backend = solver.backend
+    assert isinstance(backend.compressor, Compressor) and backend.compressor.latent_dim == 8
+    assert backend.posterior.passed
+    assert abs(fit.log_Z - truth["log_z"]) <= max(4 * fit.log_Z_err, 0.10)
+    values = np.asarray(fit.posterior_samples)
+    delta = np.abs(values.mean(axis=0) - truth["mean_theta"]) / truth["std_theta"]
+    assert np.all(delta < 0.1 + 4 / np.sqrt(backend.posterior.ess)), delta
+    # The autoencoder trains on the spectra and folds nothing of its own.
+    assert "compressor" not in solver.fold_counts
+    assert all(record["compressor"]["generation"] == record["round"] for record in backend.history)
 
 
 @pytest.mark.e2e
@@ -292,26 +400,21 @@ def test_three_parameters_without_restriction(tmp_path):
     assert solver.backend.tracer.n_evals == fit.n_likelihood_evaluations
 
 
-_REFERENCE_TABLE = {
-    2500: [2000, 3750, 12000, 27500, 45500],
-    1000: [1500, 3000, 9000, 22500, 38500],
-    5000: [2500, 4500, 15000, 32500, 56000],
-}
+# Reference implementation: 1000 per parameter at d = 6, times (d / 6)^0.6, rounded to 250, at least 750.
+_REFERENCE_TABLE = {2: 1500, 3: 2250, 6: 6000, 10: 12500, 11: 16500, 14: 24500, 18: 36000, 24: 54000}
 
 
-@pytest.mark.parametrize("n_bins", sorted(_REFERENCE_TABLE))
-@pytest.mark.parametrize("column, d", list(enumerate([2, 3, 6, 10, 14])))
-def test_training_set_size_matches_the_reference_table(n_bins, column, d):
+@pytest.mark.parametrize("d", sorted(_REFERENCE_TABLE))
+def test_training_set_size_matches_the_reference_table(d):
     from bsixsa.backend.sixsa._sixsa import training_set_size
 
-    assert training_set_size(d, n_bins) == _REFERENCE_TABLE[n_bins][column]
+    assert training_set_size(d) == _REFERENCE_TABLE[d]
 
 
 def test_training_set_size_floors():
     from bsixsa.backend.sixsa._sixsa import training_set_size
 
-    assert training_set_size(2, 64) == 1500  # binning factor clipped at 0.5, 750 per parameter
-    assert training_set_size(6, 10**9) == training_set_size(6, 2500 * 81) == 36000
+    assert training_set_size(1) == 750 and training_set_size(2) == 1500  # 750 per parameter
 
 
 def test_sampling_before_run_says_what_to_do(tmp_path):
@@ -367,6 +470,19 @@ def test_region_reach_warning_does_not_depend_on_the_size_of_the_cstat(caplog, b
 @pytest.mark.parametrize(("refresh", "rounds"), [
     (True, [1, 2, 3, 4, 5, 6]), (False, [1]), (0, [1]), (1, [1]), (2, [1, 2]), (5, [1, 2, 3, 4, 5]),
 ])
-def test_refresh_compressor_schedule(refresh, rounds):
-    backend = SimpleNamespace(config=SimpleNamespace(refresh_compressor=refresh))
+def test_autoencoder_refresh_schedule(refresh, rounds):
+    backend = SimpleNamespace(config=SimpleNamespace(compressor=AutoencoderConfig(refresh=refresh)))
+    assert [r for r in range(1, 7) if SIXSABackend._refits_compressor(backend, r)] == rounds
+
+
+@pytest.mark.parametrize("fiducial", ["fit", "best_fold"])
+def test_score_map_is_built_once_in_round_1(fiducial):
+    backend = SimpleNamespace(config=SimpleNamespace(compressor=ScoreCompressorConfig(fiducial=fiducial)))
+    assert [r for r in range(1, 7) if SIXSABackend._refits_compressor(backend, r)] == [1]
+
+
+@pytest.mark.parametrize(("best", "rounds"), [(2499.95, [1]), (2499.0, [1, 2, 3, 4, 5, 6])])
+def test_recentre_rebuilds_the_score_map_once_a_fold_beats_its_fiducial(best, rounds):
+    backend = SimpleNamespace(config=SimpleNamespace(compressor=ScoreCompressorConfig(recentre=True)),
+                              compressor=SimpleNamespace(cstat_star=2500.0), _best_cstat=best)
     assert [r for r in range(1, 7) if SIXSABackend._refits_compressor(backend, r)] == rounds

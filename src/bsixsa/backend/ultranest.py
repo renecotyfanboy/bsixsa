@@ -38,11 +38,12 @@ class UltranestBackend(Backend):
             resume="resume" if config.resume else "overwrite",
         )
         if config.use_step_sampler:
+            nsteps = 2 * len(solver.parameter_names) if config.nsteps is None else config.nsteps
             self._reactive_sampler.stepsampler = ultranest.popstepsampler.PopulationSimpleSliceSampler(
-                popsize=100,
-                nsteps=50,
+                popsize=config.popsize,
+                nsteps=nsteps,
                 scale=1,
-                generate_direction=ultranest.popstepsampler.generate_region_oriented_direction,
+                generate_direction=ultranest.popstepsampler.generate_mixture_random_direction,
             )
 
     def _transform(self, cube: np.ndarray) -> np.ndarray:
@@ -55,6 +56,8 @@ class UltranestBackend(Backend):
         self._results = self._reactive_sampler.run(min_num_live_points=self.config.num_live_points)
         seconds = time.perf_counter() - start
 
+        # Logs the insertion-order test and, with a step sampler, its jump-distance diagnostic.
+        self._reactive_sampler.print_results()
         self._reactive_sampler.plot()
         return FitResults(
             time=seconds,

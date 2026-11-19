@@ -4,12 +4,13 @@ History matching first shrinks the prior to the region worth sampling (see
 [`bsixsa.restriction`][bsixsa.restriction]). Then each round has two parts.
 
 1. **Learning where to look.** Spectra are simulated (folded through XSPEC,
-   with Poisson noise) at parameters spread over the plausible region. An
-   autoencoder compresses each spectrum into a short code, and `n_nde`
-   normalising flows learn $p(\text{parameters} \mid \text{code})$ from these
-   pairs. Evaluated at the code of the observed spectrum, the equal-weight
-   mixture of the flows is the round's *proposal*: a cheap guess of the
-   posterior.
+   with Poisson noise) at parameters spread over the plausible region. Each
+   spectrum is compressed into one code per parameter by score compression
+   at the maximum likelihood of the observation (or, as an alternative, into
+   a short code by an autoencoder), and `n_nde` normalising flows learn
+   $p(\text{parameters} \mid \text{code})$ from these pairs. Evaluated at the
+   code of the observed spectrum, the equal-weight mixture of the flows is
+   the round's *proposal*: a cheap guess of the posterior.
 2. **Checking the guess exactly.** Draws from the proposal are folded
    through XSPEC and weighted by $e^{-C/2} / q$, the exact likelihood over the
    proposal density. The Pareto k-hat of these weights says whether the guess
@@ -43,8 +44,9 @@ import numpy as np
 import pandas as pd
 
 from ..abc import Backend
-from ..config import SIXSA
+from ..config import SIXSA, AutoencoderConfig, FlowConfig
 from ..._cube import in_cube, latin_hypercube, to_physical
+from ..._torch_utils import torch_threads
 from ...restriction import Restriction, run_history_matching
 from ...restriction.region import _to_jsonable
 from ...solver import FitResults, Solver
@@ -52,23 +54,39 @@ from .certify import Certificate, Proposal, certify, rank
 from .compressor import Compressor
 from .flows import FlowProposal, MixtureProposal, train_flow
 from .sampling import importance_sample, resample
+from .score import ScoreCompressor
 from .truncation import sample_truncated
 
 _LOG = logging.getLogger(__name__)
 # Proposal draws per batch of the final importance sample.
 _SAMPLING_BATCH = 5000
+# C-stat a fold must gain over the fiducial before `recentre` rebuilds the score map (the fit's own stopping gain).
+_RECENTRE_GAIN = 0.1
 
 
-def training_set_size(d: int, n_bins: int) -> int:
+# First training set: _TRAINING_PER_PARAMETER simulations per free parameter
+# at d = 6, scaled by (d / 6)^0.6, rounded to 250 and floored at
+# _TRAINING_MIN_PER_PARAMETER, as in the reference implementation.
+_TRAINING_PER_PARAMETER = 1000.0
+_TRAINING_MIN_PER_PARAMETER = 750
+
+
+def training_set_size(d: int) -> int:
     """Size of the first training set: `d` times a per-parameter budget.
 
-    The budget is 2000 simulations per parameter for `d = 6` on 2500 channels,
-    and grows with the number of parameters and of channels.
+    The budget is 1000 simulations per parameter at `d = 6`, times
+    `(d / 6)^0.6`, rounded to 250 and at least 750. The number of channels
+    does not enter: the flows learn `p(parameters | code)`, whose size is set
+    by `d`, and a short spectrum given fewer simulations converged worse.
     """
-    dimension_factor = (d / 6.0) ** 0.6
-    channel_factor = min(max((n_bins / 2500.0) ** 0.25, 0.5), 3.0)
-    per_param = 2000.0 * dimension_factor * channel_factor
-    return int(max(round(per_param / 250) * 250, 750)) * int(d)
+    per_param = _TRAINING_PER_PARAMETER * (int(d) / 6.0) ** 0.6
+    return int(max(round(per_param / 250) * 250, _TRAINING_MIN_PER_PARAMETER)) * int(d)
+
+
+def _architecture(flow: FlowConfig) -> str:
+    """Short label of a flow's architecture for the logs, e.g. `zuko_nsf h30 t3 b8`."""
+    label = f"{flow.model} h{flow.hidden_features} t{flow.num_transforms}"
+    return label + (f" b{flow.num_bins}" if flow.model == "zuko_nsf" else "")
 
 
 class SIXSABackend(Backend):
@@ -86,7 +104,9 @@ class SIXSABackend(Backend):
         history: One dict per round: the gate certificate's diagnostics plus
             the training, compressor and truncation records.
         certificates: The gate certificate of every round, in order.
-        compressor: The spectrum autoencoder
+        compressor: The spectrum compressor: a
+            [`ScoreCompressor`][bsixsa.backend.sixsa.score.ScoreCompressor] (the
+            default) or the autoencoder
             ([`Compressor`][bsixsa.backend.sixsa.compressor.Compressor]).
         best_round: Round whose gate certificate gave the final proposal.
         exit_reason: `"gate"` (a proposal passed) or `"n_rounds"` (the round
@@ -96,6 +116,11 @@ class SIXSABackend(Backend):
             would add.
         outdir: Output directory, `<outputfiles_basename>/sixsa`.
         rng: NumPy generator seeded from `SIXSA.seed`.
+        min_efficiency: The efficiency gate of this run, in percent
+            (`SIXSA.min_efficiency`, or its schedule value for the number
+            of free parameters).
+        target_ess: The effective sample size the final importance sample
+            aims for (`SIXSA.target_ess`, or its schedule value).
     """
 
     config_cls = SIXSA
@@ -103,29 +128,37 @@ class SIXSABackend(Backend):
     def __init__(self, *, solver: Solver, config: SIXSA) -> None:
         super().__init__(solver=solver, config=config)
         self.rng = np.random.default_rng(config.seed)
+        self.min_efficiency = config.gate_efficiency(solver.num_parameters)
+        self.target_ess = config.final_ess(solver.num_parameters)
         self.outdir = Path(solver.outputfiles_basename) / "sixsa"
         self.restriction: Restriction | None = None
         self.history: list[dict] = []
         self.certificates: list[Certificate] = []
         self.posterior: Certificate | None = None
         self.n_unique: int | None = None
-        self.compressor: Compressor | None = None
+        self.compressor: ScoreCompressor | Compressor | None = None
         self.best_round: int | None = None
         self.exit_reason = ""
         self.best_fit: np.ndarray | None = None
         self.best_fit_stat = np.inf
+        # Lowest C-stat folded so far, in the cube: the score compressor's fiducial.
+        self._best_u: np.ndarray | None = None
+        self._best_cstat = np.inf
 
     def _to_physical(self, u: np.ndarray) -> np.ndarray:
         """Physical parameters of cube points."""
         return to_physical(self.solver.prior, u)
 
-    def _record(self, theta: np.ndarray, cstat: np.ndarray) -> None:
-        """Feed the tracer and track the best fold."""
+    def _record(self, u: np.ndarray, theta: np.ndarray, cstat: np.ndarray) -> None:
+        """Feed the tracer and track the best folds (with XSPEC's prior term, and bare C-stat)."""
         self.tracer.record(theta, cstat)
         stat = cstat + self.solver.prior.xspec_bayes_contribution(theta)
         if np.isfinite(stat).any() and np.nanmin(stat) < self.best_fit_stat:
             best = int(np.nanargmin(stat))
             self.best_fit, self.best_fit_stat = theta[best].copy(), float(stat[best])
+        if np.isfinite(cstat).any() and np.nanmin(cstat) < self._best_cstat:
+            best = int(np.nanargmin(cstat))
+            self._best_u, self._best_cstat = np.array(u[best], dtype=np.float64), float(cstat[best])
 
     def _cstat(self, u: np.ndarray) -> np.ndarray:
         """Exact C-stat of cube points, `+inf` outside the closed cube."""
@@ -135,17 +168,22 @@ class SIXSABackend(Backend):
         if inside.any():
             theta = self._to_physical(u[inside])
             out[inside] = self.solver.simulate(theta, return_kind="cstat", progress_bar=False)["cstat"]
-            self._record(theta, out[inside])
+            self._record(u[inside], theta, out[inside])
         return out
 
-    def _training_data(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Exact C-stat and one Poisson realisation of the model counts at each cube point."""
+    def _model_counts(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Exact C-stat and expected counts of cube points."""
         theta = self._to_physical(u)
         sim = self.solver.simulate(theta, return_kind="full_model_counts", progress_bar=False)
         cstat = np.asarray(sim["cstat"], dtype=np.float64)
-        self._record(theta, cstat)
+        self._record(u, theta, cstat)
+        return cstat, np.asarray(sim["total_model_counts"], dtype=np.float64)
+
+    def _training_data(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Exact C-stat and one Poisson realisation of the model counts at each cube point."""
+        cstat, mu = self._model_counts(u)
         # Model counts can dip below zero (e.g. negative-normalisation lines).
-        counts = self.rng.poisson(np.clip(sim["total_model_counts"], 0, None)).astype(np.float32)
+        counts = self.rng.poisson(np.clip(mu, 0, None)).astype(np.float32)
         return cstat, counts
 
     def _draw_region(self, n: int) -> np.ndarray:
@@ -156,19 +194,65 @@ class SIXSABackend(Backend):
         return restriction.region.sample(n, self.rng, max_candidates=restriction.config.max_candidates)
 
     def _refits_compressor(self, r: int) -> bool:
-        """Whether round `r` refits the compressor (`refresh_compressor`: every round, never again, or up to round k)."""
-        refresh = self.config.refresh_compressor
-        if isinstance(refresh, bool):
-            return r == 1 or refresh
-        return r <= max(refresh, 1)
+        """Whether round `r` fits the compressor: the score map in round 1; the autoencoder per its `refresh`.
+
+        With `recentre`, the score map is rebuilt in a later round once a fold
+        has beaten its fiducial by more than `_RECENTRE_GAIN` in C-stat.
+        `refresh` refits the autoencoder every round, never again, or up to
+        round k.
+        """
+        settings = self.config.compressor
+        if r == 1:
+            return True
+        if isinstance(settings, AutoencoderConfig):
+            if isinstance(settings.refresh, bool):
+                return settings.refresh
+            return r <= max(settings.refresh, 1)
+        return settings.recentre and self._best_cstat < self.compressor.cstat_star - _RECENTRE_GAIN
+
+    def _refit_compressor(self, r: int, cstat: np.ndarray, counts: np.ndarray) -> None:
+        """Build the score map at the best fold so far, or refit the autoencoder on the round's spectra."""
+        compressor = self.compressor
+        if isinstance(compressor, ScoreCompressor):
+            if self._best_u is None:
+                raise RuntimeError(
+                    "SIXSA found no parameter vector with a finite C-stat to build the score compression at: "
+                    "the model predicts zero counts where counts were observed everywhere it was folded. "
+                    "Check the prior ranges and the model set-up."
+                )
+            with self.solver.fold_phase("compressor"):
+                if self.config.compressor.fiducial == "fit":
+                    compressor.fit(self._best_u)
+                else:
+                    compressor.build(self._best_u)
+            self._log_score_map(r)
+            return
+        restriction = self.restriction
+        # Round 1 trains on the spectra that resemble the observation.
+        cut = restriction.threshold if r == 1 and restriction is not None else None
+        compressor.fit(counts, cstat=cstat, max_cstat=cut)
+
+    def _log_score_map(self, r: int) -> None:
+        """Name the parameters the data barely constrain at the fiducial, and the unsettled derivatives.
+
+        A parameter whose marginal Fisher sigma exceeds the prior's own,
+        `1/sqrt(12)` in the cube, is prior-dominated there: its code carries
+        little, and the flows learn its posterior from the prior's edges.
+        """
+        compressor, names = self.compressor, np.array(self.solver.parameter_names)
+        dominated = names[compressor.sigma > 1.0 / np.sqrt(12.0)].tolist()
+        unsettled = names[compressor.unstable].tolist()
+        _LOG.info(
+            "SIXSA round %d score map: fiducial C-stat %.2f, marginal Fisher sigmas in the cube %s; "
+            "prior-dominated: %s; derivative unsettled: %s.",
+            r, compressor.cstat_star, " ".join(f"{s:.2g}" for s in compressor.sigma),
+            ", ".join(dominated) or "none", ", ".join(unsettled) or "none",
+        )
 
     def _encode(self, r: int, cstat: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Refit the compressor if due; return the training codes and the observation's code."""
-        restriction = self.restriction
         if self._refits_compressor(r):
-            # Round 1 trains on the spectra that resemble the observation.
-            cut = restriction.threshold if r == 1 and restriction is not None else None
-            self.compressor.fit(counts, cstat=cstat, max_cstat=cut)
+            self._refit_compressor(r, cstat, counts)
         z = self.compressor.encode(counts)
         z_obs = self.compressor.encode(self.solver.observed_counts)[0]
         if np.any((z_obs < z.min(axis=0)) | (z_obs > z.max(axis=0))):
@@ -181,15 +265,20 @@ class SIXSABackend(Backend):
 
     def _train_flows(self, r: int, u: np.ndarray, z: np.ndarray,
                      z_obs: np.ndarray) -> tuple[list[FlowProposal], list[dict]]:
-        """Train `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
+        """Train the `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
         flows, infos = [], []
-        for k in range(self.config.n_nde):
-            estimator, info = train_flow(
-                u, z, **self.config.flow.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
-                log_dir=self.outdir / f"round_{r}" / f"member_{k}",
-            )
-            flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
-            infos.append(info)
+        with torch_threads(self.config.flow_torch_threads):
+            for k, member in enumerate(self.config.flow_members()):
+                estimator, info = train_flow(
+                    u, z, **member.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
+                    log_dir=self.outdir / f"round_{r}" / f"member_{k}",
+                )
+                flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
+                infos.append(info)
+                _LOG.info("SIXSA round %d flow %d/%d (%s): %d epochs, best validation loss %.4f%s",
+                          r, k + 1, self.config.n_nde, _architecture(member), info["epochs_trained"],
+                          info["best_validation_loss"],
+                          "" if info["attempts"] == 1 else f" after {info['attempts'] - 1} diverged attempt(s)")
         return flows, infos
 
     def _warn_if_region_cuts_posterior(self, r: int, cert: Certificate) -> None:
@@ -222,7 +311,7 @@ class SIXSABackend(Backend):
         proposal = flows[0] if len(flows) == 1 else MixtureProposal(flows, name=f"round{r}/mixture")
         with self.solver.fold_phase("gate"):
             cert = certify(proposal, cfg.check_draws, self._cstat, rng=self.rng, round_index=r,
-                           khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency)
+                           khat_threshold=cfg.khat_threshold, min_efficiency=self.min_efficiency)
         self.certificates.append(cert)
         _LOG.info("SIXSA round %d: %s k_hat=%.3f, efficiency=%.1f%%, ESS=%.0f, best fold %.1f",
                   r, cert.name, cert.k_hat, cert.efficiency, cert.ess, float(np.min(cert.cstat)))
@@ -251,8 +340,8 @@ class SIXSABackend(Backend):
         cfg = self.config
         with self.solver.fold_phase("sampling"):
             self.posterior = importance_sample(
-                proposal, self._cstat, target_ess=cfg.target_ess, max_draws=max_draws, batch=_SAMPLING_BATCH,
-                rng=self.rng, khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency,
+                proposal, self._cstat, target_ess=self.target_ess, max_draws=max_draws, batch=_SAMPLING_BATCH,
+                rng=self.rng, khat_threshold=cfg.khat_threshold, min_efficiency=self.min_efficiency,
             )
         rows, self.n_unique = resample(self.posterior.u, self.posterior.log_w_smoothed,
                                        cfg.num_posterior_samples, self.rng)
@@ -272,6 +361,9 @@ class SIXSABackend(Backend):
         started = time.perf_counter()
         cfg, solver = self.config, self.solver
         folds_before = sum(solver.fold_counts.values())
+        _LOG.info("SIXSA gate for d=%d: k-hat < %g and efficiency >= %g%% on %d draws; final effective sample "
+                  "size %g; %d flows per round.", solver.num_parameters, cfg.khat_threshold, self.min_efficiency,
+                  cfg.check_draws, self.target_ess, cfg.n_nde)
         if cfg.history_matching is not None:
             with solver.fold_phase("restriction"):
                 self.restriction = run_history_matching(
@@ -279,10 +371,13 @@ class SIXSABackend(Backend):
                     param_names=solver.parameter_names, log=_LOG.info,
                 )
             self.restriction.save(self.outdir / "restriction")
-        self.compressor = Compressor(solver.n_bins, solver.num_parameters, **cfg.compressor.model_dump(),
-                                     seed=cfg.seed, log=_LOG.info)
+        if isinstance(cfg.compressor, AutoencoderConfig):
+            self.compressor = Compressor(solver.n_bins, solver.num_parameters,
+                                         **cfg.compressor.model_dump(exclude={"refresh"}), seed=cfg.seed, log=_LOG.info)
+        else:
+            self.compressor = ScoreCompressor(self._model_counts, solver.observed_counts, log=_LOG.info)
 
-        n = min(cfg.n_training or training_set_size(solver.num_parameters, solver.n_bins), cfg.train_max)
+        n = min(cfg.n_training or training_set_size(solver.num_parameters), cfg.train_max)
         u = self._draw_region(n)
         with solver.fold_phase("harvest"):
             cstat, counts = self._training_data(u)
@@ -306,7 +401,7 @@ class SIXSABackend(Backend):
             warnings.warn(
                 f"SIXSA used all n_rounds={cfg.n_rounds} rounds without a proposal passing certification (best "
                 f"round {self.best_round}: k-hat {best.k_hat:.2f}, efficiency {best.efficiency:.1f}%; the gate "
-                f"needs k-hat < {cfg.khat_threshold} and efficiency >= {cfg.min_efficiency}%), so the final "
+                f"needs k-hat < {cfg.khat_threshold} and efficiency >= {self.min_efficiency:g}%), so the final "
                 f"importance sample is capped at {max_draws} draws (min(max_sampling_draws, "
                 "5 x check_draws)). Increase n_rounds or train_max, check the priors and the model, and check "
                 f"the per-round k_hat in {self.outdir / 'summary.json'}.",
@@ -322,7 +417,7 @@ class SIXSABackend(Backend):
                 advice = "increase n_rounds, check the priors and the model, or cross-check with a nested sampler."
             warnings.warn(
                 f"SIXSA final importance sample not certified: k-hat {post.k_hat:.2f} (needs < "
-                f"{cfg.khat_threshold}), efficiency {post.efficiency:.1f}% (needs >= {cfg.min_efficiency}%), "
+                f"{cfg.khat_threshold}), efficiency {post.efficiency:.1f}% (needs >= {self.min_efficiency:g}%), "
                 f"ESS {post.ess:.0f} from {post.n_raw} draws. Treat the posterior and log Z as approximate: "
                 + advice,
                 RuntimeWarning, stacklevel=3,
@@ -360,6 +455,8 @@ class SIXSABackend(Backend):
             "exit_reason": self.exit_reason, "best_round": self.best_round, "time": result.time,
             "n_likelihood_evaluations": result.n_likelihood_evaluations, "fold_counts": self.solver.fold_counts,
             "posterior": dict(post.summary(), n_unique=self.n_unique),
+            "gate": {"khat_threshold": self.config.khat_threshold, "min_efficiency": self.min_efficiency,
+                     "check_draws": self.config.check_draws, "target_ess": self.target_ess},
             "rounds": [{k: v for k, v in record.items() if k != "certificate"} for record in self.history],
             "config": self.config.model_dump(mode="json"),
         }

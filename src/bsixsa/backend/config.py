@@ -204,7 +204,25 @@ class Ultranest(BackendConfig):
     )
     use_step_sampler: StrictBool = Field(
         default=False,
-        description="Use a population slice sampler instead of region sampling, usually faster with many parameters.",
+        description=(
+            "Use a population slice sampler instead of region sampling, usually faster with many "
+            "parameters. Its directions alternate between a principal axis of the live points and the "
+            "difference of two live points, the best proposal in Buchner (2022, arXiv:2211.09426)."
+        ),
+    )
+    nsteps: PositiveInt | None = Field(
+        default=None,
+        description=(
+            "Slice-sampling steps per new live point, with `use_step_sampler`. `None` means 2 x the "
+            "number of parameters, the minimum Buchner (2022) finds necessary for these directions."
+        ),
+    )
+    popsize: PositiveInt = Field(
+        default=128,
+        description=(
+            "Walkers advanced together, with `use_step_sampler`. Each likelihood call folds this many "
+            "points, so a multiple of the solver's `n_jobs` keeps every worker busy."
+        ),
     )
 
 
@@ -317,25 +335,115 @@ class Emcee(_StartingPointConfig):
 
 
 class FlowConfig(BaseModel):
-    """Size and training budget of each SIXSA flow (a masked autoregressive flow trained with sbi)."""
+    """Architecture and training budget of one SIXSA flow, trained with sbi.
+
+    The defaults are the first member of the reference ensemble
+    ([`reference_flow_ensemble`][bsixsa.backend.config.reference_flow_ensemble]).
+    """
 
     model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
-    hidden_features: PositiveInt = Field(default=50, description="Width of the hidden layers.")
-    num_transforms: PositiveInt = Field(default=5, description="Number of stacked transforms.")
+    model: Literal["zuko_nsf", "zuko_maf"] = Field(
+        default="zuko_nsf",
+        description="`zuko_nsf` (neural spline flow) or `zuko_maf` (masked autoregressive flow).",
+    )
+    hidden_features: PositiveInt = Field(default=30, description="Width of the hidden layers.")
+    num_transforms: PositiveInt = Field(default=3, description="Number of stacked transforms.")
+    num_bins: PositiveInt = Field(
+        default=8,
+        description="Spline segments per transform; used by `zuko_nsf` only.",
+    )
     training_batch_size: PositiveInt = Field(default=1024, description="Training pairs per gradient step.")
-    max_num_epochs: PositiveInt = Field(default=25, description="Maximum number of epochs.")
+    max_num_epochs: PositiveInt = Field(
+        default=500,
+        description="Maximum number of epochs; early stopping (`stop_after_epochs`) normally ends training first.",
+    )
     stop_after_epochs: PositiveInt = Field(
         default=10,
         description="Epochs without validation improvement before stopping (patience).",
     )
 
 
-class CompressorConfig(BaseModel):
+def reference_flow_ensemble() -> list[FlowConfig]:
+    """The flows of the reference SIXSA implementation: five spline flows and two autoregressive flows.
+
+    A mixture of different architectures has heavier tails than any single
+    one, and no architecture was best on every spectrum.
+    """
+    return [
+        FlowConfig(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=8),
+        FlowConfig(model="zuko_nsf", hidden_features=40, num_transforms=3, num_bins=8),
+        FlowConfig(model="zuko_nsf", hidden_features=30, num_transforms=4, num_bins=8),
+        FlowConfig(model="zuko_nsf", hidden_features=40, num_transforms=4, num_bins=8),
+        FlowConfig(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=10),
+        FlowConfig(model="zuko_maf", hidden_features=30, num_transforms=3),
+        FlowConfig(model="zuko_maf", hidden_features=40, num_transforms=4),
+    ]
+
+
+# Rows `(d_below, value)`: the value applies to every number of free
+# parameters d < d_below; the last row, with d_below = None, to the rest.
+DimensionSchedule = list[tuple[PositiveInt | None, float]]
+
+
+def schedule_value(schedule: DimensionSchedule, d: int) -> float:
+    """The value of a `(d_below, value)` schedule for `d` free parameters: the first row with `d < d_below`."""
+    for d_below, value in schedule:
+        if d_below is None or int(d) < int(d_below):
+            return float(value)
+    raise ValueError(f"the schedule {schedule} does not cover d = {d}; end it with a (None, value) row.")
+
+
+def _check_schedule(name: str, schedule: DimensionSchedule) -> None:
+    """Thresholds strictly increasing and a final `(None, value)` row, so that every `d` gets a value."""
+    if not schedule:
+        raise ValueError(f"`{name}` must have at least one row.")
+    thresholds = [d_below for d_below, _ in schedule]
+    if thresholds[-1] is not None or any(d_below is None for d_below in thresholds[:-1]):
+        raise ValueError(f"`{name}` must end with one `(None, value)` row, got {schedule}.")
+    if any(later <= earlier for earlier, later in zip(thresholds[:-2], thresholds[1:-1])):
+        raise ValueError(f"the thresholds of `{name}` must increase strictly, got {thresholds[:-1]}.")
+
+
+class ScoreCompressorConfig(BaseModel):
+    r"""Score compression, SIXSA's default: one code per parameter, from exact derivatives at a fiducial point.
+
+    The code of a spectrum $k$ is $t = u_\star + (F + 12\,I)^{-1} \nabla_u \log L(k \mid u_\star)$,
+    with $F$ the Fisher matrix at the fiducial $u_\star$ (Alsing & Wandelt 2018) and 12
+    the precision of the uniform prior in the cube, which keeps poorly constrained
+    directions at the prior's scale; the derivatives cost a few folds per
+    parameter, and nothing is trained.
+    """
+
+    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
+
+    fiducial: Literal["fit", "best_fold"] = Field(
+        default="fit",
+        description=(
+            "Where the derivatives are taken in round 1: `fit` moves the best fold of history matching "
+            "and of the first training set to the maximum likelihood by Fisher scoring; `best_fold` takes that "
+            "fold as it is."
+        ),
+    )
+    recentre: StrictBool = Field(
+        default=False,
+        description=(
+            "Rebuild the map at the start of a later round whenever a fold has beaten the fiducial by more than "
+            "0.1 in C-stat, from that fold (fitted again with `fiducial='fit'`). For fits that stop in a local "
+            "optimum, such as a narrow line the round-1 fit missed."
+        ),
+    )
+
+
+class AutoencoderConfig(BaseModel):
     """Cash-loss autoencoder that compresses each spectrum before the SIXSA flows."""
 
     model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
+    refresh: StrictBool | NonNegativeInt = Field(
+        default=True,
+        description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
+    )
     latent_dim: PositiveInt | None = Field(
         default=None,
         description="Size of the compressed spectrum; `None` picks it from the number of parameters.",
@@ -362,16 +470,25 @@ class CompressorConfig(BaseModel):
 
 
 class SIXSA(BackendConfig):
-    """SIXSA: history matching, a Cash-loss autoencoder and certified NPE proposals.
+    """SIXSA: history matching, score compression and certified NPE proposals.
 
     History matching first restricts the prior to the region worth
-    sampling. Each round then trains `n_nde` flows and certifies their
+    sampling. Each spectrum is then compressed to one code per parameter,
+    by score compression at the maximum likelihood of the observation
+    (`compressor`; an autoencoder is the alternative). Each round trains
+    `n_nde` flows on the codes and certifies their
     equal-weight mixture by importance sampling on exact folds (Pareto k-hat
     below `khat_threshold`, efficiency at least `min_efficiency`). Until one
     passes, the next training set is drawn inside the proposal's
     highest-density region, intersected with the history-matching region.
     SIXSA fits one spectrum with the C-statistic, without background, and
     finite priors.
+
+    The defaults follow the reference SIXSA implementation: seven flows of
+    two kinds, an efficiency gate and a final effective sample size that
+    decrease with the number of free parameters `d`, and a first training
+    set that grows as `d^1.6`. The score compression is bsixsa's own
+    variant (`ScoreCompressorConfig`).
 
     `FitResults` holds equal-weight posterior samples, `log_Z`, and the best
     fold as `best_fit`.
@@ -389,15 +506,18 @@ class SIXSA(BackendConfig):
         ),
     )
     n_nde: PositiveInt = Field(
-        default=5,
-        description="Flows trained per round from different seeds; their equal-weight mixture is the round's proposal.",
+        default=7,
+        description=(
+            "Flows trained per round from different seeds; their equal-weight mixture is the round's "
+            "proposal. Flow `k` uses `flow[k % len(flow)]`."
+        ),
     )
     n_rounds: PositiveInt = Field(
         default=20,
         description="Maximum number of rounds; the run stops once a proposal is certified.",
     )
     check_draws: Integer = Field(
-        default=1000,
+        default=2000,
         ge=100,
         description="Proposal draws (one exact fold each) that certify the proposal of each round.",
     )
@@ -406,10 +526,20 @@ class SIXSA(BackendConfig):
         ge=0, le=1,
         description="Largest Pareto k-hat of the importance weights for certification (0.7 is the usual PSIS limit).",
     )
-    min_efficiency: float = Field(
-        default=5.0,
-        ge=0, le=100,
-        description="Smallest importance-sampling efficiency (effective sample size per fold) for certification, in percent.",
+    min_efficiency: Annotated[float, Field(ge=0, le=100)] | None = Field(
+        default=None,
+        description=(
+            "Smallest importance-sampling efficiency (effective sample size per fold) for certification, in "
+            "percent; `None` takes it from `efficiency_schedule` for the number of free parameters."
+        ),
+    )
+    efficiency_schedule: DimensionSchedule = Field(
+        default=[(5, 10.0), (10, 5.0), (15, 2.5), (None, 1.0)],
+        description=(
+            "`min_efficiency` by number of free parameters `d` when it is `None`: rows `(d_below, percent)`, "
+            "the first row with `d < d_below` applies and the last row, `(None, percent)`, covers the rest. "
+            "The efficiency of importance sampling falls with `d`."
+        ),
     )
     truncated_quantile: float = Field(
         default=1e-3,
@@ -427,23 +557,45 @@ class SIXSA(BackendConfig):
     )
     n_training: Annotated[Integer, Field(ge=20)] | None = Field(
         default=None,
-        description="Size of the first training set; `None` picks it from the number of parameters and channels.",
+        description="Size of the first training set; `None` picks it from the number of free parameters.",
     )
     train_ramp: float = Field(
-        default=1.25,
+        default=1.1,
         ge=1,
         description="Growth factor of the training set per round.",
     )
-    train_max: PositiveInt = Field(default=50_000, description="Largest training set.")
-    refresh_compressor: StrictBool | NonNegativeInt = Field(
-        default=True,
-        description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
+    train_max: PositiveInt = Field(default=100_000, description="Largest training set.")
+    flow: Annotated[list[FlowConfig], Field(min_length=1)] = Field(
+        default_factory=reference_flow_ensemble,
+        description=(
+            "Architectures and training budgets of the flows: flow `k` of a round uses `flow[k % len(flow)]`. "
+            "One `FlowConfig` gives every flow the same settings. The default is the reference ensemble."
+        ),
     )
-    flow: FlowConfig = Field(default_factory=FlowConfig, description="Size and training budget of the flows.")
-    compressor: CompressorConfig = Field(default_factory=CompressorConfig, description="Spectrum autoencoder.")
-    target_ess: PositiveFloat = Field(
-        default=2000.0,
-        description="Effective sample size at which the final importance sample stops.",
+    flow_torch_threads: PositiveInt | None = Field(
+        default=1,
+        description=(
+            "Torch threads while a flow trains; these networks are too small to gain from more. "
+            "`None` keeps torch's setting."
+        ),
+    )
+    compressor: ScoreCompressorConfig | AutoencoderConfig = Field(
+        default_factory=ScoreCompressorConfig,
+        description="How each spectrum is compressed before the flows: score compression or an autoencoder.",
+    )
+    target_ess: PositiveFloat | None = Field(
+        default=None,
+        description=(
+            "Effective sample size at which the final importance sample stops; `None` takes it from "
+            "`ess_schedule` for the number of free parameters."
+        ),
+    )
+    ess_schedule: DimensionSchedule = Field(
+        default=[(5, 5000.0), (10, 3000.0), (15, 2000.0), (None, 1000.0)],
+        description=(
+            "`target_ess` by number of free parameters `d` when it is `None`, as rows `(d_below, ESS)` "
+            "read like `efficiency_schedule`."
+        ),
     )
     max_sampling_draws: PositiveInt = Field(
         default=200_000,
@@ -458,13 +610,40 @@ class SIXSA(BackendConfig):
         description="Seed of every random draw of the run, except history matching's; `None` is not reproducible.",
     )
 
+    @field_validator("flow", mode="before")
+    @classmethod
+    def _one_flow_for_every_member(cls, value: Any) -> Any:
+        """A single `FlowConfig` (or dict) stands for a one-entry list."""
+        if isinstance(value, (FlowConfig, dict)):
+            return [value]
+        return value
+
     @model_validator(mode="after")
     def _validate_budgets(self) -> SIXSA:
         if self.n_training is not None and self.n_training > self.train_max:
             raise ValueError(
                 f"n_training ({self.n_training}) must not exceed train_max ({self.train_max})."
             )
+        _check_schedule("efficiency_schedule", self.efficiency_schedule)
+        _check_schedule("ess_schedule", self.ess_schedule)
+        if not all(0.0 <= value <= 100.0 for _, value in self.efficiency_schedule):
+            raise ValueError(f"`efficiency_schedule` values are percentages in [0, 100], got {self.efficiency_schedule}.")
+        if not all(value > 0.0 for _, value in self.ess_schedule):
+            raise ValueError(f"`ess_schedule` values must be positive, got {self.ess_schedule}.")
         return self
+
+    def flow_members(self) -> list[FlowConfig]:
+        """The settings of the `n_nde` flows of a round, cycling through `flow`."""
+        return [self.flow[k % len(self.flow)] for k in range(self.n_nde)]
+
+    def gate_efficiency(self, d: int) -> float:
+        """`min_efficiency`, or its value in `efficiency_schedule` for `d` free parameters."""
+        return float(self.min_efficiency) if self.min_efficiency is not None else schedule_value(
+            self.efficiency_schedule, d)
+
+    def final_ess(self, d: int) -> float:
+        """`target_ess`, or its value in `ess_schedule` for `d` free parameters."""
+        return float(self.target_ess) if self.target_ess is not None else schedule_value(self.ess_schedule, d)
 
     def validate_for_solver(self, solver: Solver) -> None:
         """Check that the prior is finite and XSPEC holds one spectrum, no background, and uses cstat.

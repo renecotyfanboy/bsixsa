@@ -38,8 +38,8 @@ CHECK_DRAWS = 1000
 N_MEMBERS = 2
 N_HARVEST = 1500
 N_TRUNCATED = 2000
-FLOW = {"hidden_features": 32, "num_transforms": 3, "max_num_epochs": 20, "training_batch_size": 256,
-        "stop_after_epochs": 5}
+FLOW = {"model": "zuko_maf", "hidden_features": 32, "num_transforms": 3, "num_bins": 8, "max_num_epochs": 20,
+        "training_batch_size": 256, "stop_after_epochs": 5}
 
 
 def _round(state, r: int, u: np.ndarray, counts: np.ndarray, workdir) -> SimpleNamespace:

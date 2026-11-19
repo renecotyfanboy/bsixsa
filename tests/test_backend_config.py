@@ -18,6 +18,7 @@ sys.modules.setdefault("xspec", MagicMock())
 
 from bsixsa import (  # noqa: E402
     SIXSA,
+    AutoencoderConfig,
     BackendConfig,
     Emcee,
     HistoryMatching,
@@ -148,6 +149,13 @@ def test_emcee_config_requires_initialisation_strategy():
 def test_ultranest_config_rejects_unknown_extras():
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         Ultranest(foo="bar")
+
+
+def test_ultranest_step_sampler_defaults():
+    config = Ultranest()
+    assert (config.nsteps, config.popsize) == (None, 128)
+    with pytest.raises(ValidationError):
+        Ultranest(nsteps=0)
 
 
 def test_trace_config_exposes_shared_plot_settings():
@@ -427,8 +435,8 @@ def test_sixsa_accepts_a_single_cstat_spectrum_without_background():
 def test_config_errors_quote_the_offending_values(solver_stub):
     from bsixsa import SIXSA
 
-    with pytest.raises(ValidationError, match=r"n_training \(60000\) must not exceed train_max \(50000\)"):
-        SIXSA(n_training=60_000)
+    with pytest.raises(ValidationError, match=r"n_training \(120000\) must not exceed train_max \(100000\)"):
+        SIXSA(n_training=120_000)
     with pytest.raises(ValueError, match="got 3"):
         Emcee(init_from_prior=True, num_walkers=3).validate_for_solver(solver_stub)
 
@@ -484,7 +492,7 @@ def test_missing_sampler_package_is_reported_by_run_when_the_config_was_replaced
         (SIXSA, "check_draws", np.float64(1e3), 1000),
         (SIXSA, "truncated_support_draws", np.float32(4096.0), 4096),
         (SIXSA, "n_training", 2e3, 2000),
-        (SIXSA, "refresh_compressor", 2.0, 2),
+        (AutoencoderConfig, "refresh", 2.0, 2),
         (HistoryMatching, "simulations_per_parameter", 1e3, 1000),
         (HistoryMatching, "max_candidates", 2e9, 2_000_000_000),
         (HistoryMatching, "seed", np.int64(7), 7),
@@ -508,7 +516,7 @@ def test_integer_options_refuse_booleans_strings_and_fractions(config_cls, field
         config_cls(**{field: value})
 
 
-def test_refresh_compressor_keeps_booleans_apart_from_integers():
-    assert SIXSA(refresh_compressor=True).refresh_compressor is True
-    assert SIXSA(refresh_compressor=False).refresh_compressor is False
-    assert type(SIXSA(refresh_compressor=1.0).refresh_compressor) is int
+def test_autoencoder_refresh_keeps_booleans_apart_from_integers():
+    assert AutoencoderConfig(refresh=True).refresh is True
+    assert AutoencoderConfig(refresh=False).refresh is False
+    assert type(AutoencoderConfig(refresh=1.0).refresh) is int
