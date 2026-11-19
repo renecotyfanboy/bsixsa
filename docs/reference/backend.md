@@ -35,9 +35,9 @@ when it is missing.
 
 SIXSA (simulation-based inference for X-ray spectral analysis) fits a spectrum
 without running a sampler on the likelihood. It learns a **proposal** from
-simulated spectra (an autoencoder compresses the counts, neural posterior
-estimators map the codes to parameters), then corrects that proposal by
-importance sampling against XSPEC's own C-statistic. The networks only decide
+simulated spectra (score compression turns the counts into one code per
+parameter, neural posterior estimators map the codes to parameters), then
+corrects that proposal by importance sampling against XSPEC's own C-statistic. The networks only decide
 where to look; the answer comes from exact folds, so a poor network costs
 efficiency and cannot cost correctness, and how poor it is gets measured every
 round.
@@ -61,7 +61,8 @@ print(solver.backend.posterior.passed, solver.backend.posterior.k_hat)
 
 The backend logs each round through the `bsixsa` logger: attach a handler (or
 `logging.basicConfig(level=logging.INFO)`) to follow the history-matching
-waves, the compressor fits, the k-hat trajectory and the truncation.
+waves, the fit of the fiducial and the score map, the k-hat trajectory and
+the truncation.
 
 SIXSA requires one spectrum, the C-statistic, no loaded background and finite
 priors; `Solver(...)` checks this.
@@ -72,6 +73,11 @@ priors; `Solver(...)` checks this.
       C-stat $C$ of a parameter vector.
     - **unit cube**: each parameter mapped through its prior CDF,
       $u = F(\theta)$, so the prior is uniform on $[0, 1]^d$.
+    - **score compression**: the code of a spectrum $k$ is one Fisher-scoring
+      step from a fiducial point $u_\star$,
+      $t = u_\star + F^{-1} \nabla_u \log L(k \mid u_\star)$ with $F$ the Fisher
+      matrix there (regularised as described below); it is one number per
+      parameter, an estimate of the parameters themselves (Alsing & Wandelt 2018).
     - **proposal**: a density $q$ over the parameters, the equal-weight
       mixture of the round's flows at the observed spectrum, cheap to sample
       and to evaluate.
@@ -100,10 +106,28 @@ priors; `Solver(...)` checks this.
 2. A training set is simulated flat on that region (or on a Latin hypercube of
    the full prior without history matching). Parameters live in the prior's
    unit cube throughout, where the prior density is one.
-3. A Cash-loss autoencoder maps counts to latent codes. It is refitted at the
-   start of each round, warm-started from the previous fit (see
-   `refresh_compressor` to refit only in the first rounds); the training
-   spectra and the observation are then both encoded with the current fit.
+3. Score compression maps counts to codes. In round 1, the fold with the
+   lowest C-stat so far (from history matching and the first training set)
+   is moved to the maximum likelihood of the observation by Fisher scoring
+   (`ScoreCompressorConfig(fiducial="fit")`); the derivatives of the expected
+   counts there (central differences on exact folds, with a step per
+   parameter halved until it agrees with twice itself) give the Fisher
+   matrix $F$, and the code of every spectrum follows by a matrix product,
+   $t = u_\star + (F + 12\,I)^{-1} \nabla_u \log L$. The 12 is the precision
+   of the uniform prior in the cube: it keeps the codes of directions the
+   spectrum barely constrains (degenerate normalisations, say) at the scale
+   of the prior instead of amplifying their Poisson noise, and leaves the
+   information unchanged, since the code is still an invertible linear
+   function of the score. The map costs a few folds per parameter, nothing
+   is trained, and the observation's code is the fiducial itself. By default
+   the map is built once: rebuilding it at the best fold of each round gained
+   nothing on Perseus. `recentre=True` rebuilds it at the start of a round
+   whenever a fold has beaten the fiducial by more than 0.1 in C-stat, for fits
+   that stop in a local optimum (narrow lines the round-1 fit missed, say).
+   `fiducial="best_fold"` builds it at the best fold without
+   fitting it. `compressor=AutoencoderConfig()` uses the
+   Cash-loss autoencoder of earlier versions instead, refitted at the start
+   of each round (see its `refresh`).
 4. `n_nde` flows are trained from different seeds on the (parameters, code)
    pairs with sbi's `NPE_C` and the plain maximum-likelihood loss; their
    equal-weight mixture is the round's proposal.
@@ -154,8 +178,9 @@ XSPEC-convention prior term. `solver.backend` keeps:
   `log_z`, `log_z_err` and `passed`;
 - `history`, one record per round: the gate certificate's summary scalars
   plus the certificate itself under `certificate` (left out of
-  `summary.json`), the compressor fit, the flows' training records and the
-  truncation diagnostics;
+  `summary.json`), the compressor's last record (the score map: fiducial,
+  C-stat there, Fisher condition, steps and marginal Fisher sigmas), the
+  flows' training records and the truncation diagnostics;
 - `certificates`, the gate certificate of every round;
 - `restriction`, the history-matching
   [`Restriction`][bsixsa.restriction.Restriction], or `None` without history
@@ -200,14 +225,15 @@ torch in the tests.
 | module | what it owns |
 |---|---|
 | `_sixsa` | the rounds, the training-set law and the outputs |
+| `score` | the score compression, its derivatives and the Fisher-scoring fit of the fiducial |
 | `compressor` | the Cash-loss autoencoder and its generation counter |
 | `flows` | the flows frozen at the observation, their mixture, sbi training |
 | `certify` | importance weights, PSIS, k-hat and the ranking |
 | `truncation` | the SIR draws of the next training set |
 | `sampling` | the final importance sample and its equal-weight resample |
 
-The compressor is the one large network (its first layer is `n_bins` wide);
-`compressor=CompressorConfig(device="auto")` runs it on cuda or mps when
+The autoencoder is the one large network (its first layer is `n_bins` wide);
+`compressor=AutoencoderConfig(device="auto")` runs it on cuda or mps when
 available.
 
 ### Configuration reference
@@ -224,7 +250,13 @@ available.
       show_root_full_path: false
       heading_level: 4
 
-::: bsixsa.backend.config.CompressorConfig
+::: bsixsa.backend.config.ScoreCompressorConfig
+    options:
+      show_root_heading: true
+      show_root_full_path: false
+      heading_level: 4
+
+::: bsixsa.backend.config.AutoencoderConfig
     options:
       show_root_heading: true
       show_root_full_path: false

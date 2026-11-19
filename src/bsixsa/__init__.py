@@ -19,15 +19,15 @@ from .backend import (
     Nessai,
     Ultranest,
 )
-from .backend.config import CompressorConfig, FlowConfig
+from .backend.config import AutoencoderConfig, FlowConfig, ScoreCompressorConfig
 from .export import export_xspec_chain
 from .restriction import HistoryMatching
 from .solver import FitResults, Solver
 
 __all__ = [
     "SIXSA",
+    "AutoencoderConfig",
     "BackendConfig",
-    "CompressorConfig",
     "Emcee",
     "FitResults",
     "FlowConfig",
@@ -36,6 +36,7 @@ __all__ = [
     "LevenbergMarquardt",
     "Nautilus",
     "Nessai",
+    "ScoreCompressorConfig",
     "Solver",
     "Ultranest",
     "export_xspec_chain",

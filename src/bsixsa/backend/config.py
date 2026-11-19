@@ -342,18 +342,52 @@ class FlowConfig(BaseModel):
     hidden_features: PositiveInt = Field(default=50, description="Width of the hidden layers.")
     num_transforms: PositiveInt = Field(default=5, description="Number of stacked transforms.")
     training_batch_size: PositiveInt = Field(default=1024, description="Training pairs per gradient step.")
-    max_num_epochs: PositiveInt = Field(default=25, description="Maximum number of epochs.")
+    max_num_epochs: PositiveInt = Field(default=100, description="Maximum number of epochs.")
     stop_after_epochs: PositiveInt = Field(
         default=10,
         description="Epochs without validation improvement before stopping (patience).",
     )
 
 
-class CompressorConfig(BaseModel):
+class ScoreCompressorConfig(BaseModel):
+    r"""Score compression, SIXSA's default: one code per parameter, from exact derivatives at a fiducial point.
+
+    The code of a spectrum $k$ is $t = u_\star + (F + 12\,I)^{-1} \nabla_u \log L(k \mid u_\star)$,
+    with $F$ the Fisher matrix at the fiducial $u_\star$ (Alsing & Wandelt 2018) and 12
+    the precision of the uniform prior in the cube, which keeps poorly constrained
+    directions at the prior's scale; the derivatives cost a few folds per
+    parameter, and nothing is trained.
+    """
+
+    model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
+
+    fiducial: Literal["fit", "best_fold"] = Field(
+        default="fit",
+        description=(
+            "Where the derivatives are taken in round 1: `fit` moves the best fold of history matching "
+            "and of the first training set to the maximum likelihood by Fisher scoring; `best_fold` takes that "
+            "fold as it is."
+        ),
+    )
+    recentre: StrictBool = Field(
+        default=False,
+        description=(
+            "Rebuild the map at the start of a later round whenever a fold has beaten the fiducial by more than "
+            "0.1 in C-stat, from that fold (fitted again with `fiducial='fit'`). For fits that stop in a local "
+            "optimum, such as a narrow line the round-1 fit missed."
+        ),
+    )
+
+
+class AutoencoderConfig(BaseModel):
     """Cash-loss autoencoder that compresses each spectrum before the SIXSA flows."""
 
     model_config = ConfigDict(**MODEL_CONFIG, allow_inf_nan=False)
 
+    refresh: StrictBool | NonNegativeInt = Field(
+        default=True,
+        description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
+    )
     latent_dim: PositiveInt | None = Field(
         default=None,
         description="Size of the compressed spectrum; `None` picks it from the number of parameters.",
@@ -380,10 +414,13 @@ class CompressorConfig(BaseModel):
 
 
 class SIXSA(BackendConfig):
-    """SIXSA: history matching, a Cash-loss autoencoder and certified NPE proposals.
+    """SIXSA: history matching, score compression and certified NPE proposals.
 
     History matching first restricts the prior to the region worth
-    sampling. Each round then trains `n_nde` flows and certifies their
+    sampling. Each spectrum is then compressed to one code per parameter,
+    by score compression at the maximum likelihood of the observation
+    (`compressor`; an autoencoder is the alternative). Each round trains
+    `n_nde` flows on the codes and certifies their
     equal-weight mixture by importance sampling on exact folds (Pareto k-hat
     below `khat_threshold`, efficiency at least `min_efficiency`). Until one
     passes, the next training set is drawn inside the proposal's
@@ -453,12 +490,11 @@ class SIXSA(BackendConfig):
         description="Growth factor of the training set per round.",
     )
     train_max: PositiveInt = Field(default=50_000, description="Largest training set.")
-    refresh_compressor: StrictBool | NonNegativeInt = Field(
-        default=True,
-        description="Refit the autoencoder every round (`True`), only in round 1 (`False`), or in rounds 1 to `k`.",
-    )
     flow: FlowConfig = Field(default_factory=FlowConfig, description="Size and training budget of the flows.")
-    compressor: CompressorConfig = Field(default_factory=CompressorConfig, description="Spectrum autoencoder.")
+    compressor: ScoreCompressorConfig | AutoencoderConfig = Field(
+        default_factory=ScoreCompressorConfig,
+        description="How each spectrum is compressed before the flows: score compression or an autoencoder.",
+    )
     target_ess: PositiveFloat = Field(
         default=2000.0,
         description="Effective sample size at which the final importance sample stops.",
