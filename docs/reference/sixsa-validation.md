@@ -61,8 +61,8 @@ variants differ only by how the spectra are compressed.
   parameters on 2606 channels: a 13 eV wide line with a 1 keV wide prior on
   its energy. The reference is a Nautilus run (log Z −795.640).
 
-Default settings of the time throughout (`n_nde=5`, flows capped at 25
-epochs, 100 since: see the next section), seeds
+Default settings of the time throughout (flows capped at 25 epochs, the
+other settings listed in the next section), seeds
 `SIXSA(seed=s, history_matching=HistoryMatching(seed=s))`. Folds count every
 exact evaluation of a run, history matching included; ΔlogZ is the mean
 difference to the reference with its standard error over the runs. In every
@@ -118,9 +118,10 @@ What the runs say:
 ## Flow training budget
 
 Each flow trains until `stop_after_epochs` epochs pass without a validation
-improvement, or until `max_num_epochs`. The cap was 25 until October 2026;
-in the 25-epoch Perseus runs below every flow reached it while its
-validation loss was still improving. The special-issue campaign ran SIXSA
+improvement, or until `max_num_epochs`. The cap was 25 until October 2026,
+and in the 25-epoch Perseus runs below every flow reached it while its
+validation loss was still improving; it was 100 from then until November
+2026, when the reference defaults raised it to 500. The special-issue campaign ran SIXSA
 with score compression on 32-core nodes, ten runs per target at 100 epochs,
 ten Perseus runs and four Tycho runs at 25, next to ten Nautilus and ten
 Nessai runs of the same likelihoods:
@@ -130,6 +131,12 @@ Nessai runs of the same likelihoods:
 - **Tycho**, `TBabs(bvnei + bvnei + powerlaw)`, 16 free parameters on 2235
   channels, with the degeneracy described above. The reference is Nautilus
   (log Z −872.862 ± 0.003), for the reason given below.
+
+Apart from the epoch cap, these runs used the defaults of the time: five
+masked autoregressive flows, a 5% gate on 1000 draws, a final effective
+sample size of 2000, and a first training set scaled with the number of
+channels, grown by 1.25 per round up to 50 000. They have not been repeated
+with the current defaults; their code is tagged `special-issue-sixsa`.
 
 Folds and ΔlogZ are counted as above; the time is the wall time of a run.
 

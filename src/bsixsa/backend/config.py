@@ -487,7 +487,8 @@ class SIXSA(BackendConfig):
     The defaults follow the reference SIXSA implementation: seven flows of
     two kinds, an efficiency gate and a final effective sample size that
     decrease with the number of free parameters `d`, and a first training
-    set that grows as `d^1.6`.
+    set that grows as `d^1.6`. The score compression is bsixsa's own
+    variant (`ScoreCompressorConfig`).
 
     `FitResults` holds equal-weight posterior samples, `log_Z`, and the best
     fold as `best_fit`.
