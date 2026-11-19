@@ -427,8 +427,8 @@ def test_sixsa_accepts_a_single_cstat_spectrum_without_background():
 def test_config_errors_quote_the_offending_values(solver_stub):
     from bsixsa import SIXSA
 
-    with pytest.raises(ValidationError, match=r"n_training \(60000\) must not exceed train_max \(50000\)"):
-        SIXSA(n_training=60_000)
+    with pytest.raises(ValidationError, match=r"n_training \(120000\) must not exceed train_max \(100000\)"):
+        SIXSA(n_training=120_000)
     with pytest.raises(ValueError, match="got 3"):
         Emcee(init_from_prior=True, num_walkers=3).validate_for_solver(solver_stub)
 

@@ -51,7 +51,7 @@ xspec.Fit.bayes = "off"
 # Load one spectrum, its response and model, then define your prior as usual.
 solver = Solver(
     prior,
-    backend=SIXSA(seed=42, n_nde=5, history_matching=HistoryMatching(seed=42)),
+    backend=SIXSA(seed=42, history_matching=HistoryMatching(seed=42)),
     outputfiles_basename="fit-sixsa",
 )
 result = solver.run()
@@ -99,19 +99,31 @@ priors; `Solver(...)` checks this.
    exact C-stat evaluations; `history_matching=None` skips it.
 2. A training set is simulated flat on that region (or on a Latin hypercube of
    the full prior without history matching). Parameters live in the prior's
-   unit cube throughout, where the prior density is one.
+   unit cube throughout, where the prior density is one. Unless `n_training`
+   is set, the set holds $d$ times $1000\,(d/6)^{0.6}$ simulations, rounded to
+   250 and at least 750 per parameter (6000 for $d = 6$, 16 500 for $d = 11$).
 3. A Cash-loss autoencoder maps counts to latent codes. It is refitted at the
    start of each round, warm-started from the previous fit (see
    `refresh_compressor` to refit only in the first rounds); the training
    spectra and the observation are then both encoded with the current fit.
 4. `n_nde` flows are trained from different seeds on the (parameters, code)
-   pairs with sbi's `NPE_C` and the plain maximum-likelihood loss; their
-   equal-weight mixture is the round's proposal.
-5. The proposal is certified on `check_draws` draws (each one inside the prior
-   bounds costs an exact fold). The gate
-   is k-hat below `khat_threshold` (0.7) and an efficiency of at least
-   `min_efficiency` (5%), with more than ⌈3√n⌉ + 4 positive weights (at least
-   100 of the default 1000 draws) so that k-hat can be fitted at all.
+   pairs with sbi's `NPE_C` and the plain maximum-likelihood loss, one torch
+   thread each (`flow_torch_threads`); their equal-weight mixture is the
+   round's proposal. Flow `k` takes the settings `flow[k % len(flow)]`; the
+   default is the reference ensemble of seven flows, five neural spline flows
+   and two masked autoregressive flows
+   ([`reference_flow_ensemble`][bsixsa.backend.config.reference_flow_ensemble]),
+   each trained until 10 epochs pass without validation improvement (at most
+   500). A training whose loss turns NaN is retried, twice at most, with half
+   the learning rate.
+5. The proposal is certified on `check_draws` draws (2000 by default; each one
+   inside the prior bounds costs an exact fold). The gate is k-hat below
+   `khat_threshold` (0.7) and an efficiency of at least `min_efficiency`, with
+   more than ⌈3√n⌉ + 4 positive weights so that k-hat can be fitted at all.
+   By default `min_efficiency` depends on the number of free parameters $d$,
+   because importance sampling loses efficiency as $d$ grows
+   (`efficiency_schedule`): 10% for $d < 5$, 5% for $5 \le d < 10$, 2.5% for
+   $10 \le d < 15$ and 1% from $d = 15$.
 6. Unless the gate passed or the rounds ran out, the next training set (`train_ramp` times larger,
    capped at `train_max`) is drawn approximately uniformly inside the proposal's
    highest-density region $\{u : \log q(u) > t\}$, which holds
@@ -126,7 +138,9 @@ priors; `Solver(...)` checks this.
    of 5000 draws (each draw inside the prior bounds costs one exact fold) until
    the effective sample size reaches `target_ess` or the draws reach
    `max_sampling_draws`; the weighted draws give the posterior and the log
-   evidence.
+   evidence. By default `target_ess` also depends on $d$ (`ess_schedule`):
+   5000 for $d < 5$, 3000 for $5 \le d < 10$, 2000 for $10 \le d < 15$ and
+   1000 from $d = 15$.
 
 A passed gate is a finite-sample diagnostic, not a proof that every posterior
 mode was found. A low k-hat cannot diagnose a mode absent from the proposed
@@ -219,6 +233,12 @@ available.
       heading_level: 4
 
 ::: bsixsa.backend.config.FlowConfig
+    options:
+      show_root_heading: true
+      show_root_full_path: false
+      heading_level: 4
+
+::: bsixsa.backend.config.reference_flow_ensemble
     options:
       show_root_heading: true
       show_root_full_path: false
