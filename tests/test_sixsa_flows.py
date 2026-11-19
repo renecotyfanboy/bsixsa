@@ -147,6 +147,19 @@ def test_train_flow_gives_up_after_the_last_retry(monkeypatch, tmp_path):
     assert attempts == pytest.approx([1e-3, 5e-4, 2.5e-4])
 
 
+@pytest.mark.parametrize("message, diverged", [
+    ("NaN/Inf present in loss", True),
+    ("found invalid values:\ntensor([[nan, nan]])", True),
+    ("the loss is infinite", True),
+    ("sbi inference failed: shape mismatch", False),
+    ("maintenance information", False),
+])
+def test_only_nan_or_infinite_words_count_as_divergence(message, diverged):
+    from bsixsa.backend.sixsa import flows
+
+    assert flows._diverged(RuntimeError(message)) is diverged
+
+
 # ---------------------------------------------------------------------------
 # FlowProposal
 # ---------------------------------------------------------------------------

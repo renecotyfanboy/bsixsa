@@ -8,6 +8,7 @@ code $z$ of a spectrum. Evaluated at the observed code, it becomes a
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,8 @@ _CLIP_MAX_NORM = 1.0
 # A training whose loss turns NaN or infinite is retried this many times,
 # each time with half the learning rate and another seed.
 _DIVERGENCE_RETRIES = 2
+# Whole words only: "inference" or "maintenance" in an unrelated error must not trigger a retry.
+_DIVERGENCE_WORDS = re.compile(r"\b(nan|inf|infinite|infinity)\b")
 
 
 class FlowProposal:
@@ -95,8 +98,7 @@ class MixtureProposal:
 
 def _diverged(error: Exception) -> bool:
     """Whether a training error comes from a NaN or infinite loss or parameter."""
-    text = str(error).lower()
-    return isinstance(error, (ValueError, RuntimeError)) and ("nan" in text or "inf" in text)
+    return isinstance(error, (ValueError, RuntimeError)) and bool(_DIVERGENCE_WORDS.search(str(error).lower()))
 
 
 def train_flow(
