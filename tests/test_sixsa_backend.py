@@ -104,7 +104,11 @@ def test_public_sampling_and_saved_diagnostics(completed):
     assert summary["posterior"]["passed"] and summary["rounds"][-1]["passed"]
     # The persisted keys, which notebooks read.
     assert set(summary) == {"exit_reason", "best_round", "time", "n_likelihood_evaluations", "fold_counts",
-                            "posterior", "rounds", "config"}
+                            "posterior", "gate", "rounds", "config"}
+    # small_config sets check_draws and target_ess; the efficiency gate comes from the schedule (d = 2).
+    assert summary["gate"] == {"khat_threshold": 0.7, "min_efficiency": 10.0, "check_draws": 1000,
+                               "target_ess": 1500.0}
+    assert (backend.min_efficiency, backend.target_ess) == (10.0, 1500.0)
     assert set(summary["posterior"]) == _SUMMARY_SCALARS | {"n_unique"}
     round_keys = _SUMMARY_SCALARS | {"round", "n_train", "compressor", "nde", "truncation"}
     assert all(set(record) == round_keys for record in summary["rounds"])
@@ -151,7 +155,9 @@ def test_internal_budgets_are_validated_at_configuration_boundary(field, value):
 def test_network_options_are_validated_at_configuration_boundary(section, field, value):
     with pytest.raises(ValidationError) as exc:
         SIXSA(**{section: {field: value}})
-    assert exc.value.errors()[0]["loc"][:2] == (section, field)
+    # One FlowConfig stands for a one-entry list, so its errors carry the index 0.
+    expected = (section, 0, field) if section == "flow" else (section, field)
+    assert exc.value.errors()[0]["loc"][:len(expected)] == expected
 
 
 @pytest.mark.parametrize("member,field,value", [
@@ -175,18 +181,65 @@ def test_reference_training_defaults_are_preserved():
     from bsixsa.backend.sixsa import flows
 
     cfg = SIXSA()
-    assert cfg.n_nde == 5
-    assert cfg.flow.model_dump() == dict(
-        hidden_features=50, num_transforms=5, training_batch_size=1024, max_num_epochs=100, stop_after_epochs=10,
-    )
+    assert cfg.n_nde == 7 and cfg.flow_torch_threads == 1
+    budget = dict(training_batch_size=1024, max_num_epochs=500, stop_after_epochs=10)
+    assert [member.model_dump() for member in cfg.flow_members()] == [
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=40, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=4, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=40, num_transforms=4, num_bins=8, **budget),
+        dict(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=10, **budget),
+        dict(model="zuko_maf", hidden_features=30, num_transforms=3, num_bins=8, **budget),
+        dict(model="zuko_maf", hidden_features=40, num_transforms=4, num_bins=8, **budget),
+    ]
+    assert (cfg.check_draws, cfg.train_ramp, cfg.train_max) == (2000, 1.1, 100_000)
+    assert cfg.min_efficiency is None and cfg.target_ess is None
     assert (flows._LEARNING_RATE, flows._VALIDATION_FRACTION, flows._CLIP_MAX_NORM) == (1e-3, 0.2, 1.0)
+
+
+@pytest.mark.parametrize("d, efficiency, ess", [
+    (1, 10.0, 5000), (4, 10.0, 5000), (5, 5.0, 3000), (9, 5.0, 3000), (10, 2.5, 2000),
+    (14, 2.5, 2000), (15, 1.0, 1000), (24, 1.0, 1000),
+])
+def test_gate_and_final_ess_follow_the_reference_schedules(d, efficiency, ess):
+    cfg = SIXSA()
+    assert cfg.gate_efficiency(d) == efficiency and cfg.final_ess(d) == ess
+    explicit = SIXSA(min_efficiency=7.5, target_ess=1234)
+    assert explicit.gate_efficiency(d) == 7.5 and explicit.final_ess(d) == 1234
+
+
+def test_custom_schedules_and_their_validation():
+    cfg = SIXSA(efficiency_schedule=[(3, 20.0), (None, 4.0)], ess_schedule=[[8, 900], [None, 300]])
+    assert (cfg.gate_efficiency(2), cfg.gate_efficiency(3)) == (20.0, 4.0)
+    assert (cfg.final_ess(7), cfg.final_ess(8)) == (900.0, 300.0)
+    assert SIXSA.model_validate_json(cfg.model_dump_json()) == cfg
+    for schedule in ([], [(5, 10.0)], [(None, 1.0), (5, 10.0)], [(10, 5.0), (5, 2.0), (None, 1.0)],
+                     [(5, 101.0), (None, 1.0)], [(5, float("nan")), (None, 1.0)]):
+        with pytest.raises(ValidationError):
+            SIXSA(efficiency_schedule=schedule)
+    with pytest.raises(ValidationError):
+        SIXSA(ess_schedule=[(5, 0.0), (None, 100.0)])
+    with pytest.raises(ValidationError):
+        SIXSA(min_efficiency=150.0)
+
+
+def test_flow_members_cycle_through_the_flow_list():
+    cfg = SIXSA(n_nde=3, flow=[{"model": "zuko_maf"}, {"hidden_features": 64}])
+    assert [(m.model, m.hidden_features) for m in cfg.flow_members()] == [
+        ("zuko_maf", 30), ("zuko_nsf", 64), ("zuko_maf", 30)]
+    assert [m.hidden_features for m in SIXSA(n_nde=2).flow_members()] == [30, 40]
+    single = SIXSA(n_nde=4, flow=FlowConfig(model="zuko_maf", hidden_features=50, num_transforms=5))
+    assert len(single.flow) == 1 and len(single.flow_members()) == 4
+    assert all(m == single.flow[0] for m in single.flow_members())
+    with pytest.raises(ValidationError):
+        SIXSA(flow=[])
 
 
 def test_config_nested_defaults():
     cfg = SIXSA(flow={"hidden_features": 32})
-    assert cfg.flow.num_transforms == 5
+    assert len(cfg.flow) == 1 and cfg.flow[0].num_transforms == 3 and cfg.flow[0].model == "zuko_nsf"
     assert cfg.truncated_oversampling == 32
-    assert isinstance(cfg.flow, FlowConfig)
+    assert isinstance(cfg.flow[0], FlowConfig)
     assert cfg.compressor == ScoreCompressorConfig(fiducial="fit")
     autoencoder = AutoencoderConfig()
     assert autoencoder.device == "cpu" and autoencoder.batch_size == 512 and autoencoder.refresh is True
@@ -347,26 +400,21 @@ def test_three_parameters_without_restriction(tmp_path):
     assert solver.backend.tracer.n_evals == fit.n_likelihood_evaluations
 
 
-_REFERENCE_TABLE = {
-    2500: [2000, 3750, 12000, 27500, 45500],
-    1000: [1500, 3000, 9000, 22500, 38500],
-    5000: [2500, 4500, 15000, 32500, 56000],
-}
+# Reference implementation: 1000 per parameter at d = 6, times (d / 6)^0.6, rounded to 250, at least 750.
+_REFERENCE_TABLE = {2: 1500, 3: 2250, 6: 6000, 10: 12500, 11: 16500, 14: 24500, 18: 36000, 24: 54000}
 
 
-@pytest.mark.parametrize("n_bins", sorted(_REFERENCE_TABLE))
-@pytest.mark.parametrize("column, d", list(enumerate([2, 3, 6, 10, 14])))
-def test_training_set_size_matches_the_reference_table(n_bins, column, d):
+@pytest.mark.parametrize("d", sorted(_REFERENCE_TABLE))
+def test_training_set_size_matches_the_reference_table(d):
     from bsixsa.backend.sixsa._sixsa import training_set_size
 
-    assert training_set_size(d, n_bins) == _REFERENCE_TABLE[n_bins][column]
+    assert training_set_size(d) == _REFERENCE_TABLE[d]
 
 
 def test_training_set_size_floors():
     from bsixsa.backend.sixsa._sixsa import training_set_size
 
-    assert training_set_size(2, 64) == 1500  # binning factor clipped at 0.5, 750 per parameter
-    assert training_set_size(6, 10**9) == training_set_size(6, 2500 * 81) == 36000
+    assert training_set_size(1) == 750 and training_set_size(2) == 1500  # 750 per parameter
 
 
 def test_sampling_before_run_says_what_to_do(tmp_path):

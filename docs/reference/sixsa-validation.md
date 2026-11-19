@@ -19,8 +19,11 @@ notebooks. A simulated 100 ks X-IFU spectrum of the Perseus cluster,
 velocity broadening and a log-uniform normalisation) on 3197 channels, was fitted
 with a previous version of SIXSA, which certified every flow of a round and
 their mixture before gating the best of them, and ran history matching before
-the backend; it used the default settings, `n_nde=5`, `seed=0` and
-`HistoryMatching(seed=0)`. The reference is a nessai importance nested
+the backend; it used the default settings of that version (five masked
+autoregressive flows trained for at most 25 epochs, a 5% efficiency gate on
+1000 draws, a training set scaled with the number of channels), `n_nde=5`,
+`seed=0` and `HistoryMatching(seed=0)`. The defaults now follow the reference
+implementation and this run has not been repeated with them. The reference is a nessai importance nested
 sampling run (log Z −1531.599 ± 0.010).
 
 | round | training set | k-hat | efficiency |

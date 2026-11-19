@@ -24,6 +24,9 @@ __all__ = ["FlowProposal", "MixtureProposal", "train_flow"]
 _LEARNING_RATE = 1e-3
 _VALIDATION_FRACTION = 0.2
 _CLIP_MAX_NORM = 1.0
+# A training whose loss turns NaN or infinite is retried this many times,
+# each time with half the learning rate and another seed.
+_DIVERGENCE_RETRIES = 2
 
 
 class FlowProposal:
@@ -90,28 +93,89 @@ class MixtureProposal:
         return logsumexp(log_q, axis=0) - np.log(len(self.members))
 
 
+def _diverged(error: Exception) -> bool:
+    """Whether a training error comes from a NaN or infinite loss or parameter."""
+    text = str(error).lower()
+    return isinstance(error, (ValueError, RuntimeError)) and ("nan" in text or "inf" in text)
+
+
 def train_flow(
     u: np.ndarray,
     z: np.ndarray,
     *,
+    model: str,
     hidden_features: int,
     num_transforms: int,
+    num_bins: int,
     training_batch_size: int,
     max_num_epochs: int,
     stop_after_epochs: int,
     seed: int,
     log_dir: str | Path,
 ) -> tuple[Any, dict]:
-    """Train one masked autoregressive flow on ``(u, z)`` pairs; return the estimator and its training record.
+    """Train one flow on ``(u, z)`` pairs; return the estimator and its training record.
 
-    Training curves are written to *log_dir* for TensorBoard.
+    *model* is ``"zuko_nsf"`` or ``"zuko_maf"``; *num_bins* applies to
+    ``"zuko_nsf"`` only. A training whose loss diverges is retried up to
+    twice, each time with half the learning rate and a new seed derived
+    from *seed*. Training curves are written to *log_dir* for TensorBoard.
     """
+    learning_rate = _LEARNING_RATE
+    for attempt in range(_DIVERGENCE_RETRIES + 1):
+        attempt_seed = int(seed) if attempt == 0 else int(np.random.default_rng([int(seed), attempt]).integers(2**31 - 1))
+        attempt_dir = Path(log_dir) if attempt == 0 else Path(log_dir) / f"retry_{attempt}"
+        try:
+            estimator, inference = _train_once(
+                u, z, model=model, hidden_features=hidden_features, num_transforms=num_transforms,
+                num_bins=num_bins, training_batch_size=training_batch_size, max_num_epochs=max_num_epochs,
+                stop_after_epochs=stop_after_epochs, learning_rate=learning_rate, seed=attempt_seed,
+                log_dir=attempt_dir,
+            )
+            break
+        except (ValueError, RuntimeError) as error:
+            if not _diverged(error) or attempt == _DIVERGENCE_RETRIES:
+                raise
+            learning_rate *= 0.5
+    summary = inference.summary
+    info = {
+        "model": str(model),
+        "hidden_features": int(hidden_features),
+        "num_transforms": int(num_transforms),
+        "num_bins": int(num_bins) if model == "zuko_nsf" else None,
+        "seed": int(seed),
+        "attempts": attempt + 1,
+        "learning_rate": learning_rate,
+        "log_dir": str(log_dir),
+        "epochs_trained": int(summary["epochs_trained"][-1]),
+        "best_validation_loss": float(summary["best_validation_loss"][-1]),
+    }
+    return estimator.eval(), info
+
+
+def _train_once(
+    u: np.ndarray,
+    z: np.ndarray,
+    *,
+    model: str,
+    hidden_features: int,
+    num_transforms: int,
+    num_bins: int,
+    training_batch_size: int,
+    max_num_epochs: int,
+    stop_after_epochs: int,
+    learning_rate: float,
+    seed: int,
+    log_dir: Path,
+) -> tuple[Any, Any]:
+    """One sbi training run; returns the estimator and the sbi inference object (for its summary)."""
     from sbi.inference import NPE_C
     from sbi.inference.trainers.base import TensorBoardTracker
     from sbi.neural_nets import posterior_nn
     from sbi.utils import BoxUniform
     from torch.utils.tensorboard import SummaryWriter
 
+    if model not in ("zuko_nsf", "zuko_maf"):
+        raise ValueError(f"model must be 'zuko_nsf' or 'zuko_maf', got {model!r}.")
     theta = torch.as_tensor(np.asarray(u, dtype=np.float32))
     x = torch.as_tensor(np.asarray(z, dtype=np.float32)).reshape(theta.shape[0], -1)
     d = theta.shape[1]
@@ -119,7 +183,10 @@ def train_flow(
     torch.manual_seed(int(seed))
     writer = SummaryWriter(log_dir=str(log_dir))
     try:
-        estimator_builder = posterior_nn("zuko_maf", hidden_features=hidden_features, num_transforms=num_transforms)
+        # sbi's own num_bins default (10) differs from zuko's (8): always pass it to a spline flow.
+        architecture = {"num_bins": int(num_bins)} if model == "zuko_nsf" else {}
+        estimator_builder = posterior_nn(model, hidden_features=hidden_features, num_transforms=num_transforms,
+                                         **architecture)
         inference = NPE_C(
             prior=BoxUniform(torch.zeros(d), torch.ones(d)), density_estimator=estimator_builder,
             show_progress_bars=False, tracker=TensorBoardTracker(writer),
@@ -127,16 +194,9 @@ def train_flow(
         # Training draws are flat on their region, so the plain maximum-likelihood loss applies.
         estimator = inference.append_simulations(theta, x).train(
             force_first_round_loss=True, training_batch_size=training_batch_size, max_num_epochs=max_num_epochs,
-            stop_after_epochs=stop_after_epochs, learning_rate=_LEARNING_RATE,
+            stop_after_epochs=stop_after_epochs, learning_rate=learning_rate,
             validation_fraction=_VALIDATION_FRACTION, clip_max_norm=_CLIP_MAX_NORM,
         )
     finally:
         writer.close()
-    summary = inference.summary
-    info = {
-        "seed": int(seed),
-        "log_dir": str(log_dir),
-        "epochs_trained": int(summary["epochs_trained"][-1]),
-        "best_validation_loss": float(summary["best_validation_loss"][-1]),
-    }
-    return estimator.eval(), info
+    return estimator, inference

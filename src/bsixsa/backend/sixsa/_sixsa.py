@@ -44,8 +44,9 @@ import numpy as np
 import pandas as pd
 
 from ..abc import Backend
-from ..config import SIXSA, AutoencoderConfig
+from ..config import SIXSA, AutoencoderConfig, FlowConfig
 from ..._cube import in_cube, latin_hypercube, to_physical
+from ..._torch_utils import torch_threads
 from ...restriction import Restriction, run_history_matching
 from ...restriction.region import _to_jsonable
 from ...solver import FitResults, Solver
@@ -63,16 +64,29 @@ _SAMPLING_BATCH = 5000
 _RECENTRE_GAIN = 0.1
 
 
-def training_set_size(d: int, n_bins: int) -> int:
+# First training set: _TRAINING_PER_PARAMETER simulations per free parameter
+# at d = 6, scaled by (d / 6)^0.6, rounded to 250 and floored at
+# _TRAINING_MIN_PER_PARAMETER, as in the reference implementation.
+_TRAINING_PER_PARAMETER = 1000.0
+_TRAINING_MIN_PER_PARAMETER = 750
+
+
+def training_set_size(d: int) -> int:
     """Size of the first training set: `d` times a per-parameter budget.
 
-    The budget is 2000 simulations per parameter for `d = 6` on 2500 channels,
-    and grows with the number of parameters and of channels.
+    The budget is 1000 simulations per parameter at `d = 6`, times
+    `(d / 6)^0.6`, rounded to 250 and at least 750. The number of channels
+    does not enter: the flows learn `p(parameters | code)`, whose size is set
+    by `d`, and a short spectrum given fewer simulations converged worse.
     """
-    dimension_factor = (d / 6.0) ** 0.6
-    channel_factor = min(max((n_bins / 2500.0) ** 0.25, 0.5), 3.0)
-    per_param = 2000.0 * dimension_factor * channel_factor
-    return int(max(round(per_param / 250) * 250, 750)) * int(d)
+    per_param = _TRAINING_PER_PARAMETER * (int(d) / 6.0) ** 0.6
+    return int(max(round(per_param / 250) * 250, _TRAINING_MIN_PER_PARAMETER)) * int(d)
+
+
+def _architecture(flow: FlowConfig) -> str:
+    """Short label of a flow's architecture for the logs, e.g. `zuko_nsf h30 t3 b8`."""
+    label = f"{flow.model} h{flow.hidden_features} t{flow.num_transforms}"
+    return label + (f" b{flow.num_bins}" if flow.model == "zuko_nsf" else "")
 
 
 class SIXSABackend(Backend):
@@ -102,6 +116,11 @@ class SIXSABackend(Backend):
             would add.
         outdir: Output directory, `<outputfiles_basename>/sixsa`.
         rng: NumPy generator seeded from `SIXSA.seed`.
+        min_efficiency: The efficiency gate of this run, in percent
+            (`SIXSA.min_efficiency`, or its schedule value for the number
+            of free parameters).
+        target_ess: The effective sample size the final importance sample
+            aims for (`SIXSA.target_ess`, or its schedule value).
     """
 
     config_cls = SIXSA
@@ -109,6 +128,8 @@ class SIXSABackend(Backend):
     def __init__(self, *, solver: Solver, config: SIXSA) -> None:
         super().__init__(solver=solver, config=config)
         self.rng = np.random.default_rng(config.seed)
+        self.min_efficiency = config.gate_efficiency(solver.num_parameters)
+        self.target_ess = config.final_ess(solver.num_parameters)
         self.outdir = Path(solver.outputfiles_basename) / "sixsa"
         self.restriction: Restriction | None = None
         self.history: list[dict] = []
@@ -244,15 +265,20 @@ class SIXSABackend(Backend):
 
     def _train_flows(self, r: int, u: np.ndarray, z: np.ndarray,
                      z_obs: np.ndarray) -> tuple[list[FlowProposal], list[dict]]:
-        """Train `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
+        """Train the `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
         flows, infos = [], []
-        for k in range(self.config.n_nde):
-            estimator, info = train_flow(
-                u, z, **self.config.flow.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
-                log_dir=self.outdir / f"round_{r}" / f"member_{k}",
-            )
-            flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
-            infos.append(info)
+        with torch_threads(self.config.flow_torch_threads):
+            for k, member in enumerate(self.config.flow_members()):
+                estimator, info = train_flow(
+                    u, z, **member.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
+                    log_dir=self.outdir / f"round_{r}" / f"member_{k}",
+                )
+                flows.append(FlowProposal(estimator, z_obs, name=f"round{r}/member{k}"))
+                infos.append(info)
+                _LOG.info("SIXSA round %d flow %d/%d (%s): %d epochs, best validation loss %.4f%s",
+                          r, k + 1, self.config.n_nde, _architecture(member), info["epochs_trained"],
+                          info["best_validation_loss"],
+                          "" if info["attempts"] == 1 else f" after {info['attempts'] - 1} diverged attempt(s)")
         return flows, infos
 
     def _warn_if_region_cuts_posterior(self, r: int, cert: Certificate) -> None:
@@ -285,7 +311,7 @@ class SIXSABackend(Backend):
         proposal = flows[0] if len(flows) == 1 else MixtureProposal(flows, name=f"round{r}/mixture")
         with self.solver.fold_phase("gate"):
             cert = certify(proposal, cfg.check_draws, self._cstat, rng=self.rng, round_index=r,
-                           khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency)
+                           khat_threshold=cfg.khat_threshold, min_efficiency=self.min_efficiency)
         self.certificates.append(cert)
         _LOG.info("SIXSA round %d: %s k_hat=%.3f, efficiency=%.1f%%, ESS=%.0f, best fold %.1f",
                   r, cert.name, cert.k_hat, cert.efficiency, cert.ess, float(np.min(cert.cstat)))
@@ -314,8 +340,8 @@ class SIXSABackend(Backend):
         cfg = self.config
         with self.solver.fold_phase("sampling"):
             self.posterior = importance_sample(
-                proposal, self._cstat, target_ess=cfg.target_ess, max_draws=max_draws, batch=_SAMPLING_BATCH,
-                rng=self.rng, khat_threshold=cfg.khat_threshold, min_efficiency=cfg.min_efficiency,
+                proposal, self._cstat, target_ess=self.target_ess, max_draws=max_draws, batch=_SAMPLING_BATCH,
+                rng=self.rng, khat_threshold=cfg.khat_threshold, min_efficiency=self.min_efficiency,
             )
         rows, self.n_unique = resample(self.posterior.u, self.posterior.log_w_smoothed,
                                        cfg.num_posterior_samples, self.rng)
@@ -335,6 +361,9 @@ class SIXSABackend(Backend):
         started = time.perf_counter()
         cfg, solver = self.config, self.solver
         folds_before = sum(solver.fold_counts.values())
+        _LOG.info("SIXSA gate for d=%d: k-hat < %g and efficiency >= %g%% on %d draws; final effective sample "
+                  "size %g; %d flows per round.", solver.num_parameters, cfg.khat_threshold, self.min_efficiency,
+                  cfg.check_draws, self.target_ess, cfg.n_nde)
         if cfg.history_matching is not None:
             with solver.fold_phase("restriction"):
                 self.restriction = run_history_matching(
@@ -348,7 +377,7 @@ class SIXSABackend(Backend):
         else:
             self.compressor = ScoreCompressor(self._model_counts, solver.observed_counts, log=_LOG.info)
 
-        n = min(cfg.n_training or training_set_size(solver.num_parameters, solver.n_bins), cfg.train_max)
+        n = min(cfg.n_training or training_set_size(solver.num_parameters), cfg.train_max)
         u = self._draw_region(n)
         with solver.fold_phase("harvest"):
             cstat, counts = self._training_data(u)
@@ -372,7 +401,7 @@ class SIXSABackend(Backend):
             warnings.warn(
                 f"SIXSA used all n_rounds={cfg.n_rounds} rounds without a proposal passing certification (best "
                 f"round {self.best_round}: k-hat {best.k_hat:.2f}, efficiency {best.efficiency:.1f}%; the gate "
-                f"needs k-hat < {cfg.khat_threshold} and efficiency >= {cfg.min_efficiency}%), so the final "
+                f"needs k-hat < {cfg.khat_threshold} and efficiency >= {self.min_efficiency:g}%), so the final "
                 f"importance sample is capped at {max_draws} draws (min(max_sampling_draws, "
                 "5 x check_draws)). Increase n_rounds or train_max, check the priors and the model, and check "
                 f"the per-round k_hat in {self.outdir / 'summary.json'}.",
@@ -388,7 +417,7 @@ class SIXSABackend(Backend):
                 advice = "increase n_rounds, check the priors and the model, or cross-check with a nested sampler."
             warnings.warn(
                 f"SIXSA final importance sample not certified: k-hat {post.k_hat:.2f} (needs < "
-                f"{cfg.khat_threshold}), efficiency {post.efficiency:.1f}% (needs >= {cfg.min_efficiency}%), "
+                f"{cfg.khat_threshold}), efficiency {post.efficiency:.1f}% (needs >= {self.min_efficiency:g}%), "
                 f"ESS {post.ess:.0f} from {post.n_raw} draws. Treat the posterior and log Z as approximate: "
                 + advice,
                 RuntimeWarning, stacklevel=3,
@@ -426,6 +455,8 @@ class SIXSABackend(Backend):
             "exit_reason": self.exit_reason, "best_round": self.best_round, "time": result.time,
             "n_likelihood_evaluations": result.n_likelihood_evaluations, "fold_counts": self.solver.fold_counts,
             "posterior": dict(post.summary(), n_unique=self.n_unique),
+            "gate": {"khat_threshold": self.config.khat_threshold, "min_efficiency": self.min_efficiency,
+                     "check_draws": self.config.check_draws, "target_ess": self.target_ess},
             "rounds": [{k: v for k, v in record.items() if k != "certificate"} for record in self.history],
             "config": self.config.model_dump(mode="json"),
         }

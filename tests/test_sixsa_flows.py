@@ -1,6 +1,6 @@
 """Tests for the SIXSA flow proposals and their training (`flows.py`).
 
-The flows are tiny (d = 2, zuko MAF 16 x 2, 5 epochs on 1500 pairs), so every
+The flows are tiny (d = 2, zuko MAF or NSF 16 x 2, 5 epochs on 1500 pairs), so every
 test runs in about a second. The mixture algebra is checked on the analytic
 Gaussian proposals of `tests/_analytic.py`, where every density is exact.
 """
@@ -25,8 +25,8 @@ from bsixsa.backend.sixsa.flows import FlowProposal, MixtureProposal, train_flow
 
 D = 2
 N_TRAIN = 1500
-FLOW = {"hidden_features": 16, "num_transforms": 2, "training_batch_size": 256, "max_num_epochs": 5,
-        "stop_after_epochs": 10}
+FLOW = {"model": "zuko_maf", "hidden_features": 16, "num_transforms": 2, "num_bins": 8, "training_batch_size": 256,
+        "max_num_epochs": 5, "stop_after_epochs": 10}
 
 
 def _dataset(n: int = N_TRAIN, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -82,6 +82,69 @@ def test_train_flow_is_deterministic_in_its_seed(trained, tmp_path):
     other, _ = train_flow(theta, z, **FLOW, seed=4, log_dir=tmp_path / "other")
     np.testing.assert_array_equal(_grid_log_probs(trained[0]), _grid_log_probs(again))
     assert np.max(np.abs(_grid_log_probs(trained[0]) - _grid_log_probs(other))) > 1e-3
+
+
+def test_train_flow_builds_a_spline_flow_with_its_bins(tmp_path):
+    theta, z = _dataset()
+    settings = dict(FLOW, model="zuko_nsf", num_bins=6)
+    estimator, info = train_flow(theta, z, **settings, seed=1, log_dir=tmp_path / "nsf")
+    assert (info["model"], info["num_bins"], info["attempts"]) == ("zuko_nsf", 6, 1)
+    assert np.all(np.isfinite(_grid_log_probs(estimator)))
+    _, maf_info = train_flow(theta, z, **FLOW, seed=1, log_dir=tmp_path / "maf")
+    assert maf_info["model"] == "zuko_maf" and maf_info["num_bins"] is None
+
+
+def test_train_flow_rejects_an_unknown_model(tmp_path):
+    theta, z = _dataset(n=200)
+    with pytest.raises(ValueError, match="zuko_nsf"):
+        train_flow(theta, z, **dict(FLOW, model="nsf"), seed=0, log_dir=tmp_path)
+
+
+def test_train_flow_retries_a_diverged_training_with_a_smaller_learning_rate(monkeypatch, tmp_path):
+    from bsixsa.backend.sixsa import flows
+
+    calls = []
+    real = flows._train_once
+
+    def flaky(*args, learning_rate, seed, **kwargs):
+        calls.append((learning_rate, seed))
+        if len(calls) == 1:
+            raise ValueError("Expected parameter loc to satisfy the constraint Real(), but found invalid values: nan")
+        return real(*args, learning_rate=learning_rate, seed=seed, **kwargs)
+
+    monkeypatch.setattr(flows, "_train_once", flaky)
+    theta, z = _dataset()
+    _, info = train_flow(theta, z, **FLOW, seed=5, log_dir=tmp_path)
+    assert info["attempts"] == 2 and info["learning_rate"] == pytest.approx(5e-4)
+    assert calls[0] == (1e-3, 5) and calls[1][0] == pytest.approx(5e-4) and calls[1][1] != 5
+
+
+def test_train_flow_does_not_retry_other_errors(monkeypatch, tmp_path):
+    from bsixsa.backend.sixsa import flows
+
+    def broken(*args, **kwargs):
+        raise ValueError("shape mismatch")
+
+    monkeypatch.setattr(flows, "_train_once", broken)
+    theta, z = _dataset(n=200)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        train_flow(theta, z, **FLOW, seed=0, log_dir=tmp_path)
+
+
+def test_train_flow_gives_up_after_the_last_retry(monkeypatch, tmp_path):
+    from bsixsa.backend.sixsa import flows
+
+    attempts = []
+
+    def always_nan(*args, **kwargs):
+        attempts.append(kwargs["learning_rate"])
+        raise RuntimeError("NaN/Inf present in loss")
+
+    monkeypatch.setattr(flows, "_train_once", always_nan)
+    theta, z = _dataset(n=200)
+    with pytest.raises(RuntimeError, match="NaN"):
+        train_flow(theta, z, **FLOW, seed=0, log_dir=tmp_path)
+    assert attempts == pytest.approx([1e-3, 5e-4, 2.5e-4])
 
 
 # ---------------------------------------------------------------------------
