@@ -573,10 +573,10 @@ class SIXSA(BackendConfig):
         ),
     )
     flow_torch_threads: PositiveInt | None = Field(
-        default=1,
+        default=None,
         description=(
-            "Torch threads while a flow trains; these networks are too small to gain from more. "
-            "`None` keeps torch's setting."
+            "Torch threads while a flow trains; `None` takes one per 10 free parameters (at least one), "
+            "within the solver's `n_jobs` and the available CPUs."
         ),
     )
     compressor: ScoreCompressorConfig | AutoencoderConfig = Field(

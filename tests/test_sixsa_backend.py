@@ -181,7 +181,7 @@ def test_reference_training_defaults_are_preserved():
     from bsixsa.backend.sixsa import flows
 
     cfg = SIXSA()
-    assert cfg.n_nde == 7 and cfg.flow_torch_threads == 1
+    assert cfg.n_nde == 7 and cfg.flow_torch_threads is None
     budget = dict(training_batch_size=1024, max_num_epochs=500, stop_after_epochs=10)
     assert [member.model_dump() for member in cfg.flow_members()] == [
         dict(model="zuko_nsf", hidden_features=30, num_transforms=3, num_bins=8, **budget),
@@ -195,6 +195,30 @@ def test_reference_training_defaults_are_preserved():
     assert (cfg.check_draws, cfg.train_ramp, cfg.train_max) == (2000, 1.1, 100_000)
     assert cfg.min_efficiency is None and cfg.target_ess is None
     assert (flows._LEARNING_RATE, flows._VALIDATION_FRACTION, flows._CLIP_MAX_NORM) == (1e-3, 0.2, 1.0)
+
+
+@pytest.mark.parametrize("d, n_jobs, cpus, explicit, expected", [
+    (5, 16, 16, None, 1), (19, 16, 16, None, 1), (20, 16, 16, None, 2), (41, 16, 16, None, 4),
+    (41, 2, 16, None, 2), (41, 16, 3, None, 3), (5, 16, 16, 6, 6),
+])
+def test_flows_train_on_threads_set_by_dimension_within_the_fit_cores(
+        d, n_jobs, cpus, explicit, expected, monkeypatch, tmp_path):
+    import torch
+
+    seen = []
+
+    def fake_train(*args, **kwargs):
+        seen.append(torch.get_num_threads())
+        return object(), dict(epochs_trained=1, best_validation_loss=0.0, attempts=1)
+
+    monkeypatch.setattr("bsixsa.backend.sixsa._sixsa.train_flow", fake_train)
+    monkeypatch.setattr("bsixsa.backend.sixsa._sixsa.FlowProposal", lambda *args, **kwargs: object())
+    monkeypatch.setattr("bsixsa.backend.sixsa._sixsa.available_cpu_count", lambda: cpus)
+    backend = SimpleNamespace(config=SIXSA(n_nde=2, flow_torch_threads=explicit), rng=np.random.default_rng(0),
+                              solver=SimpleNamespace(num_parameters=d, _n_jobs=n_jobs), outdir=tmp_path)
+    before = torch.get_num_threads()
+    SIXSABackend._train_flows(backend, 1, None, None, None)
+    assert seen == [expected, expected] and torch.get_num_threads() == before
 
 
 @pytest.mark.parametrize("d, efficiency, ess", [

@@ -131,11 +131,12 @@ priors; `Solver(...)` checks this.
    Cash-loss autoencoder of earlier versions instead, refitted at the start
    of each round (see its `refresh`).
 4. `n_nde` flows are trained from different seeds on the (parameters, code)
-   pairs with sbi's `NPE_C` and the plain maximum-likelihood loss, one torch
-   thread each (`flow_torch_threads`); their equal-weight mixture is the
-   round's proposal. Flow `k` takes the settings `flow[k % len(flow)]`; the
-   default is the reference ensemble of seven flows, five neural spline flows
-   and two masked autoregressive flows
+   pairs with sbi's `NPE_C` and the plain maximum-likelihood loss, by default
+   on one torch thread per 10 free parameters, within the solver's `n_jobs`
+   and the available CPUs (`flow_torch_threads`); their equal-weight mixture
+   is the round's proposal. Flow `k` takes the settings `flow[k % len(flow)]`;
+   the default is the reference ensemble of seven flows, five neural spline
+   flows and two masked autoregressive flows
    ([`reference_flow_ensemble`][bsixsa.backend.config.reference_flow_ensemble]),
    each trained until 10 epochs pass without validation improvement (at most
    500). A training whose loss turns NaN is retried, twice at most, with half
