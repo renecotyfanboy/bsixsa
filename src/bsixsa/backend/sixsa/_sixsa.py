@@ -47,6 +47,7 @@ from ..abc import Backend
 from ..config import SIXSA, AutoencoderConfig, FlowConfig
 from ..._cube import in_cube, latin_hypercube, to_physical
 from ..._torch_utils import torch_threads
+from ...convenience import available_cpu_count
 from ...restriction import Restriction, run_history_matching
 from ...restriction.region import _to_jsonable
 from ...solver import FitResults, Solver
@@ -267,7 +268,10 @@ class SIXSABackend(Backend):
                      z_obs: np.ndarray) -> tuple[list[FlowProposal], list[dict]]:
         """Train the `n_nde` flows on the `(u, z)` pairs, each frozen at the observation's code."""
         flows, infos = [], []
-        with torch_threads(self.config.flow_torch_threads):
+        # Threads pay only at high d: 16 gain nothing at d = 5; at d = 41, 4 run 2.6x faster and 16 only 3.3x.
+        threads = self.config.flow_torch_threads or min(
+            max(self.solver.num_parameters // 10, 1), self.solver._n_jobs, available_cpu_count())
+        with torch_threads(threads):
             for k, member in enumerate(self.config.flow_members()):
                 estimator, info = train_flow(
                     u, z, **member.model_dump(), seed=int(self.rng.integers(2**31 - 1)),
